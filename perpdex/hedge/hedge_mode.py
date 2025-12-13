@@ -48,7 +48,9 @@ Examples:
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
-    
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help='Path to configuration file (default: config.yaml)')
+
     return parser.parse_args()
 
 
@@ -108,14 +110,16 @@ async def main():
                 ticker=args.ticker.upper(),
                 order_quantity=Decimal(args.size),
                 fill_timeout=args.fill_timeout,
-                iterations=args.iter
+                iterations=args.iter,
+                config_path=args.config
             )
         else:  # extended
             bot = HedgeBotClass(
                 ticker=args.ticker.upper(),
                 order_quantity=Decimal(args.size),
                 fill_timeout=args.fill_timeout,
-                iterations=args.iter
+                iterations=args.iter,
+                config_path=args.config
             )
         
         # Run the bot

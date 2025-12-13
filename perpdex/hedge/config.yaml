@@ -1,0 +1,47 @@
+# Delta Neutral Volume Farming Bot Configuration
+# ================================================
+# API 키는 .env에서 관리 (이 파일은 Git에 커밋 가능)
+#
+# 우선순위: CLI 인자 > config.yaml > 하드코딩 기본값
+#
+# 사용법:
+#   python hedge_mode.py --exchange backpack --ticker ETH --size 0.05 --iter 20
+
+trading:
+  # 포지션 불균형 허용치
+  # |Backpack_position + Lighter_position| 기준
+  # 이 값 초과 시 경고 로그 출력
+  position_diff_threshold: 0.2
+
+  # 주문 취소 타임아웃 (초)
+  # 미체결 주문이 이 시간 후 취소되고 재주문
+  order_cancel_timeout: 10
+
+  # 트레이딩 루프 타임아웃 (초)
+  # 전체 루프가 이 시간 내 완료되어야 함
+  trading_loop_timeout: 180
+
+  # 최대 재시도 횟수
+  # API 호출 실패 시 재시도 횟수
+  max_retries: 15
+
+  # 체결 확인 간격 (초)
+  # 주문 체결 여부 확인 주기
+  fill_check_interval: 10
+
+pricing:
+  # 매수가 조정 (시장가 × 이 값)
+  # 예: 0.998 = 시장가보다 0.2% 낮게 주문 (post-only maker)
+  buy_price_multiplier: 0.998
+
+  # 매도가 조정 (진입가 × 이 값)
+  # 예: 1.002 = 진입가보다 0.2% 높게 청산 주문
+  sell_price_multiplier: 1.002
+
+# 참고: 아래 값들은 CLI에서만 설정 가능
+# --exchange: 거래소 (backpack, extended)
+# --ticker: 거래 심볼 (BTC, ETH, SOL)
+# --size: 주문 수량
+# --iter: 반복 횟수
+# --fill-timeout: 체결 대기 시간
+# --env-file: .env 파일 경로

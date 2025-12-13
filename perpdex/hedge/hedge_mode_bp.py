@@ -18,6 +18,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchanges.backpack import BackpackClient
+from config_loader import ConfigLoader
 import websockets
 from datetime import datetime
 import pytz
@@ -32,7 +33,7 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on Backpack and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, config_path: str = "config.yaml"):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
@@ -41,6 +42,9 @@ class HedgeBot:
         self.backpack_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
+
+        # Load configuration from config.yaml
+        self.config = ConfigLoader(config_path)
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -643,7 +647,8 @@ class HedgeBot:
                 await asyncio.sleep(0.5)
             elif self.backpack_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
                 await asyncio.sleep(0.5)
-                if time.time() - start_time > 10:
+                orderCancelTimeout = self.config.get("trading", "order_cancel_timeout")
+                if time.time() - start_time > orderCancelTimeout:
                     try:
                         # Cancel the order using Backpack client
                         cancel_result = await self.backpack_client.cancel_order(order_id)
@@ -746,15 +751,18 @@ class HedgeBot:
 
         best_bid, best_ask = self.get_lighter_best_levels()
 
-        # Determine order parameters
+        # Determine order parameters (get multipliers from config)
+        sellPriceMultiplier = Decimal(str(self.config.get("pricing", "sell_price_multiplier")))
+        buyPriceMultiplier = Decimal(str(self.config.get("pricing", "buy_price_multiplier")))
+
         if lighter_side.lower() == 'buy':
             order_type = "CLOSE"
             is_ask = False
-            price = best_ask[0] * Decimal('1.002')
+            price = best_ask[0] * sellPriceMultiplier
         else:
             order_type = "OPEN"
             is_ask = True
-            price = best_bid[0] * Decimal('0.998')
+            price = best_bid[0] * buyPriceMultiplier
 
 
         # Reset order state
@@ -1062,8 +1070,9 @@ class HedgeBot:
 
             self.logger.info(f"[STEP 1] Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
 
-            if abs(self.backpack_position + self.lighter_position) > 0.2:
-                self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position}")
+            positionDiffThreshold = self.config.get("trading", "position_diff_threshold")
+            if abs(self.backpack_position + self.lighter_position) > positionDiffThreshold:
+                self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position} (threshold: {positionDiffThreshold})")
                 break
 
             self.order_execution_complete = False
@@ -1185,5 +1194,7 @@ def parse_arguments():
                         help='Number of iterations to run')
     parser.add_argument('--fill-timeout', type=int, default=5,
                         help='Timeout in seconds for maker order fills (default: 5)')
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help='Path to configuration file (default: config.yaml)')
 
     return parser.parse_args()
