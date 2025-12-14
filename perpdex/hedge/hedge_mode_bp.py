@@ -618,6 +618,129 @@ class HedgeBot:
 
         self.logger.info("=" * 50)
 
+    def get_backpack_balance(self) -> dict:
+        """
+        Get USDC balance from Backpack.
+
+        Returns:
+            dict with balance info:
+            - available: available USDC balance
+            - total: total USDC balance (including in orders)
+            - error: error message if failed
+        """
+        try:
+            if not self.backpack_client:
+                return {"available": 0, "total": 0, "error": "Client not initialized"}
+
+            balances = self.backpack_client.account_client.get_balances()
+
+            if not balances:
+                return {"available": 0, "total": 0, "error": "No balance data"}
+
+            # Find USDC balance
+            for balance in balances:
+                if balance.get('symbol') == 'USDC':
+                    available = float(balance.get('available', 0))
+                    locked = float(balance.get('locked', 0))
+                    return {
+                        "available": available,
+                        "total": available + locked,
+                        "locked": locked
+                    }
+
+            return {"available": 0, "total": 0, "error": "USDC not found"}
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to get Backpack balance: {e}")
+            return {"available": 0, "total": 0, "error": str(e)}
+
+    def get_lighter_balance(self) -> dict:
+        """
+        Get collateral balance from Lighter.
+
+        Returns:
+            dict with balance info:
+            - total_collateral: total collateral value
+            - free_collateral: available (unused) collateral
+            - error: error message if failed
+        """
+        try:
+            if not self.lighter_client:
+                return {"total_collateral": 0, "free_collateral": 0, "error": "Client not initialized"}
+
+            # Get account info from Lighter
+            accountApi = self.lighter_client.api_client
+            if hasattr(self.lighter_client, 'account_index'):
+                import lighter
+                api = lighter.AccountApi(accountApi)
+                accountData = api.account(by="index", value=str(self.lighter_client.account_index))
+
+                if accountData:
+                    totalCollateral = float(getattr(accountData, 'total_collateral', 0) or 0)
+                    freeCollateral = float(getattr(accountData, 'free_collateral', 0) or 0)
+                    return {
+                        "total_collateral": totalCollateral,
+                        "free_collateral": freeCollateral
+                    }
+
+            return {"total_collateral": 0, "free_collateral": 0, "error": "No account data"}
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to get Lighter balance: {e}")
+            return {"total_collateral": 0, "free_collateral": 0, "error": str(e)}
+
+    def log_balance_status(self, iteration: int):
+        """
+        Log balance status at specified intervals.
+
+        Args:
+            iteration: Current trading loop iteration number
+        """
+        balanceLogging = self.config.get("monitoring", "balance_logging")
+        if not balanceLogging:
+            return
+
+        balanceLogInterval = self.config.get("monitoring", "balance_log_interval")
+        if iteration % balanceLogInterval != 0:
+            return
+
+        # Get balances from both exchanges
+        backpackBalance = self.get_backpack_balance()
+        lighterBalance = self.get_lighter_balance()
+
+        # Log balance summary
+        self.logger.info("=" * 50)
+        self.logger.info("💰 BALANCE STATUS")
+        self.logger.info("=" * 50)
+        self.logger.info(f"📊 Backpack USDC: ${backpackBalance.get('available', 0):.2f} available "
+                        f"(${backpackBalance.get('total', 0):.2f} total)")
+        self.logger.info(f"📊 Lighter Collateral: ${lighterBalance.get('free_collateral', 0):.2f} free "
+                        f"(${lighterBalance.get('total_collateral', 0):.2f} total)")
+
+        # Calculate and check imbalance
+        backpackTotal = backpackBalance.get('total', 0)
+        lighterTotal = lighterBalance.get('total_collateral', 0)
+        combinedTotal = backpackTotal + lighterTotal
+
+        if combinedTotal > 0:
+            backpackRatio = backpackTotal / combinedTotal
+            lighterRatio = lighterTotal / combinedTotal
+
+            self.logger.info(f"📈 Balance Ratio: Backpack {backpackRatio*100:.1f}% | Lighter {lighterRatio*100:.1f}%")
+
+            # Check warning threshold
+            balanceWarningThreshold = self.config.get("monitoring", "balance_warning_threshold")
+            imbalance = abs(backpackRatio - 0.5)  # Deviation from 50/50
+
+            if imbalance > balanceWarningThreshold / 2:  # /2 because we measure from 50%
+                self.logger.warning(
+                    f"⚠️ BALANCE WARNING: Significant imbalance detected! "
+                    f"(Backpack: {backpackRatio*100:.1f}%, Lighter: {lighterRatio*100:.1f}%)"
+                )
+                self.logger.warning("⚠️ Consider transferring funds to rebalance")
+
+        self.logger.info("=" * 50)
+
     def initialize_backpack_client(self):
         """Initialize the Backpack client."""
         if not self.backpack_public_key or not self.backpack_secret_key:
@@ -1162,6 +1285,9 @@ class HedgeBot:
 
             # Log funding fee status at configured intervals
             self.log_funding_status(iterations)
+
+            # Log balance status at configured intervals
+            self.log_balance_status(iterations)
 
             self.logger.info(f"[STEP 1] Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
 

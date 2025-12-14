@@ -53,6 +53,9 @@ class ConfigLoader:
             "funding_fee_logging": True,
             "funding_fee_log_interval": 5,
             "funding_fee_warning_threshold": -10.0,
+            "balance_logging": True,
+            "balance_log_interval": 5,
+            "balance_warning_threshold": 0.3,
         },
         "pricing": {
             "buy_price_multiplier": 0.998,
@@ -75,6 +78,9 @@ class ConfigLoader:
             "funding_fee_logging": bool,
             "funding_fee_log_interval": int,
             "funding_fee_warning_threshold": (int, float),
+            "balance_logging": bool,
+            "balance_log_interval": int,
+            "balance_warning_threshold": (int, float),
         },
         "pricing": {
             "buy_price_multiplier": (int, float),
