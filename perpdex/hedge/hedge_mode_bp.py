@@ -526,6 +526,98 @@ class HedgeBot:
             self.logger.info("✅ Lighter client initialized successfully")
         return self.lighter_client
 
+    def get_backpack_funding_payments(self, limit: int = 10) -> dict:
+        """
+        Get recent funding payments from Backpack.
+
+        Args:
+            limit: Number of recent funding payments to retrieve
+
+        Returns:
+            dict with funding payments summary:
+            - total: cumulative funding fee (positive = received, negative = paid)
+            - count: number of payments
+            - payments: list of recent payments
+        """
+        try:
+            if not self.backpack_client:
+                return {"total": 0, "count": 0, "payments": [], "error": "Client not initialized"}
+
+            # Use the account client's get_funding_payments method
+            symbol = f"{self.ticker}_USDC_PERP"
+            fundingPayments = self.backpack_client.account_client.get_funding_payments(
+                symbol=symbol,
+                limit=limit
+            )
+
+            if not fundingPayments:
+                return {"total": 0, "count": 0, "payments": []}
+
+            # Calculate cumulative funding fee
+            total = Decimal('0')
+            payments = []
+            for payment in fundingPayments:
+                amount = Decimal(str(payment.get('paymentAmount', '0')))
+                total += amount
+                payments.append({
+                    "symbol": payment.get('symbol'),
+                    "amount": float(amount),
+                    "timestamp": payment.get('timestamp')
+                })
+
+            return {
+                "total": float(total),
+                "count": len(payments),
+                "payments": payments
+            }
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to get Backpack funding payments: {e}")
+            return {"total": 0, "count": 0, "payments": [], "error": str(e)}
+
+    def log_funding_status(self, iteration: int):
+        """
+        Log funding fee status at specified intervals.
+
+        Args:
+            iteration: Current trading loop iteration number
+        """
+        fundingFeeLogging = self.config.get("monitoring", "funding_fee_logging")
+        if not fundingFeeLogging:
+            return
+
+        fundingFeeLogInterval = self.config.get("monitoring", "funding_fee_log_interval")
+        if iteration % fundingFeeLogInterval != 0:
+            return
+
+        # Get Backpack funding payments
+        backpackFunding = self.get_backpack_funding_payments(limit=20)
+
+        # Log funding summary
+        self.logger.info("=" * 50)
+        self.logger.info("📊 FUNDING FEE STATUS")
+        self.logger.info("=" * 50)
+        self.logger.info(f"💰 Backpack Cumulative Funding: ${backpackFunding['total']:.4f}")
+        self.logger.info(f"📝 Recent Payments Count: {backpackFunding['count']}")
+
+        # Check warning threshold
+        fundingFeeWarningThreshold = self.config.get("monitoring", "funding_fee_warning_threshold")
+        if backpackFunding['total'] < fundingFeeWarningThreshold:
+            self.logger.warning(
+                f"⚠️ FUNDING WARNING: Cumulative funding fee (${backpackFunding['total']:.2f}) "
+                f"exceeds threshold (${fundingFeeWarningThreshold:.2f})"
+            )
+            self.logger.warning("⚠️ Consider checking position direction or rebalancing")
+
+        # Log recent payments details (last 3)
+        if backpackFunding['payments']:
+            self.logger.info("📋 Recent Funding Payments (Backpack):")
+            for payment in backpackFunding['payments'][:3]:
+                direction = "received" if payment['amount'] > 0 else "paid"
+                self.logger.info(f"   • ${abs(payment['amount']):.6f} ({direction})")
+
+        self.logger.info("=" * 50)
+
     def initialize_backpack_client(self):
         """Initialize the Backpack client."""
         if not self.backpack_public_key or not self.backpack_secret_key:
@@ -1067,6 +1159,9 @@ class HedgeBot:
             self.logger.info("-----------------------------------------------")
             self.logger.info(f"🔄 Trading loop iteration {iterations}")
             self.logger.info("-----------------------------------------------")
+
+            # Log funding fee status at configured intervals
+            self.log_funding_status(iterations)
 
             self.logger.info(f"[STEP 1] Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
 

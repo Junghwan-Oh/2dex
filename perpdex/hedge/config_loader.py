@@ -49,6 +49,11 @@ class ConfigLoader:
             "default_size": 0.01,
             "default_iterations": 10,
         },
+        "monitoring": {
+            "funding_fee_logging": True,
+            "funding_fee_log_interval": 5,
+            "funding_fee_warning_threshold": -10.0,
+        },
         "pricing": {
             "buy_price_multiplier": 0.998,
             "sell_price_multiplier": 1.002,
@@ -65,6 +70,11 @@ class ConfigLoader:
             "fill_check_interval": (int, float),
             "default_size": (int, float),
             "default_iterations": int,
+        },
+        "monitoring": {
+            "funding_fee_logging": bool,
+            "funding_fee_log_interval": int,
+            "funding_fee_warning_threshold": (int, float),
         },
         "pricing": {
             "buy_price_multiplier": (int, float),

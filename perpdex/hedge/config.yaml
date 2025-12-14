@@ -36,6 +36,18 @@ trading:
   # 주문 체결 여부 확인 주기
   fill_check_interval: 10
 
+monitoring:
+  # 펀딩비 로깅 활성화
+  funding_fee_logging: true
+
+  # 펀딩비 로깅 주기 (iterations)
+  # 예: 5 = 5회 반복마다 펀딩비 로그 출력
+  funding_fee_log_interval: 5
+
+  # 펀딩비 경고 임계값 (USD)
+  # 누적 펀딩비가 이 값 초과 시 경고
+  funding_fee_warning_threshold: -10.0
+
 pricing:
   # 매수가 조정 (시장가 × 이 값)
   # 예: 0.998 = 시장가보다 0.2% 낮게 주문 (post-only maker)
