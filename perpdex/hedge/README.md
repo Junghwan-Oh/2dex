@@ -76,7 +76,11 @@ cp .env.backpack_lighter .env
 ### 기본 실행
 
 ```bash
+# CLI 파라미터로 직접 지정
 python hedge_mode.py --exchange backpack --ticker ETH --size 0.05 --iter 20
+
+# config.yaml 기본값 사용 (--size, --iter 생략 가능)
+python hedge_mode.py --exchange backpack --ticker ETH
 ```
 
 ### 파라미터
@@ -85,16 +89,20 @@ python hedge_mode.py --exchange backpack --ticker ETH --size 0.05 --iter 20
 |-----------|-------------|---------|---------|
 | `--exchange` | 거래소 선택 | (필수) | `backpack` |
 | `--ticker` | 거래 심볼 | `BTC` | `ETH`, `SOL` |
-| `--size` | 주문당 수량 | (필수) | `0.05` |
-| `--iter` | 반복 횟수 | (필수) | `20` |
+| `--size` | 주문당 수량 | config.yaml | `0.05` |
+| `--iter` | 반복 횟수 | config.yaml | `20` |
 | `--fill-timeout` | 체결 대기 시간(초) | `5` | `10` |
 | `--env-file` | 환경 파일 경로 | `.env` | `.env.prod` |
+| `--config` | 설정 파일 경로 | `config.yaml` | `config.prod.yaml` |
 
 ### 실행 예시
 
 ```bash
-# ETH 테스트 (소액)
-python hedge_mode.py --exchange backpack --ticker ETH --size 0.01 --iter 5
+# ETH 테스트 (소액, config.yaml 기본값 사용)
+python hedge_mode.py --exchange backpack --ticker ETH
+
+# ETH 커스텀 설정
+python hedge_mode.py --exchange backpack --ticker ETH --size 0.05 --iter 20
 
 # BTC 본 실행
 python hedge_mode.py --exchange backpack --ticker BTC --size 0.001 --iter 50
@@ -103,6 +111,51 @@ python hedge_mode.py --exchange backpack --ticker BTC --size 0.001 --iter 50
 python hedge_mode.py --exchange backpack --ticker SOL --size 1.0 --iter 100 --env-file .env.prod
 ```
 
+## 설정 파일 (config.yaml)
+
+코드 수정 없이 전략 파라미터를 튜닝할 수 있습니다.
+
+**우선순위**: CLI 인자 > config.yaml > 하드코딩 기본값
+
+```yaml
+trading:
+  # 기본 주문 수량 (CLI --size 미지정 시 사용)
+  default_size: 0.01           # 테스트: 0.01 (~$5)
+  default_iterations: 10       # 기본 반복 횟수
+
+  # 포지션 불균형 허용치
+  position_diff_threshold: 0.2
+
+  # 타임아웃 설정
+  order_cancel_timeout: 10     # 미체결 주문 취소 (초)
+  trading_loop_timeout: 180    # 루프 전체 타임아웃 (초)
+  max_retries: 15              # API 재시도 횟수
+  fill_check_interval: 10      # 체결 확인 간격 (초)
+
+monitoring:
+  # 펀딩비 모니터링
+  funding_fee_logging: true
+  funding_fee_log_interval: 5  # N회 반복마다 로깅
+  funding_fee_warning_threshold: -10.0  # 경고 임계값 (USD)
+
+pricing:
+  # 가격 조정 (post-only maker)
+  buy_price_multiplier: 0.998  # 시장가 × 0.998 (-0.2%)
+  sell_price_multiplier: 1.002 # 진입가 × 1.002 (+0.2%)
+```
+
+## 펀딩비 모니터링
+
+봇은 자동으로 펀딩비를 모니터링하고 로깅합니다:
+
+- **주기적 로깅**: `funding_fee_log_interval` 마다 누적 펀딩비 표시
+- **경고 알림**: 누적 펀딩비가 `funding_fee_warning_threshold` 초과 시 경고
+- **로그 예시**:
+  ```
+  [INFO] Funding status: Total=-$5.23 from 12 payments (last 10 shown)
+  [WARNING] Cumulative funding fee (-$12.50) exceeds warning threshold (-$10.00)!
+  ```
+
 ## 파일 구조
 
 ```
@@ -110,9 +163,18 @@ hedge/
 ├── hedge_mode.py          # 메인 엔트리 포인트
 ├── hedge_mode_bp.py       # Backpack+Lighter HedgeBot 구현
 ├── hedge_mode_ext.py      # Extended+Lighter HedgeBot 구현
+├── config_loader.py       # YAML 설정 로더
+├── config.yaml            # 전략 파라미터 설정
 ├── exchanges/
 │   ├── backpack.py        # Backpack 거래소 클라이언트
-│   └── lighter.py         # Lighter 거래소 클라이언트
+│   ├── bp_client.py       # Backpack HTTP/WebSocket
+│   ├── lighter.py         # Lighter 거래소 클라이언트
+│   └── lighter_custom_websocket.py  # Lighter WebSocket
+├── tests/
+│   └── test_config_loader.py  # 설정 로더 단위 테스트
+├── docs/
+│   ├── PARAMETERS_ANALYSIS.md  # 파라미터 분석 문서
+│   └── QA_SESSION_2025-12-14.md  # Q&A 세션 기록
 ├── .env.example           # 전체 환경 설정 예시
 ├── .env.backpack_lighter  # Backpack+Lighter 전용 설정
 ├── requirements.txt       # Python 의존성
@@ -146,6 +208,21 @@ hedge/
 **포인트 획득**:
 - Lighter: ~1.4 points ($70k/point)
 - Backpack: Trading volume points
+
+## 구현 현황
+
+### 완료 (Completed)
+- [x] config.yaml 설정 파일 지원 (SPEC-001)
+- [x] default_size, default_iterations 파라미터
+- [x] 펀딩비 모니터링 및 로깅
+
+### 권장 (Medium Priority)
+- [ ] 잔고 모니터링
+
+### 잠재 기능 (보류)
+- [ ] holding_time 파라미터 (거래량 감소 우려로 보류)
+- [ ] 자동 리밸런싱
+- [ ] 다른 DEX 페어 확장
 
 ## 라이센스
 
