@@ -8,6 +8,13 @@
 #   python hedge_mode.py --exchange backpack --ticker ETH --size 0.05 --iter 20
 
 trading:
+  # 기본 주문 수량 (CLI --size 미지정 시 사용)
+  # 테스트: 0.01 (약 $5), 예시: 0.05 (약 $100)
+  default_size: 0.01
+
+  # 기본 반복 횟수 (CLI --iter 미지정 시 사용)
+  default_iterations: 10
+
   # 포지션 불균형 허용치
   # |Backpack_position + Lighter_position| 기준
   # 이 값 초과 시 경고 로그 출력
@@ -41,7 +48,7 @@ pricing:
 # 참고: 아래 값들은 CLI에서만 설정 가능
 # --exchange: 거래소 (backpack, extended)
 # --ticker: 거래 심볼 (BTC, ETH, SOL)
-# --size: 주문 수량
-# --iter: 반복 횟수
+# --size: 주문 수량 (미지정 시 trading.default_size 사용)
+# --iter: 반복 횟수 (미지정 시 trading.default_iterations 사용)
 # --fill-timeout: 체결 대기 시간
 # --env-file: .env 파일 경로

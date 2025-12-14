@@ -46,6 +46,8 @@ class ConfigLoader:
             "trading_loop_timeout": 180,
             "max_retries": 15,
             "fill_check_interval": 10,
+            "default_size": 0.01,
+            "default_iterations": 10,
         },
         "pricing": {
             "buy_price_multiplier": 0.998,
@@ -61,6 +63,8 @@ class ConfigLoader:
             "trading_loop_timeout": (int, float),
             "max_retries": int,
             "fill_check_interval": (int, float),
+            "default_size": (int, float),
+            "default_iterations": int,
         },
         "pricing": {
             "buy_price_multiplier": (int, float),

@@ -24,6 +24,8 @@ from decimal import Decimal
 from pathlib import Path
 import dotenv
 
+from config_loader import ConfigLoader
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -33,6 +35,7 @@ def parse_arguments():
 Examples:
     python hedge_mode.py --exchange backpack --ticker BTC --size 0.01 --iter 10
     python hedge_mode.py --exchange extended --ticker ETH --size 0.1 --iter 5
+    python hedge_mode.py --exchange backpack --ticker ETH  # Uses config.yaml defaults
         """
     )
     
@@ -40,10 +43,10 @@ Examples:
                         help='Exchange to use (backpack or extended)')
     parser.add_argument('--ticker', type=str, default='BTC',
                         help='Ticker symbol (default: BTC)')
-    parser.add_argument('--size', type=str, required=True,
-                        help='Number of tokens to buy/sell per order')
-    parser.add_argument('--iter', type=int, required=True,
-                        help='Number of iterations to run')
+    parser.add_argument('--size', type=str, default=None,
+                        help='Number of tokens to buy/sell per order (default: from config.yaml)')
+    parser.add_argument('--iter', type=int, default=None,
+                        help='Number of iterations to run (default: from config.yaml)')
     parser.add_argument('--fill-timeout', type=int, default=5,
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--env-file', type=str, default=".env",
@@ -88,19 +91,26 @@ async def main():
         print(f"Env file not find: {env_path.resolve()}")
         sys.exit(1)
     dotenv.load_dotenv(args.env_file)
-    
+
+    # Load configuration
+    config = ConfigLoader(args.config)
+
+    # Apply config defaults if CLI args not provided
+    size = args.size if args.size else str(config.get("trading", "default_size"))
+    iterations = args.iter if args.iter else config.get("trading", "default_iterations")
+
     # Validate exchange
     validate_exchange(args.exchange)
-    
+
     # Get the appropriate HedgeBot class
     try:
         HedgeBotClass = get_hedge_bot_class(args.exchange)
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
-    
+
     print(f"Starting hedge mode for {args.exchange} exchange...")
-    print(f"Ticker: {args.ticker}, Size: {args.size}, Iterations: {args.iter}")
+    print(f"Ticker: {args.ticker}, Size: {size}, Iterations: {iterations}")
     print("-" * 50)
     
     try:
@@ -108,17 +118,17 @@ async def main():
         if args.exchange.lower() == 'backpack':
             bot = HedgeBotClass(
                 ticker=args.ticker.upper(),
-                order_quantity=Decimal(args.size),
+                order_quantity=Decimal(size),
                 fill_timeout=args.fill_timeout,
-                iterations=args.iter,
+                iterations=iterations,
                 config_path=args.config
             )
         else:  # extended
             bot = HedgeBotClass(
                 ticker=args.ticker.upper(),
-                order_quantity=Decimal(args.size),
+                order_quantity=Decimal(size),
                 fill_timeout=args.fill_timeout,
-                iterations=args.iter,
+                iterations=iterations,
                 config_path=args.config
             )
         
