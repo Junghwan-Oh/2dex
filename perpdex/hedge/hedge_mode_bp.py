@@ -19,6 +19,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchanges.backpack import BackpackClient
 from config_loader import ConfigLoader
+from helpers.telegram_bot import TelegramBot
 import websockets
 from datetime import datetime
 import pytz
@@ -149,10 +150,79 @@ class HedgeBot:
         self.backpack_public_key = os.getenv('BACKPACK_PUBLIC_KEY')
         self.backpack_secret_key = os.getenv('BACKPACK_SECRET_KEY')
 
+        # Telegram notification configuration
+        self.telegram_bot = None
+        telegramToken = os.getenv('TELEGRAM_BOT_TOKEN')
+        telegramChatId = os.getenv('TELEGRAM_CHAT_ID')
+        if telegramToken and telegramChatId:
+            try:
+                self.telegram_bot = TelegramBot(telegramToken, telegramChatId)
+                self.logger.info("Telegram bot initialized successfully")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize Telegram bot: {e}")
+
+        # Telegram command polling configuration
+        self.telegramPollingInterval = 5  # seconds
+        self.telegramPollingTask = None
+
+        # Status file for inter-process communication with TelegramService
+        from pathlib import Path
+        self.statusFilePath = Path(__file__).parent / "bot_status.json"
+
+    def updateStatusFile(self, running: bool = True):
+        """Update status file for TelegramService inter-process communication."""
+        try:
+            status = {
+                "running": running,
+                "ticker": self.ticker,
+                "order_size": str(self.order_quantity),
+                "iteration": self.order_counter,
+                "iterations": self.iterations,
+                "start_time": datetime.now().isoformat(),
+                "stop_requested": False
+            }
+            with open(self.statusFilePath, 'w') as f:
+                json.dump(status, f, indent=2)
+        except Exception as e:
+            self.logger.warning(f"Failed to update status file: {e}")
+
+    def checkStopFlag(self) -> bool:
+        """Check if TelegramService has requested a stop."""
+        try:
+            if self.statusFilePath.exists():
+                with open(self.statusFilePath, 'r') as f:
+                    status = json.load(f)
+                    if status.get("stop_requested", False):
+                        self.logger.info("🛑 Stop requested via Telegram")
+                        return True
+        except Exception as e:
+            self.logger.warning(f"Failed to check stop flag: {e}")
+        return False
+
+    def clearStatusFile(self):
+        """Clear the status file when bot stops."""
+        try:
+            status = {
+                "running": False,
+                "ticker": self.ticker,
+                "order_size": str(self.order_quantity),
+                "iteration": self.order_counter,
+                "iterations": self.iterations,
+                "stop_time": datetime.now().isoformat(),
+                "stop_requested": False
+            }
+            with open(self.statusFilePath, 'w') as f:
+                json.dump(status, f, indent=2)
+        except Exception as e:
+            self.logger.warning(f"Failed to clear status file: {e}")
+
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
         self.stop_flag = True
         self.logger.info("\n🛑 Stopping...")
+
+        # Update status file to indicate bot is stopped
+        self.clearStatusFile()
 
         # Close WebSocket connections
         if self.backpack_client:
@@ -171,6 +241,17 @@ class HedgeBot:
             except Exception as e:
                 self.logger.error(f"Error cancelling Lighter WebSocket task: {e}")
 
+        # Stop Telegram polling task
+        self.stopTelegramPolling()
+
+        # Close Telegram bot connection
+        if self.telegram_bot:
+            try:
+                self.telegram_bot.close()
+                self.logger.info("Telegram bot connection closed")
+            except Exception as e:
+                self.logger.error(f"Error closing Telegram bot: {e}")
+
         # Close logging handlers properly
         for handler in self.logger.handlers[:]:
             try:
@@ -178,6 +259,158 @@ class HedgeBot:
                 self.logger.removeHandler(handler)
             except Exception:
                 pass
+
+    def send_telegram_alert(self, message: str, parseMode: str = "HTML"):
+        """Send alert message to Telegram."""
+        if self.telegram_bot:
+            try:
+                self.telegram_bot.send_text(message, parseMode)
+            except Exception as e:
+                self.logger.warning(f"Failed to send Telegram alert: {e}")
+
+    async def telegramCommandPolling(self):
+        """Background task to poll for Telegram commands."""
+        self.logger.info("Telegram command polling started")
+        while not self.stop_flag:
+            try:
+                if self.telegram_bot:
+                    command = self.telegram_bot.processUpdates()
+                    if command:
+                        await self.handleTelegramCommand(command)
+            except Exception as e:
+                self.logger.warning(f"Telegram polling error: {e}")
+            await asyncio.sleep(self.telegramPollingInterval)
+
+    async def handleTelegramCommand(self, command: str):
+        """Handle Telegram command from user."""
+        self.logger.info(f"Processing Telegram command: {command}")
+
+        if command == "menu":
+            # Send inline keyboard menu
+            bpPos = float(self.backpack_position)
+            ltPos = float(self.lighter_position)
+            menuText = (
+                f"<b>🤖 Hedge Bot Control Panel</b>\n"
+                f"Ticker: <code>{self.ticker}</code>\n"
+                "---\n"
+                f"📈 Backpack: {bpPos:+.4f}\n"
+                f"📉 Lighter: {ltPos:+.4f}\n"
+                f"🔄 Progress: {self.order_counter}/{self.iterations}\n"
+                "---\n"
+                "Select a command:"
+            )
+            self.telegram_bot.sendMenu(menuText)
+
+        elif command == "balance":
+            # Get and send balance information
+            balanceMsg = await self.getBalanceMessage()
+            self.send_telegram_alert(balanceMsg)
+
+        elif command == "position":
+            # Send current position information
+            positionMsg = self.getPositionMessage()
+            self.send_telegram_alert(positionMsg)
+
+        elif command in ["stop", "kill"]:
+            # Stop the bot
+            self.logger.info(f"Received {command} command from Telegram")
+            bpPos = float(self.backpack_position)
+            ltPos = float(self.lighter_position)
+            stopMsg = (
+                f"<b>🛑 Bot Stopping...</b>\n"
+                f"Received <code>{command}</code> command.\n"
+                f"Ticker: <code>{self.ticker}</code>\n"
+                "---\n"
+                f"📊 Final Positions:\n"
+                f"  Backpack: {bpPos:+.4f}\n"
+                f"  Lighter: {ltPos:+.4f}\n"
+                f"🔄 Completed: {self.order_counter}/{self.iterations} iterations"
+            )
+            self.send_telegram_alert(stopMsg)
+            self.stop_flag = True
+
+    async def getBalanceMessage(self) -> str:
+        """Get formatted balance message for Telegram."""
+        try:
+            # Get Backpack balance using the correct method
+            backpackBalance = "N/A"
+            if self.backpack_client:
+                try:
+                    balances = self.backpack_client.account_client.get_balances()
+                    if balances:
+                        for balance in balances:
+                            if balance.get('symbol') == 'USDC':
+                                available = float(balance.get('available', 0))
+                                locked = float(balance.get('locked', 0))
+                                total = available + locked
+                                backpackBalance = f"Available: {available:.2f} USDC\nLocked: {locked:.2f} USDC\nTotal: {total:.2f} USDC"
+                                break
+                        else:
+                            backpackBalance = "USDC not found"
+                    else:
+                        backpackBalance = "No balance data"
+                except Exception as e:
+                    backpackBalance = f"Error: {e}"
+
+            # Get Lighter balance
+            lighterBalance = "N/A"
+            try:
+                url = f"{self.lighter_base_url}/api/v1/account?by=index&value={self.account_index}"
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    freeCollateral = float(data.get('free_collateral', 0)) / 1e6  # Convert from micro units
+                    portfolioValue = float(data.get('portfolio_value', 0)) / 1e6
+                    lighterBalance = f"Free: {freeCollateral:.2f} USDC\nPortfolio: {portfolioValue:.2f} USDC"
+                else:
+                    lighterBalance = f"API Error: {response.status_code}"
+            except Exception as e:
+                lighterBalance = f"Error: {e}"
+
+            return (
+                "<b>Account Balances</b>\n"
+                "---\n"
+                f"<b>Backpack:</b>\n{backpackBalance}\n\n"
+                f"<b>Lighter:</b>\n{lighterBalance}"
+            )
+        except Exception as e:
+            return f"<b>Balance Error:</b> {e}"
+
+    def getPositionMessage(self) -> str:
+        """Get formatted position message for Telegram."""
+        netPosition = self.backpack_position + self.lighter_position
+        imbalance = abs(netPosition)
+        statusEmoji = "✅" if imbalance < Decimal('0.0001') else "⚠️"
+        status = "Balanced" if imbalance < Decimal('0.0001') else f"Imbalanced ({imbalance:.4f})"
+
+        # Format positions with proper decimal places
+        bpPos = float(self.backpack_position)
+        ltPos = float(self.lighter_position)
+        netPos = float(netPosition)
+
+        return (
+            f"<b>📊 Current Positions</b>\n"
+            f"Ticker: <code>{self.ticker}</code>\n"
+            "---\n"
+            f"<b>Backpack:</b> {bpPos:+.4f} {self.ticker}\n"
+            f"<b>Lighter:</b> {ltPos:+.4f} {self.ticker}\n"
+            f"<b>Net:</b> {netPos:+.4f} {self.ticker}\n"
+            f"<b>Status:</b> {statusEmoji} {status}\n"
+            "---\n"
+            f"<b>Progress:</b> {self.order_counter}/{self.iterations} iterations"
+        )
+
+    def startTelegramPolling(self):
+        """Start the Telegram command polling background task."""
+        if self.telegram_bot:
+            self.telegramPollingTask = asyncio.create_task(self.telegramCommandPolling())
+            self.logger.info("Telegram polling task created")
+
+    def stopTelegramPolling(self):
+        """Stop the Telegram command polling background task."""
+        if self.telegramPollingTask and not self.telegramPollingTask.done():
+            self.telegramPollingTask.cancel()
+            self.logger.info("Telegram polling task cancelled")
 
     def _initialize_csv_file(self):
         """Initialize CSV file with headers if it doesn't exist."""
@@ -228,6 +461,17 @@ class HedgeBot:
                 price=str(order_data['avg_filled_price']),
                 quantity=str(order_data['filled_base_amount'])
             )
+
+            # Send telegram alert for Lighter trade
+            tradeMsg = (
+                f"<b>📊 Lighter Trade Filled</b>\n"
+                f"Ticker: {self.ticker}\n"
+                f"Side: {order_data['side']}\n"
+                f"Size: {order_data['filled_base_amount']}\n"
+                f"Price: ${order_data['avg_filled_price']:.2f}\n"
+                f"Position: {self.lighter_position}"
+            )
+            self.send_telegram_alert(tradeMsg)
 
             # Mark execution as complete
             self.lighter_order_filled = True  # Mark order as filled
@@ -1114,6 +1358,17 @@ class HedgeBot:
                         quantity=str(filled_size)
                     )
 
+                    # Send telegram alert for Backpack trade
+                    tradeMsg = (
+                        f"<b>📊 Backpack Trade Filled</b>\n"
+                        f"Ticker: {self.ticker}\n"
+                        f"Side: {side.upper()}\n"
+                        f"Size: {filled_size}\n"
+                        f"Price: ${price}\n"
+                        f"Position: {self.backpack_position}"
+                    )
+                    self.send_telegram_alert(tradeMsg)
+
                     self.handle_backpack_order_update({
                         'order_id': order_id,
                         'side': side,
@@ -1276,9 +1531,29 @@ class HedgeBot:
 
         await asyncio.sleep(5)
 
+        # Send Telegram notification for bot start
+        startMsg = (
+            f"<b>Hedge Bot Started</b>\n"
+            f"Ticker: {self.ticker}\n"
+            f"Size: {self.order_quantity}\n"
+            f"Iterations: {self.iterations}"
+        )
+        self.send_telegram_alert(startMsg)
+
         iterations = 0
         while iterations < self.iterations and not self.stop_flag:
+            # Check for stop request from TelegramService
+            if self.checkStopFlag():
+                self.stop_flag = True
+                self.send_telegram_alert(f"<b>🛑 Hedge Bot Stopping</b>\nTicker: {self.ticker}\nReason: Telegram stop command")
+                break
+
             iterations += 1
+            self.order_counter = iterations  # Update for status file
+
+            # Update status file with current progress
+            self.updateStatusFile(running=True)
+
             self.logger.info("-----------------------------------------------")
             self.logger.info(f"🔄 Trading loop iteration {iterations}")
             self.logger.info("-----------------------------------------------")
@@ -1289,11 +1564,30 @@ class HedgeBot:
             # Log balance status at configured intervals
             self.log_balance_status(iterations)
 
+            # Send periodic Telegram status update every 10 iterations
+            if iterations % 10 == 0:
+                statusMsg = (
+                    f"<b>Hedge Bot Status</b>\n"
+                    f"Ticker: {self.ticker}\n"
+                    f"Progress: {iterations}/{self.iterations}\n"
+                    f"Position:\n"
+                    f"  Backpack: {self.backpack_position}\n"
+                    f"  Lighter: {self.lighter_position}"
+                )
+                self.send_telegram_alert(statusMsg)
+
             self.logger.info(f"[STEP 1] Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
 
             positionDiffThreshold = self.config.get("trading", "position_diff_threshold")
             if abs(self.backpack_position + self.lighter_position) > positionDiffThreshold:
                 self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position} (threshold: {positionDiffThreshold})")
+                self.send_telegram_alert(
+                    f"<b>ALERT: Position Imbalance</b>\n"
+                    f"Ticker: {self.ticker}\n"
+                    f"Backpack: {self.backpack_position}\n"
+                    f"Lighter: {self.lighter_position}\n"
+                    f"Diff: {abs(self.backpack_position + self.lighter_position)}"
+                )
                 break
 
             self.order_execution_complete = False
@@ -1393,10 +1687,37 @@ class HedgeBot:
         """Run the hedge bot."""
         self.setup_signal_handlers()
 
+        # Update status file to indicate bot is running
+        self.updateStatusFile(running=True)
+
+        # Start Telegram command polling in background
+        self.startTelegramPolling()
+
         try:
             await self.trading_loop()
+            # Send completion notification
+            bpPos = float(self.backpack_position)
+            ltPos = float(self.lighter_position)
+            netPos = bpPos + ltPos
+            statusEmoji = "✅" if abs(netPos) < 0.0001 else "⚠️"
+            completionMsg = (
+                f"<b>✅ Hedge Bot Completed</b>\n"
+                f"Ticker: <code>{self.ticker}</code>\n"
+                "---\n"
+                f"<b>📊 Final Positions:</b>\n"
+                f"  Backpack: {bpPos:+.4f} {self.ticker}\n"
+                f"  Lighter: {ltPos:+.4f} {self.ticker}\n"
+                f"  Net: {netPos:+.4f} {statusEmoji}\n"
+                "---\n"
+                f"🔄 Iterations: {self.order_counter}/{self.iterations}"
+            )
+            self.send_telegram_alert(completionMsg)
         except KeyboardInterrupt:
             self.logger.info("\n🛑 Received interrupt signal...")
+            self.send_telegram_alert(f"<b>Hedge Bot Stopped</b>\nTicker: {self.ticker}\nReason: User interrupt")
+        except Exception as e:
+            self.logger.error(f"Unexpected error: {e}")
+            self.send_telegram_alert(f"<b>Hedge Bot Error</b>\nTicker: {self.ticker}\nError: {str(e)[:200]}")
         finally:
             self.logger.info("🔄 Cleaning up...")
             self.shutdown()
@@ -1419,3 +1740,34 @@ def parse_arguments():
                         help='Path to configuration file (default: config.yaml)')
 
     return parser.parse_args()
+
+
+def main():
+    """Main entry point for the hedge bot."""
+    # Load environment variables from .env file
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    args = parse_arguments()
+
+    # Load config to get default values
+    config = ConfigLoader(args.config)
+
+    # Get values from args or config (args take precedence)
+    orderSize = Decimal(args.size) if args.size else Decimal(str(config.get("trading", "default_size")))
+    iterations = args.iter if args.iter else config.get("trading", "default_iterations")
+
+    # Create and run the bot
+    bot = HedgeBot(
+        ticker=args.ticker,
+        order_quantity=orderSize,
+        fill_timeout=args.fill_timeout,
+        iterations=iterations,
+        config_path=args.config
+    )
+
+    asyncio.run(bot.run())
+
+
+if __name__ == "__main__":
+    main()
