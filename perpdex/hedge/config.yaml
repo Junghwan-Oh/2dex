@@ -68,6 +68,30 @@ pricing:
   # 예: 1.002 = 진입가보다 0.2% 높게 청산 주문
   sell_price_multiplier: 1.002
 
+progressive_sizing:
+  # Progressive sizing 활성화 여부
+  enabled: false  # 테스트 후 true로 변경
+
+  # 초기 사이즈 (SOL)
+  initial_size: 0.1
+
+  # 검증 메커니즘
+  validation_count: 3        # 각 사이즈당 3회 연속 성공 필요
+  size_multiplier: 2.0       # 검증 통과 시 2배 증가
+
+  # 3단계 목표 설정 (USD)
+  phase_targets:
+    - max_position_value_usd: 1000.0   # Phase 1: $1K
+    - max_position_value_usd: 5000.0   # Phase 2: $5K
+    - max_position_value_usd: 25000.0  # Phase 3: $25K
+
+  # 안전 장치
+  downgrade_on_failure: true           # 실패 시 이전 사이즈로 복귀
+  max_consecutive_failures: 2          # 연속 실패 2회까지 허용
+
+  # Phase 전환 승인
+  manual_phase_approval: true          # Phase 전환 시 사용자 승인 필요
+
 # 참고: 아래 값들은 CLI에서만 설정 가능
 # --exchange: 거래소 (backpack, extended)
 # --ticker: 거래 심볼 (BTC, ETH, SOL)

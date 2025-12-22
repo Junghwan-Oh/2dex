@@ -605,9 +605,12 @@ class HedgeBot:
 
                     # Get auth token for the subscription
                     try:
-                        # Set auth token to expire in 10 minutes
-                        ten_minutes_deadline = int(time.time() + 10 * 60)
-                        auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_deadline)
+                        # FIXED: Set auth token to expire in 10 minutes (relative seconds, not absolute timestamp)
+                        # SDK adds this to current timestamp internally
+                        ten_minutes_in_seconds = 10 * 60  # 600 seconds
+                        self.logger.info(f"🔧 DEBUG: Creating auth token with {ten_minutes_in_seconds}s expiry")
+                        self.logger.info(f"🔧 DEBUG: Channel: {account_orders_channel}")
+                        auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_in_seconds)
                         if err is not None:
                             self.logger.warning(f"⚠️ Failed to create auth token for account orders subscription: {err}")
                         else:
@@ -616,6 +619,7 @@ class HedgeBot:
                                 "channel": account_orders_channel,
                                 "auth": auth_token
                             }
+                            self.logger.info(f"🔧 DEBUG: Sending subscription: {json.dumps(auth_message)}")
                             await ws.send(json.dumps(auth_message))
                             self.logger.info("✅ Subscribed to account orders with auth token (expires in 10 minutes)")
                     except Exception as e:
@@ -633,6 +637,43 @@ class HedgeBot:
 
                             # Reset timeout counter on successful message
                             timeout_count = 0
+
+                            # Log ALL incoming messages with their type
+                            msg_type = data.get("type", "UNKNOWN_TYPE")
+                            self.logger.debug(f"📨 [LIGHTER WS] Received message type: {msg_type}")
+
+                            # Log message details based on type
+                            if msg_type == "subscribed/order_book":
+                                self.logger.info(f"📨 [LIGHTER WS] Subscription confirmation: subscribed to order book")
+                            elif msg_type == "subscribed/account_orders":
+                                self.logger.info(f"📨 [LIGHTER WS] Subscription confirmation: subscribed to account orders")
+                            elif msg_type == "update/order_book":
+                                order_book = data.get("order_book", {})
+                                offset = order_book.get("offset", "N/A")
+                                num_bids = len(order_book.get("bids", []))
+                                num_asks = len(order_book.get("asks", []))
+                                self.logger.debug(f"📨 [LIGHTER WS] Order book update - offset: {offset}, bids: {num_bids}, asks: {num_asks}")
+                            elif msg_type == "update/account_orders":
+                                orders_dict = data.get("orders", {})
+                                self.logger.info(f"📨 [LIGHTER WS] Account orders update received - Markets: {list(orders_dict.keys())}")
+                                for market_key, orders_list in orders_dict.items():
+                                    self.logger.info(f"📨 [LIGHTER WS] Market {market_key}: {len(orders_list)} orders")
+                                    for idx, order in enumerate(orders_list):
+                                        order_id = order.get("order_id", "UNKNOWN")
+                                        status = order.get("status", "UNKNOWN")
+                                        side = order.get("side", "UNKNOWN")
+                                        size = order.get("size", 0)
+                                        price = order.get("price", 0)
+                                        self.logger.info(f"📨 [LIGHTER WS]   Order {idx}: id={order_id}, status={status}, side={side}, size={size}, price={price}")
+                            elif msg_type == "ping":
+                                self.logger.debug(f"📨 [LIGHTER WS] Ping received (sending pong)")
+                            else:
+                                # Log unexpected message types with full payload
+                                payload_str = json.dumps(data, default=str)
+                                if len(payload_str) > 500:
+                                    payload_str = payload_str[:500] + "..."
+                                self.logger.warning(f"📨 [LIGHTER WS] UNEXPECTED MESSAGE TYPE: {msg_type}")
+                                self.logger.warning(f"📨 [LIGHTER WS] Payload: {payload_str}")
 
                             async with self.lighter_order_book_lock:
                                 if data.get("type") == "subscribed/order_book":
@@ -701,9 +742,16 @@ class HedgeBot:
                                 elif data.get("type") == "update/account_orders":
                                     # Handle account orders updates
                                     orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
+                                    self.logger.debug(f"📨 [LIGHTER WS] Processing {len(orders)} orders for market {self.lighter_market_index}")
                                     for order in orders:
-                                        if order.get("status") == "filled":
+                                        order_status = order.get("status", "UNKNOWN")
+                                        order_id = order.get("order_id", "UNKNOWN")
+                                        self.logger.debug(f"📨 [LIGHTER WS] Processing order id={order_id}, status={order_status}")
+                                        if order_status == "filled":
+                                            self.logger.info(f"✅ [LIGHTER WS] Order FILLED: id={order_id}")
                                             self.handle_lighter_order_result(order)
+                                        else:
+                                            self.logger.debug(f"📨 [LIGHTER WS] Skipping order id={order_id} with status={order_status} (not filled)")
                                 elif data.get("type") == "update/order_book" and not self.lighter_snapshot_loaded:
                                     # Ignore updates until we have the initial snapshot
                                     continue
@@ -1025,13 +1073,19 @@ class HedgeBot:
             if "order_books" not in data:
                 raise Exception("Unexpected response format")
 
+            # Convert ticker to Lighter market symbol format (e.g., ETH -> ETH/USDC)
+            lighter_symbol = f"{self.ticker}/USDC"
+            self.logger.info(f"Looking for Lighter market: {lighter_symbol}")
+
             for market in data["order_books"]:
-                if market["symbol"] == self.ticker:
-                    return (market["market_id"],
+                if market["symbol"] == lighter_symbol:
+                    market_id = market["market_id"]
+                    self.logger.info(f"Found Lighter market: {lighter_symbol} (market_id={market_id})")
+                    return (market_id,
                             pow(10, market["supported_size_decimals"]),
                             pow(10, market["supported_price_decimals"]))
 
-            raise Exception(f"Ticker {self.ticker} not found")
+            raise Exception(f"Market {lighter_symbol} not found in Lighter order books")
 
         except Exception as e:
             self.logger.error(f"⚠️ Error getting market config: {e}")

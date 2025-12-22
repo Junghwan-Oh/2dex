@@ -259,13 +259,18 @@ class LighterCustomWebSocketManager:
 
                     # Subscribe to account orders updates
                     account_orders_channel = f"account_orders/{self.market_index}/{self.account_index}"
+                    self._log(f"🔧 DEBUG: Subscribing to channel: {account_orders_channel}", "INFO")
+                    self._log(f"🔧 DEBUG: market_index={self.market_index}, account_index={self.account_index}", "INFO")
 
                     # Get auth token for the subscription
                     try:
                         if self.lighter_client:
                             # Set auth token to expire in 10 minutes
-                            ten_minutes_deadline = int(time.time() + 10 * 60)
-                            auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_deadline)
+                            # FIXED: relative deadline in seconds, not absolute timestamp
+                            ten_minutes_in_seconds = 10 * 60
+                            self._log(f"🔧 DEBUG: Calling create_auth_token_with_expiry({ten_minutes_in_seconds})", "INFO")
+                            auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_in_seconds)
+                            self._log(f"🔧 DEBUG: Auth token result - has_token={bool(auth_token)}, err={err}", "INFO")
                             if err is not None:
                                 self._log(f"Failed to create auth token for account orders subscription: {err}", "WARNING")
                             else:
@@ -274,6 +279,7 @@ class LighterCustomWebSocketManager:
                                     "channel": account_orders_channel,
                                     "auth": auth_token
                                 }
+                                self._log(f"🔧 DEBUG: Sending subscription message: {json.dumps(auth_message)}", "INFO")
                                 await self.ws.send(json.dumps(auth_message))
                                 self._log("Subscribed to account orders with auth token (expires in 10 minutes)", "INFO")
                     except Exception as e:
