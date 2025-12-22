@@ -70,7 +70,7 @@ pricing:
 
 progressive_sizing:
   # Progressive sizing 활성화 여부
-  enabled: false  # 테스트 후 true로 변경
+  enabled: true  # ✅ Lighter 인증 수정 완료 후 활성화
 
   # 초기 사이즈 (SOL)
   initial_size: 0.1
