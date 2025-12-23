@@ -1323,14 +1323,28 @@ class HedgeBot:
         while not self.lighter_order_filled and not self.stop_flag:
             # Check for timeout (30 seconds total)
             if time.time() - start_time > 30:
-                self.logger.error(f"❌ Timeout waiting for Lighter order fill after {time.time() - start_time:.1f}s")
-                self.logger.error(f"❌ Order state - Filled: {self.lighter_order_filled}")
+                elapsed = time.time() - start_time
+                self.logger.error("="*60)
+                self.logger.error(f"❌ CRITICAL: Lighter order TIMEOUT after {elapsed:.1f}s")
+                self.logger.error(f"❌ Order: {self.lighter_order_side} {self.lighter_order_size} @ {self.lighter_order_price}")
+                self.logger.error("❌ STOPPING BOT - Manual intervention required")
+                self.logger.error("="*60)
 
-                # Fallback: Mark as filled to continue trading
-                self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
-                self.lighter_order_filled = True
-                self.waiting_for_lighter_fill = False
-                self.order_execution_complete = True
+                # Send critical Telegram alert
+                self.send_telegram_alert(
+                    f"<b>🚨 LIGHTER ORDER TIMEOUT</b>\n\n"
+                    f"Ticker: {self.ticker}\n"
+                    f"Order: {self.lighter_order_side} {self.lighter_order_size} @ {self.lighter_order_price}\n"
+                    f"Timeout: {elapsed:.1f}s\n\n"
+                    f"<b>Action:</b> Bot stopped\n"
+                    f"<b>Next Step:</b> Manual verification required\n"
+                    f"1. Check Lighter API/WebSocket status\n"
+                    f"2. Verify actual positions on both exchanges\n"
+                    f"3. Resume bot only after confirming hedge balance"
+                )
+
+                # STOP BOT IMMEDIATELY (NO FALLBACK)
+                self.stop_flag = True
                 break
 
             await asyncio.sleep(0.1)  # Check every 100ms
@@ -1585,6 +1599,166 @@ class HedgeBot:
 
         await asyncio.sleep(5)
 
+    async def _fetch_lighter_position_rest(self) -> Decimal:
+        """
+        Fetch actual Lighter position via REST API.
+
+        Returns:
+            Decimal: Net position in ETH (positive = long, negative = short)
+        """
+        try:
+            url = f"{self.lighter_base_url}/api/v1/positions"
+            params = {
+                "account": str(self.account_index),
+                "apiKeyIndex": str(self.api_key_index)
+            }
+            headers = {"accept": "application/json"}
+
+            self.logger.debug(f"Fetching Lighter position: GET {url} with params {params}")
+
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+            self.logger.debug(f"Lighter positions response: {data}")
+
+            # Find ETH/USDC position
+            lighter_symbol = f"{self.ticker}/USDC"
+            net_position = Decimal('0')
+
+            if isinstance(data, list):
+                for position in data:
+                    if position.get('symbol') == lighter_symbol:
+                        size = Decimal(str(position.get('size', '0')))
+                        side = position.get('side', '')
+
+                        # Convert to signed position
+                        if side.lower() == 'long':
+                            net_position = size
+                        elif side.lower() == 'short':
+                            net_position = -size
+
+                        self.logger.debug(f"Found {lighter_symbol} position: {side} {size} → net {net_position}")
+                        break
+
+            elif isinstance(data, dict):
+                # Alternative response format
+                positions = data.get('positions', [])
+                for position in positions:
+                    if position.get('symbol') == lighter_symbol:
+                        size = Decimal(str(position.get('size', '0')))
+                        side = position.get('side', '')
+
+                        if side.lower() == 'long':
+                            net_position = size
+                        elif side.lower() == 'short':
+                            net_position = -size
+
+                        self.logger.debug(f"Found {lighter_symbol} position: {side} {size} → net {net_position}")
+                        break
+
+            return net_position
+
+        except Exception as e:
+            self.logger.error(f"❌ Error fetching Lighter position via REST: {e}")
+            self.logger.error(f"❌ Response: {response.text if 'response' in locals() else 'N/A'}")
+            raise
+
+    async def _fetch_backpack_position_rest(self) -> Decimal:
+        """
+        Fetch actual Backpack position via REST API.
+
+        Returns:
+            Decimal: Net position in ETH (positive = long, negative = short)
+        """
+        try:
+            if not self.backpack_client:
+                raise Exception("Backpack client not initialized")
+
+            # Use Backpack client to get positions
+            positions = await self.backpack_client.get_positions()
+
+            self.logger.debug(f"Backpack positions response: {positions}")
+
+            # Find ETH_USDC_PERP position
+            symbol = f"{self.ticker}_USDC_PERP"
+            net_position = Decimal('0')
+
+            if isinstance(positions, list):
+                for position in positions:
+                    if position.get('symbol') == symbol:
+                        # Backpack returns net position directly
+                        net_position = Decimal(str(position.get('position', '0')))
+                        self.logger.debug(f"Found {symbol} position: {net_position}")
+                        break
+
+            return net_position
+
+        except Exception as e:
+            self.logger.error(f"❌ Error fetching Backpack position via REST: {e}")
+            raise
+
+    async def verify_hedge_completion(self) -> bool:
+        """
+        Verify that hedge is actually balanced by fetching real positions from both exchanges.
+
+        Returns:
+            bool: True if hedge is confirmed successful, False otherwise
+        """
+        try:
+            self.logger.info("🔍 [HEDGE VERIFICATION] Starting verification...")
+
+            # Get tolerance and threshold from config
+            tolerance = Decimal(str(self.config.get("hedge_verification", "position_tolerance", 0.001)))
+            threshold = Decimal(str(self.config.get("trading", "position_diff_threshold", 0.2)))
+
+            # Fetch actual positions from both exchanges
+            self.logger.info("🔍 [HEDGE VERIFICATION] Fetching Lighter position via REST...")
+            actual_lighter = await self._fetch_lighter_position_rest()
+
+            self.logger.info("🔍 [HEDGE VERIFICATION] Fetching Backpack position via REST...")
+            actual_backpack = await self._fetch_backpack_position_rest()
+
+            # Log actual vs tracked positions
+            self.logger.info("="*60)
+            self.logger.info("📊 [HEDGE VERIFICATION] Position Comparison:")
+            self.logger.info(f"   Lighter  - Actual: {actual_lighter:>10} | Tracked: {self.lighter_position:>10}")
+            self.logger.info(f"   Backpack - Actual: {actual_backpack:>10} | Tracked: {self.backpack_position:>10}")
+
+            # Check for discrepancies
+            lighter_diff = abs(actual_lighter - self.lighter_position)
+            backpack_diff = abs(actual_backpack - self.backpack_position)
+
+            if lighter_diff > tolerance:
+                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Lighter position mismatch: {lighter_diff} (tolerance: {tolerance})")
+                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Updating tracked Lighter position: {self.lighter_position} → {actual_lighter}")
+                self.lighter_position = actual_lighter
+
+            if backpack_diff > tolerance:
+                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Backpack position mismatch: {backpack_diff} (tolerance: {tolerance})")
+                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Updating tracked Backpack position: {self.backpack_position} → {actual_backpack}")
+                self.backpack_position = actual_backpack
+
+            # Calculate net position
+            net_position = actual_lighter + actual_backpack
+            self.logger.info(f"📊 [HEDGE VERIFICATION] Net Position: {net_position} (threshold: {threshold})")
+
+            # Verify hedge balance
+            if abs(net_position) > threshold:
+                self.logger.error(f"❌ [HEDGE VERIFICATION] FAILED - Net position {net_position} exceeds threshold {threshold}")
+                self.logger.error(f"❌ [HEDGE VERIFICATION] Lighter: {actual_lighter} | Backpack: {actual_backpack}")
+                self.logger.info("="*60)
+                return False
+
+            self.logger.info(f"✅ [HEDGE VERIFICATION] PASSED - Hedge is balanced")
+            self.logger.info("="*60)
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ [HEDGE VERIFICATION] Exception during verification: {e}")
+            self.logger.error("❌ [HEDGE VERIFICATION] FAILED - Unable to verify hedge")
+            return False
+
         # Send Telegram notification for bot start
         startMsg = (
             f"<b>Hedge Bot Started</b>\n"
@@ -1630,19 +1804,34 @@ class HedgeBot:
                 )
                 self.send_telegram_alert(statusMsg)
 
-            self.logger.info(f"[STEP 1] Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
+            # ============================================================
+            # HEDGE VERIFICATION GATE (매 반복 시작 전)
+            # ============================================================
+            self.logger.info("="*60)
+            self.logger.info(f"🔍 [PRE-ITERATION CHECK] Iteration {iterations}")
+            self.logger.info("="*60)
 
-            positionDiffThreshold = self.config.get("trading", "position_diff_threshold")
-            if abs(self.backpack_position + self.lighter_position) > positionDiffThreshold:
-                self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position} (threshold: {positionDiffThreshold})")
+            # Log locally tracked positions
+            self.logger.info(f"📊 Tracked - Backpack: {self.backpack_position} | Lighter: {self.lighter_position}")
+
+            # Verify hedge via REST API before proceeding
+            self.logger.info("🔍 Verifying hedge balance via REST API...")
+            hedge_verified = await self.verify_hedge_completion()
+
+            if not hedge_verified:
+                self.logger.error("❌ HEDGE VERIFICATION FAILED - STOPPING BOT")
                 self.send_telegram_alert(
-                    f"<b>ALERT: Position Imbalance</b>\n"
+                    f"<b>🚨 HEDGE VERIFICATION FAILED</b>\n"
                     f"Ticker: {self.ticker}\n"
-                    f"Backpack: {self.backpack_position}\n"
-                    f"Lighter: {self.lighter_position}\n"
-                    f"Diff: {abs(self.backpack_position + self.lighter_position)}"
+                    f"Iteration: {iterations}\n"
+                    f"Tracked - BP: {self.backpack_position}, LT: {self.lighter_position}\n"
+                    f"Action: Bot stopped for safety"
                 )
+                self.stop_flag = True
                 break
+
+            self.logger.info("✅ Hedge verified - safe to proceed with new orders")
+            self.logger.info("="*60)
 
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False

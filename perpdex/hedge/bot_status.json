@@ -1,9 +1,9 @@
 {
-  "running": true,
+  "running": false,
   "ticker": "ETH",
-  "order_size": "0.01",
+  "order_size": "25.600000000",
   "iteration": 1,
-  "iterations": 1,
-  "start_time": "2025-12-22T20:21:21.860168",
+  "iterations": 999,
+  "stop_time": "2025-12-22T21:20:05.224528",
   "stop_requested": false
 }

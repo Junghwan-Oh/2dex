@@ -92,6 +92,27 @@ progressive_sizing:
   # Phase 전환 승인
   manual_phase_approval: true          # Phase 전환 시 사용자 승인 필요
 
+hedge_verification:
+  # REST API 포지션 검증 활성화 여부
+  # 매 반복 시작 전 양쪽 거래소의 실제 포지션을 REST API로 조회하여 헷지 균형 확인
+  enabled: true
+
+  # 포지션 허용 오차 (ETH)
+  # 실제 포지션과 추적된 포지션의 차이가 이 값 초과 시 추적 포지션 업데이트
+  # 예: 0.001 = 0.001 ETH 이상 차이나면 조정
+  position_tolerance: 0.001
+
+  # REST API 포지션 조회 최대 재시도 횟수
+  max_retries: 3
+
+  # 재시도 간 대기 시간 (초)
+  retry_delay: 2
+
+  # 검증 실패 시 봇 중지 여부
+  # true: 헷지 불균형 감지 시 즉시 봇 중지하고 텔레그램 알림
+  # false: 경고만 로깅하고 계속 실행 (권장하지 않음)
+  stop_on_failure: true
+
 # 참고: 아래 값들은 CLI에서만 설정 가능
 # --exchange: 거래소 (backpack, extended)
 # --ticker: 거래 심볼 (BTC, ETH, SOL)
