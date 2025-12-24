@@ -1,18 +1,74 @@
 """
 GRVT exchange client implementation.
+
+NOTE: SDK imports are deferred (lazy) to avoid aiohttp import blocking on Windows.
+The pysdk modules import aiohttp at module level, which can hang indefinitely.
+All SDK classes are imported inside methods when first needed.
 """
 
 import os
 import asyncio
 import time
 from decimal import Decimal
-from typing import Dict, Any, List, Optional, Tuple
-from pysdk.grvt_ccxt import GrvtCcxt
-from pysdk.grvt_ccxt_ws import GrvtCcxtWS
-from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+from typing import Dict, Any, List, Optional, Tuple, TYPE_CHECKING
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
+
+# Type hints only - no runtime import (avoids aiohttp blocking)
+if TYPE_CHECKING:
+    from pysdk.grvt_ccxt import GrvtCcxt
+    from pysdk.grvt_ccxt_ws import GrvtCcxtWS
+    from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+
+# Module-level cache for lazy-loaded SDK classes
+_sdkCache = {
+    'GrvtCcxt': None,
+    'GrvtCcxtWS': None,
+    'GrvtEnv': None,
+    'GrvtWSEndpointType': None,
+    'logger': None,
+}
+
+
+def _getGrvtEnv():
+    """Lazy load GrvtEnv enum."""
+    if _sdkCache['GrvtEnv'] is None:
+        from pysdk.grvt_ccxt_env import GrvtEnv
+        _sdkCache['GrvtEnv'] = GrvtEnv
+    return _sdkCache['GrvtEnv']
+
+
+def _getGrvtWSEndpointType():
+    """Lazy load GrvtWSEndpointType enum."""
+    if _sdkCache['GrvtWSEndpointType'] is None:
+        from pysdk.grvt_ccxt_env import GrvtWSEndpointType
+        _sdkCache['GrvtWSEndpointType'] = GrvtWSEndpointType
+    return _sdkCache['GrvtWSEndpointType']
+
+
+def _getGrvtCcxt():
+    """Lazy load GrvtCcxt class."""
+    if _sdkCache['GrvtCcxt'] is None:
+        from pysdk.grvt_ccxt import GrvtCcxt
+        _sdkCache['GrvtCcxt'] = GrvtCcxt
+    return _sdkCache['GrvtCcxt']
+
+
+def _getGrvtCcxtWS():
+    """Lazy load GrvtCcxtWS class."""
+    if _sdkCache['GrvtCcxtWS'] is None:
+        from pysdk.grvt_ccxt_ws import GrvtCcxtWS
+        _sdkCache['GrvtCcxtWS'] = GrvtCcxtWS
+    return _sdkCache['GrvtCcxtWS']
+
+
+def _getGrvtLogger():
+    """Lazy load GRVT SDK logger."""
+    if _sdkCache['logger'] is None:
+        from pysdk.grvt_ccxt_logging_selector import logger
+        _sdkCache['logger'] = logger
+    return _sdkCache['logger']
 
 
 class GrvtClient(BaseExchangeClient):
@@ -33,14 +89,15 @@ class GrvtClient(BaseExchangeClient):
                 "GRVT_TRADING_ACCOUNT_ID, GRVT_PRIVATE_KEY, and GRVT_API_KEY must be set in environment variables"
             )
 
-        # Convert environment string to proper enum
-        env_map = {
+        # Convert environment string to proper enum (lazy load GrvtEnv)
+        GrvtEnv = _getGrvtEnv()
+        envMap = {
             'prod': GrvtEnv.PROD,
             'testnet': GrvtEnv.TESTNET,
             'staging': GrvtEnv.STAGING,
             'dev': GrvtEnv.DEV
         }
-        self.env = env_map.get(self.environment.lower(), GrvtEnv.PROD)
+        self.env = envMap.get(self.environment.lower(), GrvtEnv.PROD)
 
         # Initialize logger
         self.logger = TradingLogger(exchange="grvt", ticker=self.config.ticker, log_to_console=False)
@@ -62,7 +119,8 @@ class GrvtClient(BaseExchangeClient):
                 'api_key': self.api_key
             }
 
-            # Initialize REST client
+            # Initialize REST client (lazy load GrvtCcxt)
+            GrvtCcxt = _getGrvtCcxt()
             self.rest_client = GrvtCcxt(
                 env=self.env,
                 parameters=parameters
@@ -84,8 +142,9 @@ class GrvtClient(BaseExchangeClient):
             # Initialize WebSocket client - match the working test implementation
             loop = asyncio.get_running_loop()
 
-            # Import logger from pysdk like in the test file
-            from pysdk.grvt_ccxt_logging_selector import logger
+            # Lazy load SDK components
+            GrvtCcxtWS = _getGrvtCcxtWS()
+            sdkLogger = _getGrvtLogger()
 
             # Parameters for GRVT SDK - match test file structure
             parameters = {
@@ -98,7 +157,7 @@ class GrvtClient(BaseExchangeClient):
             self._ws_client = GrvtCcxtWS(
                 env=self.env,
                 loop=loop,
-                logger=logger,  # Add logger parameter like in test file
+                logger=sdkLogger,  # Add logger parameter like in test file
                 parameters=parameters
             )
 
@@ -220,6 +279,8 @@ class GrvtClient(BaseExchangeClient):
     async def _subscribe_to_orders(self, callback):
         """Subscribe to order updates asynchronously."""
         try:
+            # Lazy load endpoint type
+            GrvtWSEndpointType = _getGrvtWSEndpointType()
             await self._ws_client.subscribe(
                 stream="order",
                 callback=callback,
