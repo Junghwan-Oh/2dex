@@ -309,9 +309,51 @@ class GrvtClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
+    def _round_price_to_tick(self, price: Decimal, side: str) -> Decimal:
+        """Round price to valid tick size for GRVT.
+
+        For buy orders: round UP to nearest tick (more expensive = better fill)
+        For sell orders: round DOWN to nearest tick (cheaper = better fill)
+        """
+        # Get tick size from config or use default
+        tick_size = getattr(self.config, 'tick_size', None)
+        if tick_size is None or tick_size <= 0:
+            tick_size = Decimal('0.01')  # Default fallback for ETH/BTC
+
+        if side.lower() == 'buy':
+            # Round up for buy orders
+            return (price / tick_size).quantize(Decimal('1'), rounding='ROUND_UP') * tick_size
+        else:
+            # Round down for sell orders
+            return (price / tick_size).quantize(Decimal('1'), rounding='ROUND_DOWN') * tick_size
+
     async def place_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                    side: str) -> OrderResult:
-        """Place a post only order with GRVT using official SDK."""
+                                    side: str, use_ioc: bool = False) -> OrderResult:
+        """Place order with GRVT using official SDK.
+
+        Args:
+            use_ioc: If True, use IMMEDIATE_OR_CANCEL for TAKER execution.
+                     If False (default), use GOOD_TILL_TIME for MAKER orders.
+        """
+        # Round price to valid tick size
+        price = self._round_price_to_tick(price, side)
+
+        # Build params based on order type
+        # Note: GRVT rejects orders with EXCEED_MAX_SIGNATURE_EXPIRATION if duration is too long
+        if use_ioc:
+            # IOC: Immediate Or Cancel - for TAKER orders that must fill immediately
+            # Short duration for IOC (60 seconds)
+            params = {
+                'post_only': False,
+                'order_duration_secs': 60,
+                'time_in_force': 'IMMEDIATE_OR_CANCEL'
+            }
+        else:
+            # Regular limit order - 1 day duration
+            params = {
+                'post_only': False,
+                'order_duration_secs': 86400,
+            }
 
         # Place the order using GRVT SDK
         order_result = self.rest_client.create_limit_order(
@@ -319,10 +361,7 @@ class GrvtClient(BaseExchangeClient):
             side=side,
             amount=quantity,
             price=price,
-            params={
-                'post_only': True,
-                'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
-            }
+            params=params
         )
         if not order_result:
             raise Exception(f"[OPEN] Error placing order")
@@ -330,19 +369,25 @@ class GrvtClient(BaseExchangeClient):
         client_order_id = order_result.get('metadata').get('client_order_id')
         order_status = order_result.get('state').get('status')
         order_status_start_time = time.time()
-        order_info = await self.get_order_info(client_order_id=client_order_id)
-        if order_info is not None:
-            order_status = order_info.status
 
-        while order_status in ['PENDING'] and time.time() - order_status_start_time < 10:
-            # Check order status after a short delay
-            await asyncio.sleep(0.05)
+        # IOC orders need longer polling interval (GRVT processes async)
+        poll_interval = 0.5 if use_ioc else 0.05
+
+        # Wait before first poll to let GRVT process the order
+        await asyncio.sleep(poll_interval)
+
+        # Poll until order is processed or timeout
+        while time.time() - order_status_start_time < 10:
             order_info = await self.get_order_info(client_order_id=client_order_id)
             if order_info is not None:
                 order_status = order_info.status
+                # Terminal states: FILLED, CANCELLED, OPEN (for non-IOC)
+                if order_status in ['FILLED', 'CANCELLED', 'OPEN']:
+                    break
+            await asyncio.sleep(poll_interval)
 
         if order_status == 'PENDING':
-            raise Exception('Paradex Server Error: Order not processed after 10 seconds')
+            raise Exception('GRVT Server Error: Order not processed after 10 seconds')
         else:
             return order_info
 
@@ -353,9 +398,11 @@ class GrvtClient(BaseExchangeClient):
             raise ValueError("Invalid bid/ask prices")
 
         if direction == 'buy':
-            return best_ask - self.config.tick_size
+            # TAKER: hit the ask price for immediate execution
+            return best_ask + self.config.tick_size
         elif direction == 'sell':
-            return best_bid + self.config.tick_size
+            # TAKER: hit the bid price for immediate execution
+            return best_bid - self.config.tick_size
         else:
             raise ValueError("Invalid direction")
 
@@ -381,27 +428,50 @@ class GrvtClient(BaseExchangeClient):
             if best_bid <= 0 or best_ask <= 0:
                 return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
-            # Determine order side and price
+            # Determine order side and price for TAKER execution
             if direction == 'buy':
-                order_price = best_ask - self.config.tick_size
+                # TAKER BUY: Use ask price to hit the offer
+                order_price = best_ask
             elif direction == 'sell':
-                order_price = best_bid + self.config.tick_size
+                # TAKER SELL: Use bid price to hit the bid
+                order_price = best_bid
             else:
                 raise Exception(f"[OPEN] Invalid direction: {direction}")
 
-            # Place the order using GRVT SDK
+            # Place IOC order for immediate TAKER execution
             try:
-                order_info = await self.place_post_only_order(contract_id, quantity, order_price, direction)
+                order_info = await self.place_post_only_order(
+                    contract_id, quantity, order_price, direction, use_ioc=True
+                )
             except Exception as e:
                 self.logger.log(f"[OPEN] Error placing order: {e}", "ERROR")
+                await asyncio.sleep(2.0)  # Rate limit protection: wait before retry
                 continue
 
             order_status = order_info.status
             order_id = order_info.order_id
 
             if order_status == 'REJECTED':
+                self.logger.log(f"[OPEN] Order rejected, retrying...", "DEBUG")
+                await asyncio.sleep(1.0)  # Rate limit protection: wait before retry
                 continue
-            if order_status in ['OPEN', 'FILLED']:
+            if order_status == 'CANCELLED':
+                # IOC order didn't fill - retry with fresh price
+                self.logger.log(f"[OPEN] IOC order cancelled (not filled), retrying...", "DEBUG")
+                await asyncio.sleep(0.5)
+                continue
+            if order_status == 'FILLED':
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    side=direction,
+                    size=quantity,
+                    price=order_price,
+                    status=order_status
+                )
+            if order_status == 'OPEN':
+                # IOC orders shouldn't be OPEN, but handle gracefully
+                self.logger.log(f"[OPEN] Unexpected OPEN status for IOC order", "WARNING")
                 return OrderResult(
                     success=True,
                     order_id=order_id,
@@ -449,12 +519,14 @@ class GrvtClient(BaseExchangeClient):
                 order_info = await self.place_post_only_order(contract_id, quantity, adjusted_price, side)
             except Exception as e:
                 self.logger.log(f"[CLOSE] Error placing order: {e}", "ERROR")
+                await asyncio.sleep(2.0)  # Rate limit protection: wait before retry
                 continue
 
             order_status = order_info.status
             order_id = order_info.order_id
 
             if order_status == 'REJECTED':
+                await asyncio.sleep(1.0)  # Rate limit protection: wait before retry
                 continue
             if order_status in ['OPEN', 'FILLED']:
                 return OrderResult(

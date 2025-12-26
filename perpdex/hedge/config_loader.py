@@ -60,6 +60,30 @@ class ConfigLoader:
         "pricing": {
             "buy_price_multiplier": 0.998,
             "sell_price_multiplier": 1.002,
+        },
+        "grvt_rebate_tracking": {
+            "enabled": True,
+            "rebate_rate": 0.0002,
+            "milestone_alerts": [1, 5, 10, 25, 50, 100],
+            "daily_summary": True,
+            "log_to_csv": True,
+        },
+        "progressive_sizing": {
+            "enabled": True,
+            "initial_size": 0.1,
+            "validation_count": 3,
+            "size_multiplier": 2.0,
+            "downgrade_on_failure": True,
+            "max_consecutive_failures": 2,
+            "manual_phase_approval": True,
+            "phase_targets": [
+                {"max_position_value_usd": 30.0},
+                {"max_position_value_usd": 60.0},
+                {"max_position_value_usd": 150.0},
+                {"max_position_value_usd": 300.0},
+                {"max_position_value_usd": 600.0},
+                {"max_position_value_usd": 1500.0},
+            ]
         }
     }
 
@@ -85,6 +109,13 @@ class ConfigLoader:
         "pricing": {
             "buy_price_multiplier": (int, float),
             "sell_price_multiplier": (int, float),
+        },
+        "grvt_rebate_tracking": {
+            "enabled": bool,
+            "rebate_rate": (int, float),
+            "milestone_alerts": list,
+            "daily_summary": bool,
+            "log_to_csv": bool,
         }
     }
 

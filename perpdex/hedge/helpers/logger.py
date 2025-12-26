@@ -64,15 +64,22 @@ class TradingLogger:
             tz=self.timezone
         )
 
-        # File handler
-        file_handler = logging.FileHandler(self.debug_log_file)
+        # File handler (UTF-8 encoding for emoji/unicode support)
+        file_handler = logging.FileHandler(self.debug_log_file, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-        # Console handler if requested
+        # Console handler if requested (UTF-8 stream for emoji/unicode support)
         if log_to_console:
-            console_handler = logging.StreamHandler()
+            import sys
+            import io
+            # Force UTF-8 encoding on console output
+            if hasattr(sys.stdout, 'buffer'):
+                console_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+            else:
+                console_stream = sys.stdout
+            console_handler = logging.StreamHandler(console_stream)
             console_handler.setLevel(logging.INFO)
             console_handler.setFormatter(formatter)
             logger.addHandler(console_handler)

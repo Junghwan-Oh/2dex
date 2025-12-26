@@ -10,16 +10,18 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Tuple
+from typing import Tuple, Optional
 
-from lighter.signer_client import SignerClient
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchanges.backpack import BackpackClient
+from exchanges.grvt import GrvtClient
 from config_loader import ConfigLoader
 from helpers.telegram_bot import TelegramBot
+from helpers.progressive_sizing import ProgressiveSizingManager
+from helpers.rebate_tracker import RebateTracker
 import websockets
 from datetime import datetime
 import pytz
@@ -32,16 +34,16 @@ class Config:
 
 
 class HedgeBot:
-    """Trading bot that places post-only orders on Backpack and hedges with market orders on Lighter."""
+    """Trading bot that places post-only orders on Backpack and hedges with market orders on GRVT."""
 
     def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, config_path: str = "config.yaml"):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
-        self.lighter_order_filled = False
+        self.grvt_order_filled = False
         self.iterations = iterations
         self.backpack_position = Decimal('0')
-        self.lighter_position = Decimal('0')
+        self.grvt_position = Decimal('0')
         self.current_order = {}
 
         # Load configuration from config.yaml
@@ -68,12 +70,17 @@ class HedgeBot:
         logging.getLogger('requests').setLevel(logging.WARNING)
         logging.getLogger('websockets').setLevel(logging.WARNING)
 
-        # Create file handler
-        file_handler = logging.FileHandler(self.log_filename)
+        # Create file handler (UTF-8 encoding for emoji/unicode support)
+        file_handler = logging.FileHandler(self.log_filename, encoding='utf-8')
         file_handler.setLevel(logging.INFO)
 
-        # Create console handler
-        console_handler = logging.StreamHandler(sys.stdout)
+        # Create console handler (UTF-8 stream for emoji/unicode support)
+        import io
+        if hasattr(sys.stdout, 'buffer'):
+            console_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        else:
+            console_stream = sys.stdout
+        console_handler = logging.StreamHandler(console_stream)
         console_handler.setLevel(logging.INFO)
 
         # Create different formatters for file and console
@@ -106,45 +113,47 @@ class HedgeBot:
         self.backpack_best_ask = None
         self.backpack_order_book_ready = False
 
-        # Lighter order book state
-        self.lighter_client = None
-        self.lighter_order_book = {"bids": {}, "asks": {}}
-        self.lighter_best_bid = None
-        self.lighter_best_ask = None
-        self.lighter_order_book_ready = False
-        self.lighter_order_book_offset = 0
-        self.lighter_order_book_sequence_gap = False
-        self.lighter_snapshot_loaded = False
-        self.lighter_order_book_lock = asyncio.Lock()
+        # GRVT order book state
+        self.grvt_client = None
+        self.grvt_order_book = {"bids": {}, "asks": {}}
+        self.grvt_best_bid = None
+        self.grvt_best_ask = None
+        self.grvt_order_book_ready = False
+        self.grvt_order_book_offset = 0
+        self.grvt_order_book_sequence_gap = False
+        self.grvt_snapshot_loaded = False
+        self.grvt_order_book_lock = asyncio.Lock()
 
-        # Lighter WebSocket state
-        self.lighter_ws_task = None
-        self.lighter_order_result = None
+        # GRVT WebSocket state
+        self.grvt_ws_task = None
+        self.grvt_order_result = None
 
-        # Lighter order management
-        self.lighter_order_status = None
-        self.lighter_order_price = None
-        self.lighter_order_side = None
-        self.lighter_order_size = None
-        self.lighter_order_start_time = None
+        # GRVT order management
+        self.grvt_order_status = None
+        self.grvt_order_price = None
+        self.grvt_order_side = None
+        self.grvt_order_size = None
+        self.grvt_order_start_time = None
 
         # Strategy state
-        self.waiting_for_lighter_fill = False
+        self.waiting_for_grvt_fill = False
         self.wait_start_time = None
 
         # Order execution tracking
         self.order_execution_complete = False
 
         # Current order details for immediate execution
-        self.current_lighter_side = None
-        self.current_lighter_quantity = None
-        self.current_lighter_price = None
-        self.lighter_order_info = None
+        self.current_grvt_side = None
+        self.current_grvt_quantity = None
+        self.current_grvt_price = None
+        self.grvt_order_info = None
 
-        # Lighter API configuration
-        self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
-        self.account_index = int(os.getenv('LIGHTER_ACCOUNT_INDEX'))
-        self.api_key_index = int(os.getenv('LIGHTER_API_KEY_INDEX'))
+        # GRVT API configuration
+        self.grvt_trading_account_id = os.getenv('GRVT_TRADING_ACCOUNT_ID')
+        self.grvt_private_key = os.getenv('GRVT_PRIVATE_KEY')
+        self.grvt_api_key = os.getenv('GRVT_API_KEY')
+        self.grvt_environment = os.getenv('GRVT_ENVIRONMENT', 'prod')
+        self.grvt_contract = f"{ticker}_USDT_Perp"  # GRVT contract ID
 
         # Backpack configuration
         self.backpack_public_key = os.getenv('BACKPACK_PUBLIC_KEY')
@@ -168,6 +177,30 @@ class HedgeBot:
         # Status file for inter-process communication with TelegramService
         from pathlib import Path
         self.statusFilePath = Path(__file__).parent / "bot_status.json"
+
+        # Initialize Progressive Sizing Manager
+        self.progressiveSizing = ProgressiveSizingManager(
+            config=self.config.config,
+            ticker=ticker,
+            logger=self.logger
+        )
+        self.logger.info(f"Progressive Sizing: {'ENABLED' if self.progressiveSizing.enabled else 'DISABLED'}")
+
+        # Initialize GRVT Rebate Tracker (STORY-004)
+        rebate_config = {
+            'rebate_tracking': {
+                'enabled': self.config.get('grvt_rebate_tracking', 'enabled', True),
+                'milestones': self.config.get('grvt_rebate_tracking', 'milestone_alerts', [1, 5, 10, 25, 50, 100]),
+                'telegram_notifications': True,
+                'csv_logging': self.config.get('grvt_rebate_tracking', 'log_to_csv', True)
+            }
+        }
+        self.rebateTracker = RebateTracker(
+            config=rebate_config,
+            ticker=ticker,
+            logger=self.logger
+        )
+        self.logger.info(f"GRVT Rebate Tracking: {'ENABLED' if self.rebateTracker.enabled else 'DISABLED'}")
 
     def updateStatusFile(self, running: bool = True):
         """Update status file for TelegramService inter-process communication."""
@@ -233,13 +266,13 @@ class HedgeBot:
             except Exception as e:
                 self.logger.error(f"Error disconnecting Backpack WebSocket: {e}")
 
-        # Cancel Lighter WebSocket task
-        if self.lighter_ws_task and not self.lighter_ws_task.done():
+        # Cancel GRVT WebSocket task
+        if self.grvt_ws_task and not self.grvt_ws_task.done():
             try:
-                self.lighter_ws_task.cancel()
-                self.logger.info("🔌 Lighter WebSocket task cancelled")
+                self.grvt_ws_task.cancel()
+                self.logger.info("🔌 GRVT WebSocket task cancelled")
             except Exception as e:
-                self.logger.error(f"Error cancelling Lighter WebSocket task: {e}")
+                self.logger.error(f"Error cancelling GRVT WebSocket task: {e}")
 
         # Stop Telegram polling task
         self.stopTelegramPolling()
@@ -288,13 +321,13 @@ class HedgeBot:
         if command == "menu":
             # Send inline keyboard menu
             bpPos = float(self.backpack_position)
-            ltPos = float(self.lighter_position)
+            grvtPos = float(self.grvt_position)
             menuText = (
                 f"<b>🤖 Hedge Bot Control Panel</b>\n"
                 f"Ticker: <code>{self.ticker}</code>\n"
                 "---\n"
                 f"📈 Backpack: {bpPos:+.4f}\n"
-                f"📉 Lighter: {ltPos:+.4f}\n"
+                f"📉 GRVT: {grvtPos:+.4f}\n"
                 f"🔄 Progress: {self.order_counter}/{self.iterations}\n"
                 "---\n"
                 "Select a command:"
@@ -315,7 +348,7 @@ class HedgeBot:
             # Stop the bot
             self.logger.info(f"Received {command} command from Telegram")
             bpPos = float(self.backpack_position)
-            ltPos = float(self.lighter_position)
+            grvtPos = float(self.grvt_position)
             stopMsg = (
                 f"<b>🛑 Bot Stopping...</b>\n"
                 f"Received <code>{command}</code> command.\n"
@@ -323,7 +356,7 @@ class HedgeBot:
                 "---\n"
                 f"📊 Final Positions:\n"
                 f"  Backpack: {bpPos:+.4f}\n"
-                f"  Lighter: {ltPos:+.4f}\n"
+                f"  GRVT: {grvtPos:+.4f}\n"
                 f"🔄 Completed: {self.order_counter}/{self.iterations} iterations"
             )
             self.send_telegram_alert(stopMsg)
@@ -352,40 +385,42 @@ class HedgeBot:
                 except Exception as e:
                     backpackBalance = f"Error: {e}"
 
-            # Get Lighter balance
-            lighterBalance = "N/A"
+            # Get GRVT balance
+            grvtBalance = "N/A"
             try:
-                url = f"{self.lighter_base_url}/api/v1/account?by=index&value={self.account_index}"
-                response = requests.get(url, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    freeCollateral = float(data.get('free_collateral', 0)) / 1e6  # Convert from micro units
-                    portfolioValue = float(data.get('portfolio_value', 0)) / 1e6
-                    lighterBalance = f"Free: {freeCollateral:.2f} USDC\nPortfolio: {portfolioValue:.2f} USDC"
+                if self.grvt_client:
+                    balance = self.grvt_client.fetch_balance()
+                    if balance and 'USDT' in balance:
+                        usdtBalance = balance['USDT']
+                        free = float(usdtBalance.get('free', 0))
+                        total = float(usdtBalance.get('total', 0))
+                        grvtBalance = f"Free: {free:.2f} USDT\nTotal: {total:.2f} USDT"
+                    else:
+                        grvtBalance = "USDT balance not found"
                 else:
-                    lighterBalance = f"API Error: {response.status_code}"
+                    grvtBalance = "Client not initialized"
             except Exception as e:
-                lighterBalance = f"Error: {e}"
+                grvtBalance = f"Error: {e}"
 
             return (
                 "<b>Account Balances</b>\n"
                 "---\n"
                 f"<b>Backpack:</b>\n{backpackBalance}\n\n"
-                f"<b>Lighter:</b>\n{lighterBalance}"
+                f"<b>GRVT:</b>\n{grvtBalance}"
             )
         except Exception as e:
             return f"<b>Balance Error:</b> {e}"
 
     def getPositionMessage(self) -> str:
         """Get formatted position message for Telegram."""
-        netPosition = self.backpack_position + self.lighter_position
+        netPosition = self.backpack_position + self.grvt_position
         imbalance = abs(netPosition)
         statusEmoji = "✅" if imbalance < Decimal('0.0001') else "⚠️"
         status = "Balanced" if imbalance < Decimal('0.0001') else f"Imbalanced ({imbalance:.4f})"
 
         # Format positions with proper decimal places
         bpPos = float(self.backpack_position)
-        ltPos = float(self.lighter_position)
+        grvtPos = float(self.grvt_position)
         netPos = float(netPosition)
 
         return (
@@ -393,7 +428,7 @@ class HedgeBot:
             f"Ticker: <code>{self.ticker}</code>\n"
             "---\n"
             f"<b>Backpack:</b> {bpPos:+.4f} {self.ticker}\n"
-            f"<b>Lighter:</b> {ltPos:+.4f} {self.ticker}\n"
+            f"<b>GRVT:</b> {grvtPos:+.4f} {self.ticker}\n"
             f"<b>Net:</b> {netPos:+.4f} {self.ticker}\n"
             f"<b>Status:</b> {statusEmoji} {status}\n"
             "---\n"
@@ -417,11 +452,19 @@ class HedgeBot:
         if not os.path.exists(self.csv_filename):
             with open(self.csv_filename, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
-                writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity'])
+                writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity',
+                                 'ps_phase', 'ps_target_usd', 'ps_successes', 'ps_failures',
+                                 'rebate_cumulative', 'rebate_last_milestone', 'rebate_next_milestone'])
 
     def log_trade_to_csv(self, exchange: str, side: str, price: str, quantity: str):
         """Log trade details to CSV file."""
         timestamp = datetime.now(pytz.UTC).isoformat()
+
+        # Get progressive sizing data
+        ps_data = self.progressiveSizing.get_csv_log_data()
+
+        # Get rebate tracking data (STORY-004)
+        rebate_data = self.rebateTracker.get_csv_log_data()
 
         with open(self.csv_filename, 'a', newline='') as csvfile:
             writer = csv.writer(csvfile)
@@ -430,125 +473,140 @@ class HedgeBot:
                 timestamp,
                 side,
                 price,
-                quantity
+                quantity,
+                ps_data['current_phase'],
+                ps_data['phase_target_usd'],
+                ps_data['consecutive_successes'],
+                ps_data['consecutive_failures'],
+                rebate_data['cumulative_rebate'],
+                rebate_data['last_milestone_hit'],
+                rebate_data['next_milestone']
             ])
 
-        self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
+        self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price} (PS Phase {ps_data['current_phase']}, Rebate: ${rebate_data['cumulative_rebate']})")
 
-    def handle_lighter_order_result(self, order_data):
-        """Handle Lighter order result from WebSocket."""
+    def handle_grvt_order_result(self, order_data):
+        """Handle GRVT order result from WebSocket."""
         try:
-            order_data["avg_filled_price"] = (Decimal(order_data["filled_quote_amount"]) /
-                                              Decimal(order_data["filled_base_amount"]))
-            if order_data["is_ask"]:
+            # GRVT order structure: size (positive=long, negative=short)
+            filled_size = Decimal(str(order_data.get('size', 0)))
+            avg_filled_price = Decimal(str(order_data.get('average_entry_price', 0)))
+
+            # Determine side and update position
+            if filled_size < 0:
                 order_data["side"] = "SHORT"
                 order_type = "OPEN"
-                self.lighter_position -= Decimal(order_data["filled_base_amount"])
+                self.grvt_position += filled_size  # filled_size is already negative
             else:
                 order_data["side"] = "LONG"
                 order_type = "CLOSE"
-                self.lighter_position += Decimal(order_data["filled_base_amount"])
-            
-            client_order_index = order_data["client_order_id"]
+                self.grvt_position += filled_size
 
-            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [FILLED]: "
-                             f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
+            client_order_id = order_data.get("client_order_id", "N/A")
 
-            # Log Lighter trade to CSV
+            self.logger.info(f"[{client_order_id}] [{order_type}] [GRVT] [FILLED]: "
+                             f"{abs(filled_size)} @ {avg_filled_price}")
+
+            # Log GRVT trade to CSV
             self.log_trade_to_csv(
-                exchange='Lighter',
+                exchange='GRVT',
                 side=order_data['side'],
-                price=str(order_data['avg_filled_price']),
-                quantity=str(order_data['filled_base_amount'])
+                price=str(avg_filled_price),
+                quantity=str(abs(filled_size))
             )
 
-            # Send telegram alert for Lighter trade
+            # STORY-004: Calculate and record GRVT maker rebate
+            rebate_rate = Decimal(str(self.config.get('grvt_rebate_tracking', 'rebate_rate', 0.0002)))
+            trade_volume = abs(filled_size) * avg_filled_price  # Trade volume in USD
+            rebate_amount = trade_volume * rebate_rate  # Rebate in USD
+
+            self.logger.info(f"💰 GRVT Rebate: ${rebate_amount:.4f} (Volume: ${trade_volume:.2f}, Rate: {rebate_rate*100}%)")
+
+            # Record rebate and check for milestone
+            milestone_hit, milestone_msg = self.rebateTracker.record_rebate(rebate_amount)
+
+            # Send telegram alert for GRVT trade
             tradeMsg = (
-                f"<b>📊 Lighter Trade Filled</b>\n"
+                f"<b>📊 GRVT Trade Filled</b>\n"
                 f"Ticker: {self.ticker}\n"
                 f"Side: {order_data['side']}\n"
-                f"Size: {order_data['filled_base_amount']}\n"
-                f"Price: ${order_data['avg_filled_price']:.2f}\n"
-                f"Position: {self.lighter_position}"
+                f"Size: {abs(filled_size)}\n"
+                f"Price: ${avg_filled_price:.2f}\n"
+                f"Position: {self.grvt_position}\n"
+                f"Rebate: ${rebate_amount:.4f}"
             )
             self.send_telegram_alert(tradeMsg)
 
+            # Send milestone notification if triggered
+            if milestone_hit and milestone_msg:
+                self.logger.info(f"🎉 Rebate Milestone: {milestone_msg}")
+                self.send_telegram_alert(milestone_msg)
+
             # Mark execution as complete
-            self.lighter_order_filled = True  # Mark order as filled
+            self.grvt_order_filled = True  # Mark order as filled
             self.order_execution_complete = True
 
+            # STORY-003: Hedge confirmation after GRVT fill
+            asyncio.create_task(self._check_hedge_confirmation_after_fill(avg_filled_price))
+
         except Exception as e:
-            self.logger.error(f"Error handling Lighter order result: {e}")
+            self.logger.error(f"Error handling GRVT order result: {e}")
 
-    async def reset_lighter_order_book(self):
-        """Reset Lighter order book state."""
-        async with self.lighter_order_book_lock:
-            self.lighter_order_book["bids"].clear()
-            self.lighter_order_book["asks"].clear()
-            self.lighter_order_book_offset = 0
-            self.lighter_order_book_sequence_gap = False
-            self.lighter_snapshot_loaded = False
-            self.lighter_best_bid = None
-            self.lighter_best_ask = None
+    async def reset_grvt_order_book(self):
+        """Reset GRVT order book state."""
+        async with self.grvt_order_book_lock:
+            self.grvt_order_book["bids"].clear()
+            self.grvt_order_book["asks"].clear()
+            self.grvt_best_bid = None
+            self.grvt_best_ask = None
 
-    def update_lighter_order_book(self, side: str, levels: list):
-        """Update Lighter order book with new levels."""
+    def update_grvt_order_book(self, side: str, levels: list):
+        """Update GRVT order book with new levels."""
         for level in levels:
-            # Handle different data structures - could be list [price, size] or dict {"price": ..., "size": ...}
-            if isinstance(level, list) and len(level) >= 2:
-                price = Decimal(level[0])
-                size = Decimal(level[1])
-            elif isinstance(level, dict):
-                price = Decimal(level.get("price", 0))
-                size = Decimal(level.get("size", 0))
+            # GRVT order book format: {"price": ..., "size": ...}
+            if isinstance(level, dict):
+                price = Decimal(str(level.get("price", 0)))
+                size = Decimal(str(level.get("size", 0)))
             else:
                 self.logger.warning(f"⚠️ Unexpected level format: {level}")
                 continue
 
             if size > 0:
-                self.lighter_order_book[side][price] = size
+                self.grvt_order_book[side][price] = size
             else:
                 # Remove zero size orders
-                self.lighter_order_book[side].pop(price, None)
-
-    def validate_order_book_offset(self, new_offset: int) -> bool:
-        """Validate order book offset sequence."""
-        if new_offset <= self.lighter_order_book_offset:
-            self.logger.warning(
-                f"⚠️ Out-of-order update: new_offset={new_offset}, current_offset={self.lighter_order_book_offset}")
-            return False
-        return True
+                self.grvt_order_book[side].pop(price, None)
 
     def validate_order_book_integrity(self) -> bool:
         """Validate order book integrity."""
         # Check for negative prices or sizes
         for side in ["bids", "asks"]:
-            for price, size in self.lighter_order_book[side].items():
+            for price, size in self.grvt_order_book[side].items():
                 if price <= 0 or size <= 0:
                     self.logger.error(f"❌ Invalid order book data: {side} price={price}, size={size}")
                     return False
         return True
 
-    def get_lighter_best_levels(self) -> Tuple[Tuple[Decimal, Decimal], Tuple[Decimal, Decimal]]:
-        """Get best bid and ask levels from Lighter order book."""
+    def get_grvt_best_levels(self) -> Tuple[Tuple[Decimal, Decimal], Tuple[Decimal, Decimal]]:
+        """Get best bid and ask levels from GRVT order book."""
         best_bid = None
         best_ask = None
 
-        if self.lighter_order_book["bids"]:
-            best_bid_price = max(self.lighter_order_book["bids"].keys())
-            best_bid_size = self.lighter_order_book["bids"][best_bid_price]
+        if self.grvt_order_book["bids"]:
+            best_bid_price = max(self.grvt_order_book["bids"].keys())
+            best_bid_size = self.grvt_order_book["bids"][best_bid_price]
             best_bid = (best_bid_price, best_bid_size)
 
-        if self.lighter_order_book["asks"]:
-            best_ask_price = min(self.lighter_order_book["asks"].keys())
-            best_ask_size = self.lighter_order_book["asks"][best_ask_price]
+        if self.grvt_order_book["asks"]:
+            best_ask_price = min(self.grvt_order_book["asks"].keys())
+            best_ask_size = self.grvt_order_book["asks"][best_ask_price]
             best_ask = (best_ask_price, best_ask_size)
 
         return best_bid, best_ask
 
-    def get_lighter_mid_price(self) -> Decimal:
-        """Get mid price from Lighter order book."""
-        best_bid, best_ask = self.get_lighter_best_levels()
+    def get_grvt_mid_price(self) -> Decimal:
+        """Get mid price from GRVT order book."""
+        best_bid, best_ask = self.get_grvt_best_levels()
 
         if best_bid is None or best_ask is None:
             raise Exception("Cannot calculate mid price - missing order book data")
@@ -556,9 +614,9 @@ class HedgeBot:
         mid_price = (best_bid[0] + best_ask[0]) / Decimal('2')
         return mid_price
 
-    def get_lighter_order_price(self, is_ask: bool) -> Decimal:
-        """Get order price from Lighter order book."""
-        best_bid, best_ask = self.get_lighter_best_levels()
+    def get_grvt_order_price(self, is_ask: bool) -> Decimal:
+        """Get order price from GRVT order book."""
+        best_bid, best_ask = self.get_grvt_best_levels()
 
         if best_bid is None or best_ask is None:
             raise Exception("Cannot calculate order price - missing order book data")
@@ -581,242 +639,69 @@ class HedgeBot:
             # For sell orders, decrease price to improve fill probability
             return original_price - adjustment
 
-    async def request_fresh_snapshot(self, ws):
-        """Request fresh order book snapshot."""
-        await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
+    async def handle_grvt_ws(self):
+        """Handle GRVT connection and order book polling via REST API."""
+        self.logger.info("[GRVT] REST API polling starting...")
 
-    async def handle_lighter_ws(self):
-        """Handle Lighter WebSocket connection and messages."""
-        url = "wss://mainnet.zklighter.elliot.ai/stream"
-        cleanup_counter = 0
+        if self.grvt_client is None:
+            self.logger.error("[GRVT] Client not initialized")
+            return
 
-        while not self.stop_flag:
-            timeout_count = 0
-            try:
-                # Reset order book state before connecting
-                await self.reset_lighter_order_book()
+        try:
+            # Fetch initial order book via REST API
+            self.logger.info(f"[GRVT] Fetching order book for {self.grvt_contract}...")
+            best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract)
 
-                async with websockets.connect(url) as ws:
-                    # Subscribe to order book updates
-                    await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
+            if best_bid > 0 and best_ask > 0:
+                # Populate order book with best levels
+                self.grvt_order_book["bids"][best_bid] = Decimal('1')  # Placeholder size
+                self.grvt_order_book["asks"][best_ask] = Decimal('1')  # Placeholder size
+                self.grvt_best_bid = best_bid
+                self.grvt_best_ask = best_ask
+                self.grvt_order_book_ready = True
+                self.logger.info(f"[GRVT] Order book ready - Bid: {best_bid}, Ask: {best_ask}")
+            else:
+                self.logger.warning(f"[GRVT] Order book empty - Bid: {best_bid}, Ask: {best_ask}")
 
-                    # Subscribe to account orders updates
-                    account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
+            # Connect to GRVT WebSocket for order updates
+            await self.grvt_client.connect()
+            self.logger.info("[GRVT] WebSocket connected")
 
-                    # Get auth token for the subscription
-                    try:
-                        # FIXED: Set auth token to expire in 10 minutes (relative seconds, not absolute timestamp)
-                        # SDK adds this to current timestamp internally
-                        ten_minutes_in_seconds = 10 * 60  # 600 seconds
-                        self.logger.info(f"🔧 DEBUG: Creating auth token with {ten_minutes_in_seconds}s expiry")
-                        self.logger.info(f"🔧 DEBUG: Channel: {account_orders_channel}")
-                        auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_in_seconds)
-                        if err is not None:
-                            self.logger.warning(f"⚠️ Failed to create auth token for account orders subscription: {err}")
-                        else:
-                            auth_message = {
-                                "type": "subscribe",
-                                "channel": account_orders_channel,
-                                "auth": auth_token
-                            }
-                            self.logger.info(f"🔧 DEBUG: Sending subscription: {json.dumps(auth_message)}")
-                            await ws.send(json.dumps(auth_message))
-                            self.logger.info("✅ Subscribed to account orders with auth token (expires in 10 minutes)")
-                    except Exception as e:
-                        self.logger.warning(f"⚠️ Error creating auth token for account orders subscription: {e}")
+            # Setup order update handler
+            async def order_update_handler(order_data):
+                """Handle order updates from GRVT WebSocket."""
+                try:
+                    await self.handle_grvt_order_result(order_data)
+                except Exception as e:
+                    self.logger.error(f"Error handling GRVT order update: {e}")
 
-                    while not self.stop_flag:
-                        try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=1)
+            self.grvt_client.setup_order_update_handler(order_update_handler)
+            self.logger.info("[OK] GRVT WebSocket order update handler set up")
 
-                            try:
-                                data = json.loads(msg)
-                            except json.JSONDecodeError as e:
-                                self.logger.warning(f"⚠️ JSON parsing error in Lighter websocket: {e}")
-                                continue
-
-                            # Reset timeout counter on successful message
-                            timeout_count = 0
-
-                            # Log ALL incoming messages with their type
-                            msg_type = data.get("type", "UNKNOWN_TYPE")
-                            self.logger.debug(f"📨 [LIGHTER WS] Received message type: {msg_type}")
-
-                            # Log message details based on type
-                            if msg_type == "subscribed/order_book":
-                                self.logger.info(f"📨 [LIGHTER WS] Subscription confirmation: subscribed to order book")
-                            elif msg_type == "subscribed/account_orders":
-                                self.logger.info(f"📨 [LIGHTER WS] Subscription confirmation: subscribed to account orders")
-                            elif msg_type == "update/order_book":
-                                order_book = data.get("order_book", {})
-                                offset = order_book.get("offset", "N/A")
-                                num_bids = len(order_book.get("bids", []))
-                                num_asks = len(order_book.get("asks", []))
-                                self.logger.debug(f"📨 [LIGHTER WS] Order book update - offset: {offset}, bids: {num_bids}, asks: {num_asks}")
-                            elif msg_type == "update/account_orders":
-                                orders_dict = data.get("orders", {})
-                                self.logger.info(f"📨 [LIGHTER WS] Account orders update received - Markets: {list(orders_dict.keys())}")
-                                for market_key, orders_list in orders_dict.items():
-                                    self.logger.info(f"📨 [LIGHTER WS] Market {market_key}: {len(orders_list)} orders")
-                                    for idx, order in enumerate(orders_list):
-                                        order_id = order.get("order_id", "UNKNOWN")
-                                        status = order.get("status", "UNKNOWN")
-                                        side = order.get("side", "UNKNOWN")
-                                        size = order.get("size", 0)
-                                        price = order.get("price", 0)
-                                        self.logger.info(f"📨 [LIGHTER WS]   Order {idx}: id={order_id}, status={status}, side={side}, size={size}, price={price}")
-                            elif msg_type == "ping":
-                                self.logger.debug(f"📨 [LIGHTER WS] Ping received (sending pong)")
-                            else:
-                                # Log unexpected message types with full payload
-                                payload_str = json.dumps(data, default=str)
-                                if len(payload_str) > 500:
-                                    payload_str = payload_str[:500] + "..."
-                                self.logger.warning(f"📨 [LIGHTER WS] UNEXPECTED MESSAGE TYPE: {msg_type}")
-                                self.logger.warning(f"📨 [LIGHTER WS] Payload: {payload_str}")
-
-                            async with self.lighter_order_book_lock:
-                                if data.get("type") == "subscribed/order_book":
-                                    # Initial snapshot - clear and populate the order book
-                                    self.lighter_order_book["bids"].clear()
-                                    self.lighter_order_book["asks"].clear()
-
-                                    # Handle the initial snapshot
-                                    order_book = data.get("order_book", {})
-                                    if order_book and "offset" in order_book:
-                                        self.lighter_order_book_offset = order_book["offset"]
-                                        self.logger.info(f"✅ Initial order book offset set to: {self.lighter_order_book_offset}")
-
-                                    # Debug: Log the structure of bids and asks
-                                    bids = order_book.get("bids", [])
-                                    asks = order_book.get("asks", [])
-                                    if bids:
-                                        self.logger.debug(f"📊 Sample bid structure: {bids[0] if bids else 'None'}")
-                                    if asks:
-                                        self.logger.debug(f"📊 Sample ask structure: {asks[0] if asks else 'None'}")
-
-                                    self.update_lighter_order_book("bids", bids)
-                                    self.update_lighter_order_book("asks", asks)
-                                    self.lighter_snapshot_loaded = True
-                                    self.lighter_order_book_ready = True
-
-                                    self.logger.info(f"✅ Lighter order book snapshot loaded with "
-                                                     f"{len(self.lighter_order_book['bids'])} bids and "
-                                                     f"{len(self.lighter_order_book['asks'])} asks")
-
-                                elif data.get("type") == "update/order_book" and self.lighter_snapshot_loaded:
-                                    # Extract offset from the message
-                                    order_book = data.get("order_book", {})
-                                    if not order_book or "offset" not in order_book:
-                                        self.logger.warning("⚠️ Order book update missing offset, skipping")
-                                        continue
-
-                                    new_offset = order_book["offset"]
-
-                                    # Validate offset sequence
-                                    if not self.validate_order_book_offset(new_offset):
-                                        self.lighter_order_book_sequence_gap = True
-                                        break
-
-                                    # Update the order book with new data
-                                    self.update_lighter_order_book("bids", order_book.get("bids", []))
-                                    self.update_lighter_order_book("asks", order_book.get("asks", []))
-
-                                    # Validate order book integrity after update
-                                    if not self.validate_order_book_integrity():
-                                        self.logger.warning("🔄 Order book integrity check failed, requesting fresh snapshot...")
-                                        break
-
-                                    # Get the best bid and ask levels
-                                    best_bid, best_ask = self.get_lighter_best_levels()
-
-                                    # Update global variables
-                                    if best_bid is not None:
-                                        self.lighter_best_bid = best_bid[0]
-                                    if best_ask is not None:
-                                        self.lighter_best_ask = best_ask[0]
-
-                                elif data.get("type") == "ping":
-                                    # Respond to ping with pong
-                                    await ws.send(json.dumps({"type": "pong"}))
-                                elif data.get("type") == "update/account_orders":
-                                    # Handle account orders updates
-                                    orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
-                                    self.logger.debug(f"📨 [LIGHTER WS] Processing {len(orders)} orders for market {self.lighter_market_index}")
-                                    for order in orders:
-                                        order_status = order.get("status", "UNKNOWN")
-                                        order_id = order.get("order_id", "UNKNOWN")
-                                        self.logger.debug(f"📨 [LIGHTER WS] Processing order id={order_id}, status={order_status}")
-                                        if order_status == "filled":
-                                            self.logger.info(f"✅ [LIGHTER WS] Order FILLED: id={order_id}")
-                                            self.handle_lighter_order_result(order)
-                                        else:
-                                            self.logger.debug(f"📨 [LIGHTER WS] Skipping order id={order_id} with status={order_status} (not filled)")
-                                elif data.get("type") == "update/order_book" and not self.lighter_snapshot_loaded:
-                                    # Ignore updates until we have the initial snapshot
-                                    continue
-
-                            # Periodic cleanup outside the lock
-                            cleanup_counter += 1
-                            if cleanup_counter >= 1000:
-                                cleanup_counter = 0
-
-                            # Handle sequence gap and integrity issues outside the lock
-                            if self.lighter_order_book_sequence_gap:
-                                try:
-                                    await self.request_fresh_snapshot(ws)
-                                    self.lighter_order_book_sequence_gap = False
-                                except Exception as e:
-                                    self.logger.error(f"⚠️ Failed to request fresh snapshot: {e}")
-                                    break
-
-                        except asyncio.TimeoutError:
-                            timeout_count += 1
-                            if timeout_count % 3 == 0:
-                                self.logger.warning(f"⏰ No message from Lighter websocket for {timeout_count} seconds")
-                            continue
-                        except websockets.exceptions.ConnectionClosed as e:
-                            self.logger.warning(f"⚠️ Lighter websocket connection closed: {e}")
-                            break
-                        except websockets.exceptions.WebSocketException as e:
-                            self.logger.warning(f"⚠️ Lighter websocket error: {e}")
-                            break
-                        except Exception as e:
-                            self.logger.error(f"⚠️ Error in Lighter websocket: {e}")
-                            self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                            break
-            except Exception as e:
-                self.logger.error(f"⚠️ Failed to connect to Lighter websocket: {e}")
-
-            # Wait a bit before reconnecting
-            await asyncio.sleep(2)
+        except Exception as e:
+            self.logger.error(f"[GRVT] Could not setup connection: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
 
     def setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown."""
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
 
-    def initialize_lighter_client(self):
-        """Initialize the Lighter client."""
-        if self.lighter_client is None:
-            api_key_private_key = os.getenv('API_KEY_PRIVATE_KEY')
-            if not api_key_private_key:
-                raise Exception("API_KEY_PRIVATE_KEY environment variable not set")
+    def initialize_grvt_client(self):
+        """Initialize the GRVT client with WebSocket support."""
+        if self.grvt_client is None:
+            # Create config for GrvtClient
+            grvt_config = Config({
+                'ticker': self.ticker,
+                'contract_id': self.grvt_contract,  # e.g., "ETH_USDT_Perp"
+                'environment': os.getenv('GRVT_ENVIRONMENT', 'prod')
+            })
 
-            self.lighter_client = SignerClient(
-                url=self.lighter_base_url,
-                private_key=api_key_private_key,
-                account_index=self.account_index,
-                api_key_index=self.api_key_index,
-            )
-
-            # Check client
-            err = self.lighter_client.check_client()
-            if err is not None:
-                raise Exception(f"CheckClient error: {err}")
-
-            self.logger.info("✅ Lighter client initialized successfully")
-        return self.lighter_client
+            # Initialize GrvtClient (includes WebSocket support)
+            self.grvt_client = GrvtClient(grvt_config)
+            self.logger.info("✅ GRVT client initialized successfully (WebSocket enabled)")
+        return self.grvt_client
 
     def get_backpack_funding_payments(self, limit: int = 10) -> dict:
         """
@@ -946,39 +831,36 @@ class HedgeBot:
             self.logger.warning(f"⚠️ Failed to get Backpack balance: {e}")
             return {"available": 0, "total": 0, "error": str(e)}
 
-    def get_lighter_balance(self) -> dict:
+    def get_grvt_balance(self) -> dict:
         """
-        Get collateral balance from Lighter.
+        Get collateral balance from GRVT.
 
         Returns:
             dict with balance info:
-            - total_collateral: total collateral value
-            - free_collateral: available (unused) collateral
+            - total_collateral: total USDT balance
+            - free_collateral: available (free) USDT
             - error: error message if failed
         """
         try:
-            if not self.lighter_client:
+            if not self.grvt_client:
                 return {"total_collateral": 0, "free_collateral": 0, "error": "Client not initialized"}
 
-            # Get account info from Lighter
-            accountApi = self.lighter_client.api_client
-            if hasattr(self.lighter_client, 'account_index'):
-                import lighter
-                api = lighter.AccountApi(accountApi)
-                accountData = api.account(by="index", value=str(self.lighter_client.account_index))
+            # Get balance from GRVT
+            balance = self.grvt_client.fetch_balance()
 
-                if accountData:
-                    totalCollateral = float(getattr(accountData, 'total_collateral', 0) or 0)
-                    freeCollateral = float(getattr(accountData, 'free_collateral', 0) or 0)
-                    return {
-                        "total_collateral": totalCollateral,
-                        "free_collateral": freeCollateral
-                    }
+            if balance and 'USDT' in balance:
+                usdtBalance = balance['USDT']
+                freeCollateral = float(usdtBalance.get('free', 0))
+                totalCollateral = float(usdtBalance.get('total', 0))
+                return {
+                    "total_collateral": totalCollateral,
+                    "free_collateral": freeCollateral
+                }
 
-            return {"total_collateral": 0, "free_collateral": 0, "error": "No account data"}
+            return {"total_collateral": 0, "free_collateral": 0, "error": "No USDT balance"}
 
         except Exception as e:
-            self.logger.warning(f"⚠️ Failed to get Lighter balance: {e}")
+            self.logger.warning(f"⚠️ Failed to get GRVT balance: {e}")
             return {"total_collateral": 0, "free_collateral": 0, "error": str(e)}
 
     def log_balance_status(self, iteration: int):
@@ -998,7 +880,7 @@ class HedgeBot:
 
         # Get balances from both exchanges
         backpackBalance = self.get_backpack_balance()
-        lighterBalance = self.get_lighter_balance()
+        grvtBalance = self.get_grvt_balance()
 
         # Log balance summary
         self.logger.info("=" * 50)
@@ -1006,19 +888,19 @@ class HedgeBot:
         self.logger.info("=" * 50)
         self.logger.info(f"📊 Backpack USDC: ${backpackBalance.get('available', 0):.2f} available "
                         f"(${backpackBalance.get('total', 0):.2f} total)")
-        self.logger.info(f"📊 Lighter Collateral: ${lighterBalance.get('free_collateral', 0):.2f} free "
-                        f"(${lighterBalance.get('total_collateral', 0):.2f} total)")
+        self.logger.info(f"📊 GRVT USDT: ${grvtBalance.get('free_collateral', 0):.2f} free "
+                        f"(${grvtBalance.get('total_collateral', 0):.2f} total)")
 
         # Calculate and check imbalance
         backpackTotal = backpackBalance.get('total', 0)
-        lighterTotal = lighterBalance.get('total_collateral', 0)
-        combinedTotal = backpackTotal + lighterTotal
+        grvtTotal = grvtBalance.get('total_collateral', 0)
+        combinedTotal = backpackTotal + grvtTotal
 
         if combinedTotal > 0:
             backpackRatio = backpackTotal / combinedTotal
-            lighterRatio = lighterTotal / combinedTotal
+            grvtRatio = grvtTotal / combinedTotal
 
-            self.logger.info(f"📈 Balance Ratio: Backpack {backpackRatio*100:.1f}% | Lighter {lighterRatio*100:.1f}%")
+            self.logger.info(f"📈 Balance Ratio: Backpack {backpackRatio*100:.1f}% | GRVT {grvtRatio*100:.1f}%")
 
             # Check warning threshold
             balanceWarningThreshold = self.config.get("monitoring", "balance_warning_threshold")
@@ -1027,7 +909,7 @@ class HedgeBot:
             if imbalance > balanceWarningThreshold / 2:  # /2 because we measure from 50%
                 self.logger.warning(
                     f"⚠️ BALANCE WARNING: Significant imbalance detected! "
-                    f"(Backpack: {backpackRatio*100:.1f}%, Lighter: {lighterRatio*100:.1f}%)"
+                    f"(Backpack: {backpackRatio*100:.1f}%, GRVT: {grvtRatio*100:.1f}%)"
                 )
                 self.logger.warning("⚠️ Consider transferring funds to rebalance")
 
@@ -1052,44 +934,13 @@ class HedgeBot:
 
         # Initialize Backpack client
         self.backpack_client = BackpackClient(config)
+        self.backpack_client.logger = self.logger  # Set logger for Backpack client
 
         self.logger.info("✅ Backpack client initialized successfully")
         return self.backpack_client
 
-    def get_lighter_market_config(self) -> Tuple[int, int, int]:
-        """Get Lighter market configuration."""
-        url = f"{self.lighter_base_url}/api/v1/orderBooks"
-        headers = {"accept": "application/json"}
-
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-
-            if not response.text.strip():
-                raise Exception("Empty response from Lighter API")
-
-            data = response.json()
-
-            if "order_books" not in data:
-                raise Exception("Unexpected response format")
-
-            # Convert ticker to Lighter market symbol format (e.g., ETH -> ETH/USDC)
-            lighter_symbol = f"{self.ticker}/USDC"
-            self.logger.info(f"Looking for Lighter market: {lighter_symbol}")
-
-            for market in data["order_books"]:
-                if market["symbol"] == lighter_symbol:
-                    market_id = market["market_id"]
-                    self.logger.info(f"Found Lighter market: {lighter_symbol} (market_id={market_id})")
-                    return (market_id,
-                            pow(10, market["supported_size_decimals"]),
-                            pow(10, market["supported_price_decimals"]))
-
-            raise Exception(f"Market {lighter_symbol} not found in Lighter order books")
-
-        except Exception as e:
-            self.logger.error(f"⚠️ Error getting market config: {e}")
-            raise
+    # GRVT uses simple string contract symbols, no market config lookup needed
+    # Contract symbol is directly set as "ETH_USDT_Perp" in __init__
 
     async def get_backpack_contract_info(self) -> Tuple[str, Decimal]:
         """Get Backpack contract ID and tick size."""
@@ -1103,6 +954,16 @@ class HedgeBot:
                 f"Order quantity is less than min quantity: {self.order_quantity} < {self.backpack_client.config.quantity}")
 
         return contract_id, tick_size
+
+    async def get_current_price(self) -> Optional[Decimal]:
+        """Get current mid price for progressive sizing calculations."""
+        try:
+            bid, ask = await self.fetch_backpack_bbo_prices()
+            mid_price = (bid + ask) / Decimal('2')
+            return mid_price
+        except Exception as e:
+            self.logger.error(f"Failed to get current price: {e}")
+            return None
 
     async def fetch_backpack_bbo_prices(self) -> Tuple[Decimal, Decimal]:
         """Fetch best bid/ask prices from Backpack using websocket data."""
@@ -1142,18 +1003,32 @@ class HedgeBot:
         else:
             raise Exception(f"Failed to place order: {order_result.error_message}")
 
-    async def place_backpack_post_only_order(self, side: str, quantity: Decimal):
-        """Place a post-only order on Backpack."""
+    async def place_backpack_post_only_order(self, side: str, quantity: Decimal, max_retries: int = 3):
+        """Place a post-only order on Backpack with retry limit."""
         if not self.backpack_client:
             raise Exception("Backpack client not initialized")
 
         self.backpack_order_status = None
-        self.logger.info(f"[OPEN] [Backpack] [{side}] Placing Backpack POST-ONLY order")
-        order_id = await self.place_bbo_order(side, quantity)
+        retry_count = 0
+        self.logger.info(f"[OPEN] [Backpack] [{side}] Placing Backpack MAKER order (post_only)")
+        try:
+            order_id = await self.place_bbo_order(side, quantity)
+            self.logger.info(f"[OPEN] [Backpack] Order placed successfully: {order_id}")
+        except Exception as e:
+            self.logger.error(f"[OPEN] [Backpack] Order placement failed: {e}")
+            import traceback
+            self.logger.error(f"[OPEN] [Backpack] Traceback: {traceback.format_exc()}")
+            raise
 
         start_time = time.time()
         while not self.stop_flag:
             if self.backpack_order_status == 'CANCELED':
+                retry_count += 1
+                if retry_count >= max_retries:
+                    self.logger.warning(f"[WARN] Max retries ({max_retries}) reached for Backpack order")
+                    raise Exception(f"Backpack order failed after {max_retries} retries")
+
+                self.logger.info(f"[RETRY] Backpack order retry {retry_count}/{max_retries}")
                 self.backpack_order_status = 'NEW'
                 order_id = await self.place_bbo_order(side, quantity)
                 start_time = time.time()
@@ -1240,105 +1115,139 @@ class HedgeBot:
         price = Decimal(order_data.get('price', '0'))
 
         if side == 'buy':
-            lighter_side = 'sell'
+            grvt_side = 'sell'
         else:
-            lighter_side = 'buy'
+            grvt_side = 'buy'
 
         # Store order details for immediate execution
-        self.current_lighter_side = lighter_side
-        self.current_lighter_quantity = filled_size
-        self.current_lighter_price = price
+        self.current_grvt_side = grvt_side
+        self.current_grvt_quantity = filled_size
+        self.current_grvt_price = price
 
-        self.lighter_order_info = {
-            'lighter_side': lighter_side,
+        self.grvt_order_info = {
+            'grvt_side': grvt_side,
             'quantity': filled_size,
             'price': price
         }
 
-        self.waiting_for_lighter_fill = True
+        self.waiting_for_grvt_fill = True
 
 
-    async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
-        if not self.lighter_client:
-            await self.initialize_lighter_client()
+    async def place_grvt_market_order(self, grvt_side: str, quantity: Decimal, price: Decimal):
+        if not self.grvt_client:
+            self.initialize_grvt_client()
 
-        best_bid, best_ask = self.get_lighter_best_levels()
+        best_bid, best_ask = self.get_grvt_best_levels()
+
+        # If order book not ready, fetch fresh prices via REST API
+        if best_bid is None or best_ask is None:
+            self.logger.info(f"[GRVT] Order book not ready, fetching fresh prices via REST API...")
+            try:
+                bid_price, ask_price = await self.grvt_client.fetch_bbo_prices(self.grvt_contract)
+                if bid_price > 0 and ask_price > 0:
+                    best_bid = (bid_price, Decimal('1'))
+                    best_ask = (ask_price, Decimal('1'))
+                    # Update local order book
+                    self.grvt_order_book["bids"][bid_price] = Decimal('1')
+                    self.grvt_order_book["asks"][ask_price] = Decimal('1')
+                    self.grvt_order_book_ready = True
+                    self.logger.info(f"[GRVT] Fresh prices - Bid: {bid_price}, Ask: {ask_price}")
+                else:
+                    self.logger.error(f"[GRVT] REST API returned invalid prices - Bid: {bid_price}, Ask: {ask_price}")
+                    raise Exception("GRVT REST API returned invalid prices")
+            except Exception as e:
+                self.logger.error(f"[GRVT] Failed to fetch prices via REST API: {e}")
+                raise Exception(f"GRVT order book not ready and REST API failed: {e}")
 
         # Determine order parameters (get multipliers from config)
         sellPriceMultiplier = Decimal(str(self.config.get("pricing", "sell_price_multiplier")))
         buyPriceMultiplier = Decimal(str(self.config.get("pricing", "buy_price_multiplier")))
 
-        if lighter_side.lower() == 'buy':
+        if grvt_side.lower() == 'buy':
             order_type = "CLOSE"
-            is_ask = False
             price = best_ask[0] * sellPriceMultiplier
         else:
             order_type = "OPEN"
-            is_ask = True
             price = best_bid[0] * buyPriceMultiplier
 
 
         # Reset order state
-        self.lighter_order_filled = False
-        self.lighter_order_price = price
-        self.lighter_order_side = lighter_side
-        self.lighter_order_size = quantity
+        self.grvt_order_filled = False
+        self.grvt_order_price = price
+        self.grvt_order_side = grvt_side
+        self.grvt_order_size = quantity
 
         try:
-            client_order_index = int(time.time() * 1000)
-            # Sign the order transaction
-            tx_info, error = self.lighter_client.sign_create_order(
-                market_index=self.lighter_market_index,
-                client_order_index=client_order_index,
-                base_amount=int(quantity * self.base_amount_multiplier),
-                price=int(price * self.price_multiplier),
-                is_ask=is_ask,
-                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                reduce_only=False,
-                trigger_price=0,
-            )
-            if error is not None:
-                raise Exception(f"Sign error: {error}")
-
-            # Prepare the form data
-            tx_hash = await self.lighter_client.send_tx(
-                tx_type=self.lighter_client.TX_TYPE_CREATE_ORDER,
-                tx_info=tx_info
+            # GRVT uses place_post_only_order with IOC for TAKER execution
+            # use_ioc=True for immediate fill (TAKER role in hedge)
+            orderResult = await self.grvt_client.place_post_only_order(
+                contract_id=self.grvt_contract,  # "ETH_USDT_Perp"
+                quantity=quantity,
+                price=price,
+                side=grvt_side,  # 'buy' or 'sell'
+                use_ioc=True  # TAKER: Immediate Or Cancel
             )
 
-            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [OPEN]: {quantity}")
+            # Extract client_order_id for monitoring
+            clientOrderId = None
+            if orderResult:
+                # OrderInfo object has order_id attribute
+                if hasattr(orderResult, 'order_id'):
+                    clientOrderId = orderResult.order_id
+                elif hasattr(orderResult, 'client_order_id'):
+                    clientOrderId = orderResult.client_order_id
 
-            await self.monitor_lighter_order(client_order_index)
+            self.logger.info(f"[{clientOrderId}] [{order_type}] [GRVT] [PLACED]: {quantity} @ {price}")
 
-            return tx_hash
+            # Check order status from result
+            if orderResult and hasattr(orderResult, 'status'):
+                if orderResult.status == 'FILLED':
+                    self.logger.info(f"[{clientOrderId}] [{order_type}] [GRVT] [FILLED]: {quantity} @ {price}")
+                    # Trigger GRVT order result handling (synchronous method)
+                    # Convert side to size sign: sell -> negative, buy -> positive
+                    signed_size = -quantity if grvt_side.lower() == 'sell' else quantity
+                    self.handle_grvt_order_result({
+                        'client_order_id': clientOrderId,
+                        'status': 'FILLED',
+                        'size': str(signed_size),  # Signed size (negative for SHORT/sell)
+                        'average_entry_price': str(price)
+                    })
+                elif orderResult.status == 'CANCELLED':
+                    self.logger.warning(f"[{clientOrderId}] [{order_type}] [GRVT] [CANCELLED]: IOC order not filled")
+                else:
+                    self.logger.info(f"[{clientOrderId}] [{order_type}] [GRVT] [{orderResult.status}]")
+                    await self.monitor_grvt_order(clientOrderId)
+
+            return orderResult
         except Exception as e:
-            self.logger.error(f"❌ Error placing Lighter order: {e}")
+            self.logger.error(f"[ERROR] Error placing GRVT order: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return None
 
-    async def monitor_lighter_order(self, client_order_index: int):
-        """Monitor Lighter order and adjust price if needed."""
+    async def monitor_grvt_order(self, client_order_id: str):
+        """Monitor GRVT order and adjust price if needed."""
 
         start_time = time.time()
-        while not self.lighter_order_filled and not self.stop_flag:
+        while not self.grvt_order_filled and not self.stop_flag:
             # Check for timeout (30 seconds total)
             if time.time() - start_time > 30:
                 elapsed = time.time() - start_time
                 self.logger.error("="*60)
-                self.logger.error(f"❌ CRITICAL: Lighter order TIMEOUT after {elapsed:.1f}s")
-                self.logger.error(f"❌ Order: {self.lighter_order_side} {self.lighter_order_size} @ {self.lighter_order_price}")
+                self.logger.error(f"❌ CRITICAL: GRVT order TIMEOUT after {elapsed:.1f}s")
+                self.logger.error(f"❌ Order: {self.grvt_order_side} {self.grvt_order_size} @ {self.grvt_order_price}")
                 self.logger.error("❌ STOPPING BOT - Manual intervention required")
                 self.logger.error("="*60)
 
                 # Send critical Telegram alert
                 self.send_telegram_alert(
-                    f"<b>🚨 LIGHTER ORDER TIMEOUT</b>\n\n"
+                    f"<b>🚨 GRVT ORDER TIMEOUT</b>\n\n"
                     f"Ticker: {self.ticker}\n"
-                    f"Order: {self.lighter_order_side} {self.lighter_order_size} @ {self.lighter_order_price}\n"
+                    f"Order: {self.grvt_order_side} {self.grvt_order_size} @ {self.grvt_order_price}\n"
                     f"Timeout: {elapsed:.1f}s\n\n"
                     f"<b>Action:</b> Bot stopped\n"
                     f"<b>Next Step:</b> Manual verification required\n"
-                    f"1. Check Lighter API/WebSocket status\n"
+                    f"1. Check GRVT API status\n"
                     f"2. Verify actual positions on both exchanges\n"
                     f"3. Resume bot only after confirming hedge balance"
                 )
@@ -1349,40 +1258,7 @@ class HedgeBot:
 
             await asyncio.sleep(0.1)  # Check every 100ms
 
-    async def modify_lighter_order(self, client_order_index: int, new_price: Decimal):
-        """Modify current Lighter order with new price using client_order_index."""
-        try:
-            if client_order_index is None:
-                self.logger.error("❌ Cannot modify order - no order ID available")
-                return
-
-            # Calculate new Lighter price
-            lighter_price = int(new_price * self.price_multiplier)
-
-            self.logger.info(f"🔧 Attempting to modify order - Market: {self.lighter_market_index}, "
-                             f"Client Order Index: {client_order_index}, New Price: {lighter_price}")
-
-            # Use the native SignerClient's modify_order method
-            tx_info, tx_hash, error = await self.lighter_client.modify_order(
-                market_index=self.lighter_market_index,
-                order_index=client_order_index,  # Use client_order_index directly
-                base_amount=int(self.lighter_order_size * self.base_amount_multiplier),
-                price=lighter_price,
-                trigger_price=0
-            )
-
-            if error is not None:
-                self.logger.error(f"❌ Lighter order modification error: {error}")
-                return
-
-            self.lighter_order_price = new_price
-            self.logger.info(f"🔄 Lighter order modified successfully: {self.lighter_order_side} "
-                             f"{self.lighter_order_size} @ {new_price}")
-
-        except Exception as e:
-            self.logger.error(f"❌ Error modifying Lighter order: {e}")
-            import traceback
-            self.logger.error(f"❌ Full traceback: {traceback.format_exc()}")
+    # GRVT order modification not needed - uses post-only orders with immediate fill or cancel
 
     async def setup_backpack_websocket(self):
         """Setup Backpack websocket for order updates and order book data."""
@@ -1529,21 +1405,232 @@ class HedgeBot:
         except Exception as e:
             self.logger.error(f"Could not setup Backpack depth WebSocket: {e}")
 
+# DELETED: Duplicate trading_loop() method (replaced with the correct one below at line 1565)
+
+    async def _fetch_grvt_position_rest(self) -> Decimal:
+        """
+        Fetch actual GRVT position via REST API.
+
+        Returns:
+            Decimal: Net position in ETH (positive = long, negative = short)
+        """
+        try:
+            if not self.grvt_client:
+                raise Exception("GRVT client not initialized")
+
+            # Fetch positions from GRVT using rest_client
+            positions = self.grvt_client.rest_client.fetch_positions()
+
+            net_position = Decimal('0')
+
+            if positions:
+                for position in positions:
+                    if position.get('instrument') == self.grvt_contract:
+                        # GRVT position structure: size (positive=long, negative=short)
+                        size = Decimal(str(position.get('size', '0')))
+                        net_position = size
+                        self.logger.debug(f"Found {self.grvt_contract} position: {size}")
+                        break
+
+            return net_position
+
+        except Exception as e:
+            self.logger.error(f"❌ Error fetching GRVT position via REST: {e}")
+            raise
+
+    async def _fetch_backpack_position_rest(self) -> Decimal:
+        """
+        Fetch actual Backpack position via REST API.
+
+        Returns:
+            Decimal: Net position in ETH (positive = long, negative = short)
+        """
+        try:
+            if not self.backpack_client:
+                raise Exception("Backpack client not initialized")
+
+            # Use Backpack client's account_client to get positions
+            positions = self.backpack_client.account_client.get_open_positions()
+
+            self.logger.debug(f"Backpack positions response: {positions}")
+
+            # Find ETH_USDC_PERP position
+            symbol = f"{self.ticker}_USDC_PERP"
+            net_position = Decimal('0')
+
+            if isinstance(positions, list):
+                for position in positions:
+                    if position.get('symbol') == symbol:
+                        # Backpack returns netQuantity as the position
+                        net_position = Decimal(str(position.get('netQuantity', '0')))
+                        self.logger.debug(f"Found {symbol} position: {net_position}")
+                        break
+
+            return net_position
+
+        except Exception as e:
+            self.logger.error(f"❌ Error fetching Backpack position via REST: {e}")
+            raise
+
+    async def verify_hedge_completion(self) -> bool:
+        """
+        Verify that hedge is actually balanced by fetching real positions from both exchanges.
+
+        Returns:
+            bool: True if hedge is confirmed successful, False otherwise
+        """
+        try:
+            self.logger.info("🔍 [HEDGE VERIFICATION] Starting verification...")
+
+            # Get tolerance and threshold from config
+            tolerance = Decimal(str(self.config.get("hedge_verification", "position_tolerance", 0.001)))
+            threshold = Decimal(str(self.config.get("trading", "position_diff_threshold", 0.2)))
+
+            # Fetch actual positions from both exchanges
+            self.logger.info("🔍 [HEDGE VERIFICATION] Fetching GRVT position via REST...")
+            actual_grvt = await self._fetch_grvt_position_rest()
+
+            self.logger.info("🔍 [HEDGE VERIFICATION] Fetching Backpack position via REST...")
+            actual_backpack = await self._fetch_backpack_position_rest()
+
+            # Log actual vs tracked positions
+            self.logger.info("="*60)
+            self.logger.info("📊 [HEDGE VERIFICATION] Position Comparison:")
+            self.logger.info(f"   GRVT     - Actual: {actual_grvt:>10} | Tracked: {self.grvt_position:>10}")
+            self.logger.info(f"   Backpack - Actual: {actual_backpack:>10} | Tracked: {self.backpack_position:>10}")
+
+            # Check for discrepancies
+            grvt_diff = abs(actual_grvt - self.grvt_position)
+            backpack_diff = abs(actual_backpack - self.backpack_position)
+
+            if grvt_diff > tolerance:
+                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] GRVT position mismatch: {grvt_diff} (tolerance: {tolerance})")
+                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Updating tracked GRVT position: {self.grvt_position} → {actual_grvt}")
+                self.grvt_position = actual_grvt
+
+            if backpack_diff > tolerance:
+                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Backpack position mismatch: {backpack_diff} (tolerance: {tolerance})")
+                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Updating tracked Backpack position: {self.backpack_position} → {actual_backpack}")
+                self.backpack_position = actual_backpack
+
+            # Calculate net position
+            net_position = actual_grvt + actual_backpack
+            self.logger.info(f"📊 [HEDGE VERIFICATION] Net Position: {net_position} (threshold: {threshold})")
+
+            # Verify hedge balance
+            if abs(net_position) > threshold:
+                self.logger.error(f"❌ [HEDGE VERIFICATION] FAILED - Net position {net_position} exceeds threshold {threshold}")
+                self.logger.error(f"❌ [HEDGE VERIFICATION] GRVT: {actual_grvt} | Backpack: {actual_backpack}")
+                self.logger.info("="*60)
+                return False
+
+            self.logger.info(f"✅ [HEDGE VERIFICATION] PASSED - Hedge is balanced")
+            self.logger.info("="*60)
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ [HEDGE VERIFICATION] Exception during verification: {e}")
+            self.logger.error("❌ [HEDGE VERIFICATION] FAILED - Unable to verify hedge")
+            return False
+
+    async def _check_hedge_confirmation_after_fill(self, fill_price: Decimal):
+        """
+        STORY-003: Check hedge confirmation after GRVT fill if position value exceeds threshold.
+
+        Args:
+            fill_price: The price at which the GRVT order was filled
+        """
+        try:
+            # Get hedge confirmation config
+            hc_config = self.config.config.get('hedge_confirmation', {})
+            if not hc_config.get('enabled', False):
+                return  # Hedge confirmation disabled
+
+            activation_threshold = Decimal(str(hc_config.get('activation_threshold_usd', 50.0)))
+
+            # Calculate current position value
+            position_value = abs(self.grvt_position) * fill_price
+
+            if position_value >= activation_threshold:
+                self.logger.info(f"🔍 [HEDGE CONFIRMATION] Position value ${position_value:.2f} >= ${activation_threshold}")
+                self.logger.info(f"🔍 [HEDGE CONFIRMATION] Triggering post-fill verification...")
+
+                hedge_ok = await self.verify_hedge_completion()
+
+                if not hedge_ok and hc_config.get('stop_on_critical', True):
+                    self.logger.error("❌ [HEDGE CONFIRMATION] CRITICAL - Stopping bot due to hedge imbalance")
+                    self.stop_flag = True
+
+                    # Send Telegram alert
+                    alertMsg = (
+                        f"<b>🚨 HEDGE CONFIRMATION FAILED</b>\n"
+                        f"Ticker: {self.ticker}\n"
+                        f"Position Value: ${position_value:.2f}\n"
+                        f"Action: Bot stopped for safety"
+                    )
+                    self.send_telegram_alert(alertMsg)
+
+        except Exception as e:
+            self.logger.error(f"Error in hedge confirmation check: {e}")
+
+    async def ensure_clean_start(self):
+        """Cancel all open orders before starting trading loop (STORY-V5).
+
+        This prevents Rate Limit Error 1006 caused by stale orders from previous sessions.
+        """
+        self.logger.info("🧹 [CLEAN START] Checking for stale orders...")
+        cancelledCount = 0
+
+        try:
+            # GRVT orders
+            grvtOrders = await self.grvt_client.get_active_orders(self.grvt_contract)
+            if grvtOrders:
+                self.logger.warning(f"⚠️ Found {len(grvtOrders)} stale GRVT orders, cancelling...")
+                for order in grvtOrders:
+                    await self.grvt_client.cancel_order(order.order_id)
+                    cancelledCount += 1
+                    self.logger.info(f"  ❌ Cancelled GRVT order: {order.order_id}")
+        except Exception as e:
+            self.logger.error(f"Error cancelling GRVT orders: {e}")
+
+        try:
+            # Backpack orders
+            bpOrders = await self.backpack_client.get_active_orders(self.backpack_contract_id)
+            if bpOrders:
+                self.logger.warning(f"⚠️ Found {len(bpOrders)} stale Backpack orders, cancelling...")
+                for order in bpOrders:
+                    await self.backpack_client.cancel_order(order.order_id)
+                    cancelledCount += 1
+                    self.logger.info(f"  ❌ Cancelled Backpack order: {order.order_id}")
+        except Exception as e:
+            self.logger.error(f"Error cancelling Backpack orders: {e}")
+
+        if cancelledCount > 0:
+            self.logger.info(f"✅ [CLEAN START] Cancelled {cancelledCount} stale orders")
+        else:
+            self.logger.info("✅ [CLEAN START] No stale orders found")
+
     async def trading_loop(self):
-        """Main trading loop implementing the new strategy."""
+        """Main trading loop for hedge bot."""
         self.logger.info(f"🚀 Starting hedge bot for {self.ticker}")
 
+        # ============================================================
+        # INITIALIZATION
+        # ============================================================
         # Initialize clients
         try:
-            self.initialize_lighter_client()
+            self.initialize_grvt_client()
             self.initialize_backpack_client()
 
             # Get contract info
             self.backpack_contract_id, self.backpack_tick_size = await self.get_backpack_contract_info()
-            self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier = self.get_lighter_market_config()
+            # GRVT contract symbol already set in __init__ as "ETH_USDT_Perp"
 
             self.logger.info(f"Contract info loaded - Backpack: {self.backpack_contract_id}, "
-                             f"Lighter: {self.lighter_market_index}")
+                             f"GRVT: {self.grvt_contract}")
+
+            # STORY-V5: Clean Start - Cancel stale orders before trading
+            await self.ensure_clean_start()
 
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize: {e}")
@@ -1573,192 +1660,35 @@ class HedgeBot:
             self.logger.error(f"❌ Failed to setup Backpack websocket: {e}")
             return
 
-        # Setup Lighter websocket
+        # Setup GRVT REST API polling (replaces WebSocket)
         try:
-            self.lighter_ws_task = asyncio.create_task(self.handle_lighter_ws())
-            self.logger.info("✅ Lighter WebSocket task started")
+            self.grvt_ws_task = asyncio.create_task(self.handle_grvt_ws())
+            self.logger.info("✅ GRVT order book polling task started")
 
-            # Wait for initial Lighter order book data with timeout
-            self.logger.info("⏳ Waiting for initial Lighter order book data...")
+            # Wait for initial GRVT order book data with timeout
+            self.logger.info("⏳ Waiting for initial GRVT order book data...")
             timeout = 10  # seconds
             start_time = time.time()
-            while not self.lighter_order_book_ready and not self.stop_flag:
+            while not self.grvt_order_book_ready and not self.stop_flag:
                 if time.time() - start_time > timeout:
-                    self.logger.warning(f"⚠️ Timeout waiting for Lighter WebSocket order book data after {timeout}s")
+                    self.logger.warning(f"⚠️ Timeout waiting for GRVT order book data after {timeout}s")
                     break
                 await asyncio.sleep(0.5)
 
-            if self.lighter_order_book_ready:
-                self.logger.info("✅ Lighter WebSocket order book data received")
+            if self.grvt_order_book_ready:
+                self.logger.info("✅ GRVT order book data received")
             else:
-                self.logger.warning("⚠️ Lighter WebSocket order book not ready")
+                self.logger.warning("⚠️ GRVT order book not ready")
 
         except Exception as e:
-            self.logger.error(f"❌ Failed to setup Lighter websocket: {e}")
+            self.logger.error(f"❌ Failed to setup GRVT polling: {e}")
             return
 
         await asyncio.sleep(5)
 
-    async def _fetch_lighter_position_rest(self) -> Decimal:
-        """
-        Fetch actual Lighter position via REST API.
-
-        Returns:
-            Decimal: Net position in ETH (positive = long, negative = short)
-        """
-        try:
-            url = f"{self.lighter_base_url}/api/v1/positions"
-            params = {
-                "account": str(self.account_index),
-                "apiKeyIndex": str(self.api_key_index)
-            }
-            headers = {"accept": "application/json"}
-
-            self.logger.debug(f"Fetching Lighter position: GET {url} with params {params}")
-
-            response = requests.get(url, params=params, headers=headers, timeout=10)
-            response.raise_for_status()
-
-            data = response.json()
-            self.logger.debug(f"Lighter positions response: {data}")
-
-            # Find ETH/USDC position
-            lighter_symbol = f"{self.ticker}/USDC"
-            net_position = Decimal('0')
-
-            if isinstance(data, list):
-                for position in data:
-                    if position.get('symbol') == lighter_symbol:
-                        size = Decimal(str(position.get('size', '0')))
-                        side = position.get('side', '')
-
-                        # Convert to signed position
-                        if side.lower() == 'long':
-                            net_position = size
-                        elif side.lower() == 'short':
-                            net_position = -size
-
-                        self.logger.debug(f"Found {lighter_symbol} position: {side} {size} → net {net_position}")
-                        break
-
-            elif isinstance(data, dict):
-                # Alternative response format
-                positions = data.get('positions', [])
-                for position in positions:
-                    if position.get('symbol') == lighter_symbol:
-                        size = Decimal(str(position.get('size', '0')))
-                        side = position.get('side', '')
-
-                        if side.lower() == 'long':
-                            net_position = size
-                        elif side.lower() == 'short':
-                            net_position = -size
-
-                        self.logger.debug(f"Found {lighter_symbol} position: {side} {size} → net {net_position}")
-                        break
-
-            return net_position
-
-        except Exception as e:
-            self.logger.error(f"❌ Error fetching Lighter position via REST: {e}")
-            self.logger.error(f"❌ Response: {response.text if 'response' in locals() else 'N/A'}")
-            raise
-
-    async def _fetch_backpack_position_rest(self) -> Decimal:
-        """
-        Fetch actual Backpack position via REST API.
-
-        Returns:
-            Decimal: Net position in ETH (positive = long, negative = short)
-        """
-        try:
-            if not self.backpack_client:
-                raise Exception("Backpack client not initialized")
-
-            # Use Backpack client to get positions
-            positions = await self.backpack_client.get_positions()
-
-            self.logger.debug(f"Backpack positions response: {positions}")
-
-            # Find ETH_USDC_PERP position
-            symbol = f"{self.ticker}_USDC_PERP"
-            net_position = Decimal('0')
-
-            if isinstance(positions, list):
-                for position in positions:
-                    if position.get('symbol') == symbol:
-                        # Backpack returns net position directly
-                        net_position = Decimal(str(position.get('position', '0')))
-                        self.logger.debug(f"Found {symbol} position: {net_position}")
-                        break
-
-            return net_position
-
-        except Exception as e:
-            self.logger.error(f"❌ Error fetching Backpack position via REST: {e}")
-            raise
-
-    async def verify_hedge_completion(self) -> bool:
-        """
-        Verify that hedge is actually balanced by fetching real positions from both exchanges.
-
-        Returns:
-            bool: True if hedge is confirmed successful, False otherwise
-        """
-        try:
-            self.logger.info("🔍 [HEDGE VERIFICATION] Starting verification...")
-
-            # Get tolerance and threshold from config
-            tolerance = Decimal(str(self.config.get("hedge_verification", "position_tolerance", 0.001)))
-            threshold = Decimal(str(self.config.get("trading", "position_diff_threshold", 0.2)))
-
-            # Fetch actual positions from both exchanges
-            self.logger.info("🔍 [HEDGE VERIFICATION] Fetching Lighter position via REST...")
-            actual_lighter = await self._fetch_lighter_position_rest()
-
-            self.logger.info("🔍 [HEDGE VERIFICATION] Fetching Backpack position via REST...")
-            actual_backpack = await self._fetch_backpack_position_rest()
-
-            # Log actual vs tracked positions
-            self.logger.info("="*60)
-            self.logger.info("📊 [HEDGE VERIFICATION] Position Comparison:")
-            self.logger.info(f"   Lighter  - Actual: {actual_lighter:>10} | Tracked: {self.lighter_position:>10}")
-            self.logger.info(f"   Backpack - Actual: {actual_backpack:>10} | Tracked: {self.backpack_position:>10}")
-
-            # Check for discrepancies
-            lighter_diff = abs(actual_lighter - self.lighter_position)
-            backpack_diff = abs(actual_backpack - self.backpack_position)
-
-            if lighter_diff > tolerance:
-                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Lighter position mismatch: {lighter_diff} (tolerance: {tolerance})")
-                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Updating tracked Lighter position: {self.lighter_position} → {actual_lighter}")
-                self.lighter_position = actual_lighter
-
-            if backpack_diff > tolerance:
-                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Backpack position mismatch: {backpack_diff} (tolerance: {tolerance})")
-                self.logger.warning(f"⚠️ [HEDGE VERIFICATION] Updating tracked Backpack position: {self.backpack_position} → {actual_backpack}")
-                self.backpack_position = actual_backpack
-
-            # Calculate net position
-            net_position = actual_lighter + actual_backpack
-            self.logger.info(f"📊 [HEDGE VERIFICATION] Net Position: {net_position} (threshold: {threshold})")
-
-            # Verify hedge balance
-            if abs(net_position) > threshold:
-                self.logger.error(f"❌ [HEDGE VERIFICATION] FAILED - Net position {net_position} exceeds threshold {threshold}")
-                self.logger.error(f"❌ [HEDGE VERIFICATION] Lighter: {actual_lighter} | Backpack: {actual_backpack}")
-                self.logger.info("="*60)
-                return False
-
-            self.logger.info(f"✅ [HEDGE VERIFICATION] PASSED - Hedge is balanced")
-            self.logger.info("="*60)
-            return True
-
-        except Exception as e:
-            self.logger.error(f"❌ [HEDGE VERIFICATION] Exception during verification: {e}")
-            self.logger.error("❌ [HEDGE VERIFICATION] FAILED - Unable to verify hedge")
-            return False
-
+        # ============================================================
+        # TRADING LOOP
+        # ============================================================
         # Send Telegram notification for bot start
         startMsg = (
             f"<b>Hedge Bot Started</b>\n"
@@ -1800,7 +1730,7 @@ class HedgeBot:
                     f"Progress: {iterations}/{self.iterations}\n"
                     f"Position:\n"
                     f"  Backpack: {self.backpack_position}\n"
-                    f"  Lighter: {self.lighter_position}"
+                    f"  GRVT: {self.grvt_position}"
                 )
                 self.send_telegram_alert(statusMsg)
 
@@ -1812,7 +1742,7 @@ class HedgeBot:
             self.logger.info("="*60)
 
             # Log locally tracked positions
-            self.logger.info(f"📊 Tracked - Backpack: {self.backpack_position} | Lighter: {self.lighter_position}")
+            self.logger.info(f"📊 Tracked - Backpack: {self.backpack_position} | GRVT: {self.grvt_position}")
 
             # Verify hedge via REST API before proceeding
             self.logger.info("🔍 Verifying hedge balance via REST API...")
@@ -1824,7 +1754,7 @@ class HedgeBot:
                     f"<b>🚨 HEDGE VERIFICATION FAILED</b>\n"
                     f"Ticker: {self.ticker}\n"
                     f"Iteration: {iterations}\n"
-                    f"Tracked - BP: {self.backpack_position}, LT: {self.lighter_position}\n"
+                    f"Tracked - BP: {self.backpack_position}, GRVT: {self.grvt_position}\n"
                     f"Action: Bot stopped for safety"
                 )
                 self.stop_flag = True
@@ -1834,11 +1764,21 @@ class HedgeBot:
             self.logger.info("="*60)
 
             self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
+            self.waiting_for_grvt_fill = False
             try:
+                # Get current order size from progressive sizing
+                current_price = await self.get_current_price()
+                if current_price:
+                    dynamic_size = self.progressiveSizing.get_current_size(current_price)
+                else:
+                    dynamic_size = self.order_quantity  # Fallback to fixed size
+                    self.logger.warning("Could not get price, using fixed order size")
+
+                self.logger.info(f"📊 Order size: {dynamic_size} {self.ticker} (${dynamic_size * current_price if current_price else 'N/A'})")
+
                 # Determine side based on some logic (for now, alternate)
                 side = 'buy'
-                await self.place_backpack_post_only_order(side, self.order_quantity)
+                await self.place_backpack_post_only_order(side, dynamic_size)
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
@@ -1846,12 +1786,12 @@ class HedgeBot:
 
             start_time = time.time()
             while not self.order_execution_complete and not self.stop_flag:
-                # Check if Backpack order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
+                # Check if Backpack order filled and we need to place GRVT order
+                if self.waiting_for_grvt_fill:
+                    await self.place_grvt_market_order(
+                        self.current_grvt_side,
+                        self.current_grvt_quantity,
+                        self.current_grvt_price
                     )
                     break
 
@@ -1864,25 +1804,25 @@ class HedgeBot:
                 break
 
             # Close position
-            self.logger.info(f"[STEP 2] Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
+            self.logger.info(f"[STEP 2] Backpack position: {self.backpack_position} | GRVT position: {self.grvt_position}")
             self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
+            self.waiting_for_grvt_fill = False
             try:
-                # Determine side based on some logic (for now, alternate)
+                # Use same dynamic size for sell order
                 side = 'sell'
-                await self.place_backpack_post_only_order(side, self.order_quantity)
+                await self.place_backpack_post_only_order(side, dynamic_size)
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
 
             while not self.order_execution_complete and not self.stop_flag:
-                # Check if Backpack order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
+                # Check if Backpack order filled and we need to place GRVT order
+                if self.waiting_for_grvt_fill:
+                    await self.place_grvt_market_order(
+                        self.current_grvt_side,
+                        self.current_grvt_quantity,
+                        self.current_grvt_price
                     )
                     break
 
@@ -1892,9 +1832,9 @@ class HedgeBot:
                     break
 
             # Close remaining position
-            self.logger.info(f"[STEP 3] Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
+            self.logger.info(f"[STEP 3] Backpack position: {self.backpack_position} | GRVT position: {self.grvt_position}")
             self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
+            self.waiting_for_grvt_fill = False
             if self.backpack_position == 0:
                 continue
             elif self.backpack_position > 0:
@@ -1912,19 +1852,35 @@ class HedgeBot:
 
             # Wait for order to be filled via WebSocket
             while not self.order_execution_complete and not self.stop_flag:
-                # Check if Backpack order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
+                # Check if Backpack order filled and we need to place GRVT order
+                if self.waiting_for_grvt_fill:
+                    await self.place_grvt_market_order(
+                        self.current_grvt_side,
+                        self.current_grvt_quantity,
+                        self.current_grvt_price
                     )
                     break
 
                 await asyncio.sleep(0.01)
                 if time.time() - start_time > 180:
                     self.logger.error("❌ Timeout waiting for trade completion")
+                    # Record failure for timeout
+                    downgraded, failure_msg = self.progressiveSizing.record_failure()
+                    if failure_msg:
+                        self.logger.warning(f"Progressive Sizing: {failure_msg}")
+                        self.send_telegram_alert(f"<b>Progressive Sizing Update</b>\n{failure_msg}")
                     break
+
+            # Record success if iteration completed without errors
+            if self.order_execution_complete and not self.stop_flag:
+                advanced, success_msg = self.progressiveSizing.record_success()
+                if success_msg:
+                    self.logger.info(f"Progressive Sizing: {success_msg}")
+                    self.send_telegram_alert(f"<b>Progressive Sizing Update</b>\n{success_msg}")
+
+                # Log current progressive sizing status
+                ps_status = self.progressiveSizing.get_status_summary()
+                self.logger.info(f"\n{ps_status}")
 
     async def run(self):
         """Run the hedge bot."""
@@ -1940,8 +1896,8 @@ class HedgeBot:
             await self.trading_loop()
             # Send completion notification
             bpPos = float(self.backpack_position)
-            ltPos = float(self.lighter_position)
-            netPos = bpPos + ltPos
+            grvtPos = float(self.grvt_position)
+            netPos = bpPos + grvtPos
             statusEmoji = "✅" if abs(netPos) < 0.0001 else "⚠️"
             completionMsg = (
                 f"<b>✅ Hedge Bot Completed</b>\n"
@@ -1949,7 +1905,7 @@ class HedgeBot:
                 "---\n"
                 f"<b>📊 Final Positions:</b>\n"
                 f"  Backpack: {bpPos:+.4f} {self.ticker}\n"
-                f"  Lighter: {ltPos:+.4f} {self.ticker}\n"
+                f"  GRVT: {grvtPos:+.4f} {self.ticker}\n"
                 f"  Net: {netPos:+.4f} {statusEmoji}\n"
                 "---\n"
                 f"🔄 Iterations: {self.order_counter}/{self.iterations}"
@@ -1968,7 +1924,7 @@ class HedgeBot:
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Trading bot for Backpack and Lighter')
+    parser = argparse.ArgumentParser(description='Trading bot for Backpack and GRVT')
     parser.add_argument('--exchange', type=str,
                         help='Exchange')
     parser.add_argument('--ticker', type=str, default='BTC',
