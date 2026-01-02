@@ -7,6 +7,7 @@ It imports and runs the appropriate hedge mode implementation based on the excha
 
 Usage:
     python hedge_mode.py --exchange <exchange> [other arguments]
+    python hedge_mode.py --primary <exchange> --hedge <exchange> [other arguments]
 
 Supported exchanges:
     - backpack: Uses HedgeBot from hedge_mode_bp.py (Backpack + Lighter)
@@ -16,6 +17,11 @@ Supported exchanges:
       Use --v2 flag to use hedge_mode_grvt_v2.py instead
     - edgex: Uses HedgeBot from hedge_mode_edgex.py (edgeX + Lighter)
     - nado: Uses HedgeBot from hedge_mode_nado.py (Nado + Lighter)
+
+2DEX Mode (Dynamic):
+    Use --primary and --hedge to specify any two exchanges dynamically.
+    PRIMARY exchange places maker orders (POST_ONLY), HEDGE places taker orders.
+    Example: python hedge_mode.py --primary grvt --hedge backpack --ticker ETH --size 0.01 --iter 10
 
 Cross-platform compatibility:
     - Works on Linux, macOS, and Windows
@@ -43,11 +49,19 @@ Examples:
     python hedge_mode.py --exchange grvt --v2 --ticker BTC --size 0.05 --iter 10 --max-position 0.1
     python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
     python hedge_mode.py --exchange nado --ticker BTC --size 0.003 --iter 20 --max-position 0.05
+
+2DEX Mode (Dynamic - any two exchanges):
+    python hedge_mode.py --primary grvt --hedge backpack --ticker ETH --size 0.01 --iter 10
+    python hedge_mode.py --primary edgex --hedge nado --ticker BTC --size 0.001 --iter 20
         """
     )
-    
-    parser.add_argument('--exchange', type=str, required=True,
-                        help='Exchange to use (backpack, extended, apex, grvt, or edgex)')
+
+    parser.add_argument('--exchange', type=str, default=None,
+                        help='Exchange to use (backpack, extended, apex, grvt, edgex, nado) - legacy mode')
+    parser.add_argument('--primary', type=str, default=None,
+                        help='PRIMARY exchange for maker orders (2DEX mode)')
+    parser.add_argument('--hedge', type=str, default=None,
+                        help='HEDGE exchange for taker orders (2DEX mode)')
     parser.add_argument('--ticker', type=str, default='BTC',
                         help='Ticker symbol (default: BTC)')
     parser.add_argument('--size', type=str, required=True,
@@ -117,22 +131,62 @@ async def main():
         print(f"Env file not find: {env_path.resolve()}")
         sys.exit(1)
     dotenv.load_dotenv(args.env_file)
-    
+
+    # =====================================================
+    # 2DEX Mode: --primary + --hedge (Dynamic two exchanges)
+    # =====================================================
+    if args.primary and args.hedge:
+        from hedge.hedge_mode_2dex import HedgeBot2DEX
+
+        print(f"Starting 2DEX hedge mode: PRIMARY={args.primary}, HEDGE={args.hedge}")
+        print(f"Ticker: {args.ticker}, Size: {args.size}, Iterations: {args.iter}")
+        print("-" * 50)
+
+        try:
+            bot = HedgeBot2DEX(
+                primaryExchange=args.primary.lower(),
+                hedgeExchange=args.hedge.lower(),
+                ticker=args.ticker.upper(),
+                orderQuantity=Decimal(args.size),
+                fillTimeout=args.fill_timeout,
+                iterations=args.iter,
+                sleepTime=args.sleep,
+                maxPosition=args.max_position
+            )
+            await bot.run()
+        except KeyboardInterrupt:
+            print("\n2DEX hedge mode interrupted by user")
+            return 1
+        except Exception as e:
+            print(f"Error running 2DEX hedge mode: {e}")
+            import traceback
+            print(f"Full traceback: {traceback.format_exc()}")
+            return 1
+
+        return 0
+
+    # =====================================================
+    # Legacy Mode: --exchange (Single exchange + Lighter)
+    # =====================================================
+    if not args.exchange:
+        print("Error: Must specify either --exchange OR both --primary and --hedge")
+        sys.exit(1)
+
     # Validate exchange
     validate_exchange(args.exchange)
-    
+
     # Validate v2 flag usage
     if args.v2 and args.exchange.lower() != 'grvt':
         print(f"Error: --v2 flag is only supported for grvt exchange")
         sys.exit(1)
-    
+
     # Get the appropriate HedgeBot class
     try:
         HedgeBotClass = get_hedge_bot_class(args.exchange, v2=args.v2)
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
-    
+
     version_str = " v2" if args.v2 else ""
     print(f"Starting hedge mode for {args.exchange} exchange{version_str}...")
     print(f"Ticker: {args.ticker}, Size: {args.size}, Iterations: {args.iter}")
