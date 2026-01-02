@@ -108,6 +108,19 @@ class HedgeBot2DEX:
         self.primaryTickSize = None
         self.hedgeTickSize = None
 
+        # Fill rate tracking
+        self.fillRateStats = {
+            'attempts': 0,
+            'filled': 0,
+            'timeout': 0,
+            'cancelled': 0,
+            'total_volume': Decimal('0')
+        }
+
+        # Rate limit backoff (for GRVT 429 errors)
+        self.rateLimitBackoff = 1  # seconds
+        self.maxBackoff = 60  # max 60 seconds
+
     def _initializeCsvFile(self):
         """Initialize CSV file with headers if it doesn't exist."""
         if not os.path.exists(self.csvFilename):
@@ -198,12 +211,17 @@ class HedgeBot2DEX:
             True if cycle completed successfully
         """
         self.orderCounter += 1
+        self.fillRateStats['attempts'] += 1
         oppositeDirection = 'sell' if direction == 'buy' else 'buy'
 
         self.logger.info(f"\n{'='*50}")
         self.logger.info(f"[CYCLE {self.orderCounter}] PRIMARY {direction.upper()} -> HEDGE {oppositeDirection.upper()}")
 
         try:
+            # Apply rate limit backoff if needed
+            if self.rateLimitBackoff > 1:
+                self.logger.info(f"[BACKOFF] Waiting {self.rateLimitBackoff}s due to rate limit...")
+                await asyncio.sleep(self.rateLimitBackoff)
             # Step 1: Get BBO from PRIMARY
             self.logger.info(f"[BBO] Fetching from PRIMARY ({self.primaryExchangeName})...")
             bboPrices = await self.primaryClient.fetch_bbo_prices(self.primaryContractId)
@@ -230,6 +248,12 @@ class HedgeBot2DEX:
 
             if not primaryResult.success:
                 self.logger.warning(f"[WARN] PRIMARY order failed: {primaryResult.error_message}")
+
+                # Check for rate limit (429 error)
+                if '429' in str(primaryResult.error_message) or 'rate limit' in str(primaryResult.error_message).lower():
+                    self.rateLimitBackoff = min(self.rateLimitBackoff * 2, self.maxBackoff)
+                    self.logger.warning(f"[RATE_LIMIT] Detected, increasing backoff to {self.rateLimitBackoff}s")
+
                 return False
 
             self.logger.info(f"[OK] PRIMARY order placed: ID={primaryResult.order_id}")
@@ -272,11 +296,21 @@ class HedgeBot2DEX:
             if not orderFilled or filledSize <= 0:
                 self.logger.info(f"[TIMEOUT] PRIMARY order not filled within {self.fillTimeout}s, cancelling...")
                 await self.primaryClient.cancel_order(primaryResult.order_id)
+                self.fillRateStats['timeout'] += 1
                 self.logTradeToCsv(
                     self.primaryExchangeName, 'PRIMARY', direction,
                     str(makerPrice), str(self.orderQuantity), 'cancelled'
                 )
                 return False
+
+            # Update fill rate stats
+            self.fillRateStats['filled'] += 1
+            self.fillRateStats['total_volume'] += filledSize
+
+            # Reset rate limit backoff on successful fill
+            if self.rateLimitBackoff > 1:
+                self.rateLimitBackoff = max(1, self.rateLimitBackoff / 2)
+                self.logger.info(f"[BACKOFF] Successful fill, reducing backoff to {self.rateLimitBackoff}s")
 
             self.logTradeToCsv(
                 self.primaryExchangeName, 'PRIMARY', direction,
@@ -357,12 +391,19 @@ class HedgeBot2DEX:
                     await asyncio.sleep(self.sleepTime)
 
             # Summary
+            fillRate = (self.fillRateStats['filled'] / self.fillRateStats['attempts'] * 100) if self.fillRateStats['attempts'] > 0 else 0
+
             self.logger.info(f"\n{'='*60}")
             self.logger.info(f"[SUMMARY] SESSION SUMMARY")
             self.logger.info(f"   Total Cycles: {self.orderCounter}")
             self.logger.info(f"   Successful: {successCount}")
             self.logger.info(f"   Failed: {failCount}")
             self.logger.info(f"   Position Imbalance: {self.positionImbalance}")
+            self.logger.info(f"\n[FILL RATE STATS]")
+            self.logger.info(f"   Fill Rate: {fillRate:.1f}% ({self.fillRateStats['filled']}/{self.fillRateStats['attempts']})")
+            self.logger.info(f"   Filled: {self.fillRateStats['filled']} orders")
+            self.logger.info(f"   Timeout: {self.fillRateStats['timeout']} orders")
+            self.logger.info(f"   Total Volume: {self.fillRateStats['total_volume']} {self.ticker}")
             self.logger.info(f"{'='*60}\n")
 
         except Exception as e:
