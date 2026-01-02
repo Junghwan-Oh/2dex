@@ -397,23 +397,32 @@ class BackpackClient(BaseExchangeClient):
             quantity=str(quantity)
         )
 
+        # Handle case where result is string instead of dict
+        if isinstance(result, str):
+            self.logger.log(f"Market order returned string: {result}", "ERROR")
+            return OrderResult(success=False, error_message=f'Unexpected response: {result}')
+
+        if not isinstance(result, dict):
+            self.logger.log(f"Market order returned unexpected type: {type(result)}", "ERROR")
+            return OrderResult(success=False, error_message=f'Unexpected response type: {type(result)}')
+
         order_id = result.get('id')
-        order_status = result.get('status').upper()
+        order_status = result.get('status', '').upper()
 
         if order_status != 'FILLED':
             self.logger.log(f"Market order failed with status: {order_status}", "ERROR")
-            sys.exit(1)
+            return OrderResult(success=False, error_message=f'Market order status: {order_status}')
+
         # For market orders, we expect them to be filled immediately
-        else:
-            price = Decimal(result.get('executedQuoteQuantity', '0'))/Decimal(result.get('executedQuantity'))
-            return OrderResult(
-                success=True,
-                order_id=order_id,
-                side=direction.lower(),
-                size=quantity,
-                price=price,
-                status='FILLED'
-            )
+        price = Decimal(result.get('executedQuoteQuantity', '0'))/Decimal(result.get('executedQuantity'))
+        return OrderResult(
+            success=True,
+            order_id=order_id,
+            side=direction.lower(),
+            size=quantity,
+            price=price,
+            status='FILLED'
+        )
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
         """Place a close order with Backpack using official SDK with retry logic for POST_ONLY rejections."""
