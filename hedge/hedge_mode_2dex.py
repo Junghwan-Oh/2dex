@@ -420,14 +420,28 @@ class HedgeBot2DEX:
                         elif status in ['REJECTED', 'rejected']:
                             self.logger.info(f"[WebSocket] Order rejected")
                             return False
+                        elif status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'new', 'open', 'pending']:
+                            # Normal waiting states - continue monitoring
+                            pass  # No action, staleness check will handle if needed
                         else:
-                            # Unknown status - log warning and continue waiting
+                            # Truly unknown status - log warning and continue waiting
                             self.logger.warning(f"[WebSocket] Unknown order status: {status}")
                             # Continue monitoring (no action taken)
 
                     # Active BBO monitoring for cancel-and-replace decision
                     currentTime = time.time()
                     elapsed = currentTime - startTime
+
+                    # Timeout check (original template: 180s per order)
+                    if elapsed > 180:
+                        self.logger.error("[TIMEOUT] PRIMARY order timeout after 180s, cancelling...")
+                        await self.primaryClient.cancel_order(primaryResult.order_id)
+                        self.fillRateStats['timeout'] += 1
+                        self.logTradeToCsv(
+                            self.primaryExchangeName, 'PRIMARY_MAKER', direction,
+                            str(makerPrice), str(self.orderQuantity), 'timeout'
+                        )
+                        return False
 
                     if elapsed > 10:  # After 10 seconds, check if order price is stale
                         # Fetch current BBO to check if our order is still competitive
@@ -448,7 +462,7 @@ class HedgeBot2DEX:
                             lastCancelTime = currentTime
                             # Cancellation will trigger new order placement in next iteration
 
-                    # Infinite retry pattern - no timeout break, only exit on FILLED
+                    # Active monitoring with 180s timeout (original template pattern)
                     await asyncio.sleep(0.5)  # Check every 0.5s
 
                 # Handle fill status for maker orders
@@ -651,14 +665,28 @@ class HedgeBot2DEX:
                         elif status in ['REJECTED', 'rejected']:
                             self.logger.info(f"[WebSocket] Close order rejected")
                             return False
+                        elif status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'new', 'open', 'pending']:
+                            # Normal waiting states - continue monitoring
+                            pass  # No action, staleness check will handle if needed
                         else:
-                            # Unknown status - log warning and continue waiting
+                            # Truly unknown status - log warning and continue waiting
                             self.logger.warning(f"[WebSocket] Unknown close order status: {status}")
                             # Continue monitoring (no action taken)
 
                     # Active BBO monitoring for cancel-and-replace decision
                     currentTime = time.time()
                     elapsed = currentTime - startTime
+
+                    # Timeout check (original template: 180s per order)
+                    if elapsed > 180:
+                        self.logger.error("[TIMEOUT] PRIMARY close order timeout after 180s, cancelling...")
+                        await self.primaryClient.cancel_order(primaryResult.order_id)
+                        self.fillRateStats['timeout'] += 1
+                        self.logTradeToCsv(
+                            self.primaryExchangeName, 'PRIMARY_MAKER', oppositeDirection,
+                            str(closePrice), str(closeSize), 'timeout_close'
+                        )
+                        return False
 
                     if elapsed > 10:  # After 10 seconds, check if order price is stale
                         # Fetch current BBO to check if our order is still competitive
@@ -679,7 +707,7 @@ class HedgeBot2DEX:
                             lastCancelTime = currentTime
                             # Cancellation will trigger new order placement in next iteration
 
-                    # Infinite retry pattern - no timeout break, only exit on FILLED
+                    # Active monitoring with 180s timeout (original template pattern)
                     await asyncio.sleep(0.5)  # Check every 0.5s
 
                 # Handle fill status for maker orders
@@ -1031,6 +1059,61 @@ class HedgeBot2DEX:
     async def cleanup(self):
         """Clean up resources."""
         self.logger.info("[CLEANUP] Cleaning up...")
+
+        # Auto-close any unclosed position before disconnection (DN logic: one side profit + one side loss = net zero)
+        if abs(self.currentPosition) > 0:
+            self.logger.warning(f"[AUTO-CLOSE] Unclosed position detected: {self.currentPosition}, forcing cleanup close...")
+
+            try:
+                # Determine close direction (opposite of current position)
+                closeDirection = 'sell' if self.currentPosition > 0 else 'buy'
+                closeSize = abs(self.currentPosition)
+
+                self.logger.info(f"[AUTO-CLOSE] Closing position: direction={closeDirection}, size={closeSize}")
+
+                # Close on PRIMARY (market taker for immediate execution)
+                if self.primaryClient:
+                    primaryResult = await self.primaryClient.place_market_order(
+                        self.primaryContractId,
+                        closeSize,
+                        closeDirection
+                    )
+                    if primaryResult.success:
+                        primaryPrice = primaryResult.price if primaryResult.price else 'market'
+                        self.logger.info(f"[AUTO-CLOSE] PRIMARY close filled @ {primaryPrice}")
+                        self.logTradeToCsv(
+                            self.primaryExchangeName, 'PRIMARY_TAKER', closeDirection,
+                            str(primaryPrice), str(closeSize), 'auto_close'
+                        )
+                    else:
+                        self.logger.error(f"[AUTO-CLOSE] PRIMARY close FAILED: {primaryResult.error_message}")
+
+                # Close on HEDGE (market order, same direction as open)
+                hedgeDirection = 'sell' if closeDirection == 'buy' else 'buy'
+                if self.hedgeClient:
+                    hedgeResult = await self.hedgeClient.place_market_order(
+                        self.hedgeContractId,
+                        closeSize,
+                        hedgeDirection
+                    )
+                    if hedgeResult.success:
+                        hedgePrice = hedgeResult.price if hedgeResult.price else 'market'
+                        self.logger.info(f"[AUTO-CLOSE] HEDGE close filled @ {hedgePrice}")
+                        self.logTradeToCsv(
+                            self.hedgeExchangeName, 'HEDGE', hedgeDirection,
+                            str(hedgePrice), str(closeSize), 'auto_close'
+                        )
+                    else:
+                        self.logger.error(f"[AUTO-CLOSE] HEDGE close FAILED: {hedgeResult.error_message}")
+
+                # Update position tracking
+                self.currentPosition = Decimal('0')
+                self.positionOpen = False
+                self.logger.info(f"[AUTO-CLOSE] Position cleanup complete: currentPosition={self.currentPosition}")
+
+            except Exception as e:
+                self.logger.error(f"[AUTO-CLOSE] Error during position cleanup: {e}")
+                self.logger.error(f"[MANUAL] Manual intervention required: unclosed position={self.currentPosition}")
 
         if self.primaryClient:
             try:
