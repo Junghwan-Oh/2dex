@@ -192,7 +192,7 @@ class BackpackClient(BaseExchangeClient):
         self.ws_manager.config = self.config
 
         # Initialize logger using the same format as helpers
-        self.logger = TradingLogger(exchange="backpack", ticker=self.config.ticker, log_to_console=False)
+        self.logger = TradingLogger(exchange="backpack", ticker=self.config.ticker, log_to_console=True)
         self.ws_manager.set_logger(self.logger)
 
         try:
@@ -335,11 +335,11 @@ class BackpackClient(BaseExchangeClient):
                 return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
             if direction == 'buy':
-                # For buy orders, place slightly below best ask to ensure execution
+                # Aggressive maker: place 1 tick below best ask
                 order_price = best_ask - self.config.tick_size
                 side = 'Bid'
             else:
-                # For sell orders, place slightly above best bid to ensure execution
+                # Aggressive maker: place 1 tick above best bid
                 order_price = best_bid + self.config.tick_size
                 side = 'Ask'
 

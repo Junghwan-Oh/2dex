@@ -43,7 +43,7 @@ class GrvtClient(BaseExchangeClient):
         self.env = env_map.get(self.environment.lower(), GrvtEnv.PROD)
 
         # Initialize logger
-        self.logger = TradingLogger(exchange="grvt", ticker=self.config.ticker, log_to_console=False)
+        self.logger = TradingLogger(exchange="grvt", ticker=self.config.ticker, log_to_console=True)
 
         # Initialize GRVT clients
         self._initialize_grvt_clients()
@@ -336,10 +336,12 @@ class GrvtClient(BaseExchangeClient):
             if best_bid <= 0 or best_ask <= 0:
                 return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
-            # Determine order side and price
+            # Determine order side and price (aggressive maker - 1 tick from opposite side)
             if direction == 'buy':
+                # Place 1 tick below best ask (aggressive bid in spread)
                 order_price = best_ask - self.config.tick_size
             elif direction == 'sell':
+                # Place 1 tick above best bid (aggressive ask in spread)
                 order_price = best_bid + self.config.tick_size
             else:
                 raise Exception(f"[OPEN] Invalid direction: {direction}")
