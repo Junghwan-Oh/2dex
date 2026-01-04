@@ -969,14 +969,35 @@ class HedgeBot2DEX:
                     success = await self.executeCloseCycle(direction)
                     if success:
                         successCount += 1
-                        # Alternate direction for next open
-                        direction = 'sell' if direction == 'buy' else 'buy'
+                        # Price comparison will determine next direction (Phase 2B feature)
+                        # ROLLBACK: Uncomment the line below to restore alternating logic
+                        # direction = 'sell' if direction == 'buy' else 'buy'
                     else:
                         failCount += 1
                         # Keep same direction to retry close on next iteration
                 else:
                     # Open new position
-                    self.logger.info(f"[CYCLE {i+1}] Position is CLOSED, executing OPEN cycle")
+                    # ============================================================
+                    # Phase 2B: Price Comparison Based Direction Decision
+                    # ROLLBACK: Comment out lines 979-993 to disable price comparison
+                    # ============================================================
+                    try:
+                        primaryBbo = await self.get_bbo(self.primaryClient, self.primaryContractId)
+                        hedgeBbo = await self.get_bbo(self.hedgeClient, self.hedgeContractId)
+
+                        primaryMid = (primaryBbo[0] + primaryBbo[1]) / 2
+                        hedgeMid = (hedgeBbo[0] + hedgeBbo[1]) / 2
+
+                        if primaryMid > hedgeMid:
+                            direction = 'sell'  # PRIMARY expensive -> SELL on PRIMARY, BUY on HEDGE
+                        else:
+                            direction = 'buy'   # HEDGE expensive -> BUY on PRIMARY, SELL on HEDGE
+
+                        self.logger.info(f"[PRICE COMPARE] PRIMARY mid={primaryMid:.2f}, HEDGE mid={hedgeMid:.2f}, spread={primaryMid-hedgeMid:.2f} → {direction.upper()}")
+                    except Exception as e:
+                        self.logger.warning(f"[PRICE COMPARE] Failed to get BBO prices: {e}, using previous direction={direction}")
+
+                    self.logger.info(f"[CYCLE {i+1}] Position is CLOSED, executing OPEN cycle with {direction.upper()}")
                     success = await self.executeOpenCycle(direction)
                     if success:
                         successCount += 1
