@@ -969,37 +969,15 @@ class HedgeBot2DEX:
                     success = await self.executeCloseCycle(direction)
                     if success:
                         successCount += 1
-                        # Price comparison will determine next direction (Phase 2B feature)
-                        # ROLLBACK: Uncomment the line below to restore alternating logic
-                        # direction = 'sell' if direction == 'buy' else 'buy'
+                        # Phase 2A: Alternating strategy
+                        direction = 'sell' if direction == 'buy' else 'buy'
+                        self.logger.info(f"[PHASE 2A ALTERNATING] Next direction: {direction.upper()}")
                     else:
                         failCount += 1
                         # Keep same direction to retry close on next iteration
                 else:
                     # Open new position
-                    # ============================================================
-                    # Phase 2D: Momentum-Based Direction Decision
-                    # Hypothesis: Ultra-short trades follow momentum, not mean reversion
-                    # When PRIMARY > HEDGE → BUY PRIMARY (bet on gap expansion)
-                    # Statistical validation: 10/10 cycles showed gap expansion, P < 0.001
-                    # ROLLBACK: Revert to Phase 2B by swapping 'buy' ↔ 'sell' in lines below
-                    # ============================================================
-                    try:
-                        primaryBbo = await self.get_bbo(self.primaryClient, self.primaryContractId)
-                        hedgeBbo = await self.get_bbo(self.hedgeClient, self.hedgeContractId)
-
-                        primaryMid = (primaryBbo[0] + primaryBbo[1]) / 2
-                        hedgeMid = (hedgeBbo[0] + hedgeBbo[1]) / 2
-
-                        if primaryMid > hedgeMid:
-                            direction = 'buy'   # Phase 2D: PRIMARY expensive -> BUY PRIMARY (momentum following)
-                        else:
-                            direction = 'sell'  # Phase 2D: HEDGE expensive -> SELL PRIMARY (momentum following)
-
-                        self.logger.info(f"[PHASE 2D MOMENTUM] PRIMARY mid={primaryMid:.2f}, HEDGE mid={hedgeMid:.2f}, spread={primaryMid-hedgeMid:.2f} → {direction.upper()} (following trend)")
-                    except Exception as e:
-                        self.logger.warning(f"[PHASE 2D MOMENTUM] Failed to get BBO prices: {e}, using previous direction={direction}")
-
+                    # Phase 2A: No price comparison, direction already set by alternating logic
                     self.logger.info(f"[CYCLE {i+1}] Position is CLOSED, executing OPEN cycle with {direction.upper()}")
                     success = await self.executeOpenCycle(direction)
                     if success:
