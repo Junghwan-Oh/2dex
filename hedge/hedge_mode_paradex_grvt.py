@@ -91,7 +91,7 @@ class DNHedgeBot:
         self.local_primary_position = Decimal("0")
         self.local_hedge_position = Decimal("0")
         self.use_local_tracking = True
-        self.reconcile_interval = 5
+        self.reconcile_interval = 3
 
         self.primary_client = None
         self.hedge_client = None
@@ -554,69 +554,43 @@ class DNHedgeBot:
 
         for attempt in range(1, max_retries + 1):
             try:
-                if self.hedge_mode == PriceMode.MARKET:
-                    self.logger.info(
-                        f"[{order_type}] [{self.hedge_exchange.upper()}] [{side.upper()}] "
-                        f"MARKET order: {quantity} (attempt {attempt}/{max_retries})"
+                best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
+                    self.hedge_contract_id
+                )
+
+                if side == "buy":
+                    order_price = best_ask + (
+                        self.hedge_tick_size * Decimal(str(attempt))
                     )
-
-                    if hasattr(self.hedge_client, "place_market_order"):
-                        await self.hedge_client.place_market_order(
-                            self.hedge_contract_id, quantity, side
-                        )
-                    else:
-                        best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
-                            self.hedge_contract_id
-                        )
-                        if side == "buy":
-                            price = best_ask * Decimal("1.01")
-                        else:
-                            price = best_bid * Decimal("0.99")
-
-                        if self.hedge_exchange == "paradex":
-                            from paradex_py.common.order import OrderSide
-
-                            order_side = (
-                                OrderSide.Buy if side == "buy" else OrderSide.Sell
-                            )
-                        else:
-                            order_side = side
-
-                        await self.hedge_client.place_post_only_order(
-                            contract_id=self.hedge_contract_id,
-                            quantity=quantity,
-                            price=price,
-                            side=order_side,
-                        )
-
-                    fill_price = reference_price
-
                 else:
-                    best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
-                        self.hedge_contract_id
-                    )
-                    price_adjustment = self.hedge_tick_size * Decimal(str(attempt - 1))
-                    order_price = self.calculate_order_price(
-                        side, best_bid, best_ask, self.hedge_tick_size, self.hedge_mode
-                    )
-                    if attempt > 1:
-                        if side == "buy":
-                            order_price += price_adjustment
-                        else:
-                            order_price -= price_adjustment
-
-                    self.logger.info(
-                        f"[{order_type}] [{self.hedge_exchange.upper()}] [{side.upper()}] "
-                        f"POST_ONLY @ {order_price} (mode: {self.hedge_mode.value}, attempt {attempt}/{max_retries})"
+                    order_price = best_bid - (
+                        self.hedge_tick_size * Decimal(str(attempt))
                     )
 
-                    if self.hedge_exchange == "paradex":
-                        from paradex_py.common.order import OrderSide
+                order_price = self.hedge_client.round_to_tick(order_price)
 
-                        order_side = OrderSide.Buy if side == "buy" else OrderSide.Sell
-                    else:
-                        order_side = side
+                self.logger.info(
+                    f"[{order_type}] [{self.hedge_exchange.upper()}] [{side.upper()}] "
+                    f"AGGRESSIVE @ {order_price} (BBO: {best_bid}/{best_ask}, attempt {attempt}/{max_retries})"
+                )
 
+                if self.hedge_exchange == "paradex":
+                    from paradex_py.common.order import OrderSide
+
+                    order_side = OrderSide.Buy if side == "buy" else OrderSide.Sell
+                else:
+                    order_side = side
+
+                pos_before = await self.hedge_client.get_account_positions()
+
+                if hasattr(self.hedge_client, "place_aggressive_limit_order"):
+                    await self.hedge_client.place_aggressive_limit_order(
+                        contract_id=self.hedge_contract_id,
+                        quantity=quantity,
+                        price=order_price,
+                        side=order_side,
+                    )
+                else:
                     await self.hedge_client.place_post_only_order(
                         contract_id=self.hedge_contract_id,
                         quantity=quantity,
@@ -624,25 +598,37 @@ class DNHedgeBot:
                         side=order_side,
                     )
 
-                    fill_price = order_price
+                await asyncio.sleep(0.5)
 
-                self.logger.info(
-                    f"[{order_type}] [{self.hedge_exchange.upper()}] [FILLED]: {quantity} @ {fill_price}"
-                )
+                pos_after = await self.hedge_client.get_account_positions()
+                position_change = abs(pos_after - pos_before)
 
-                self.log_trade_to_csv(
-                    exchange=self.hedge_exchange.upper(),
-                    side=side,
-                    price=str(fill_price),
-                    quantity=str(quantity),
-                    order_type="hedge",
-                    mode=self.hedge_mode.value,
-                )
+                if position_change >= quantity * Decimal("0.99"):
+                    actual_fill_price = best_ask if side == "buy" else best_bid
 
-                self.hedge_order_filled = True
-                self.order_execution_complete = True
-                self.last_hedge_fill_price = fill_price
-                return True
+                    self.logger.info(
+                        f"[{order_type}] [{self.hedge_exchange.upper()}] [FILLED]: "
+                        f"{quantity} @ ~{actual_fill_price} (pos: {pos_before} -> {pos_after})"
+                    )
+
+                    self.log_trade_to_csv(
+                        exchange=self.hedge_exchange.upper(),
+                        side=side,
+                        price=str(actual_fill_price),
+                        quantity=str(quantity),
+                        order_type="hedge",
+                        mode="aggressive_taker",
+                    )
+
+                    self.hedge_order_filled = True
+                    self.order_execution_complete = True
+                    self.last_hedge_fill_price = actual_fill_price
+                    return True
+                else:
+                    self.logger.warning(
+                        f"[{order_type}] Hedge fill not confirmed! "
+                        f"Expected change: {quantity}, Actual: {position_change}"
+                    )
 
             except Exception as e:
                 self.logger.error(
@@ -787,6 +773,8 @@ class DNHedgeBot:
             self.logger.info(f"Iteration {iteration}/{self.iterations}")
             self.logger.info(f"{'=' * 40}")
 
+            await self.reconcile_positions()
+
             while (
                 self.local_primary_position < self.max_position and not self.stop_flag
             ):
@@ -803,7 +791,7 @@ class DNHedgeBot:
                     f"[BUILD] PRIMARY: {self.local_primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
                 )
 
-                if abs(net_delta) > self.order_quantity * 10:
+                if abs(net_delta) > self.order_quantity * 5:
                     self.logger.error(f"Position imbalance too large: {net_delta}")
                     self.stop_flag = True
                     break
@@ -845,7 +833,7 @@ class DNHedgeBot:
                     f"[UNWIND] PRIMARY: {self.local_primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
                 )
 
-                if abs(net_delta) > self.order_quantity * 10:
+                if abs(net_delta) > self.order_quantity * 5:
                     self.logger.error(f"Position imbalance too large: {net_delta}")
                     self.stop_flag = True
                     break

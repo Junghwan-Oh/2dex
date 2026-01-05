@@ -399,12 +399,47 @@ class GrvtClient(BaseExchangeClient):
     ) -> OrderResult:
         """Place a market order with GRVT using official SDK."""
 
-        # Place the order using GRVT SDK
         order_result = self.rest_client.create_order(
             symbol=contract_id, order_type="market", side=side, amount=quantity
         )
         if not order_result:
             raise Exception(f"[OPEN] Error placing order")
+
+    async def place_aggressive_limit_order(
+        self, contract_id: str, quantity: Decimal, price: Decimal, side: str
+    ) -> OrderResult:
+        order_result = self.rest_client.create_limit_order(
+            symbol=contract_id,
+            side=side,
+            amount=quantity,
+            price=price,
+            params={
+                "post_only": False,
+                "order_duration_secs": 30 * 86400 - 1,
+            },
+        )
+        if not order_result:
+            raise Exception(f"Error placing aggressive limit order")
+
+        client_order_id = order_result.get("metadata").get("client_order_id")
+        order_status = order_result.get("state").get("status")
+        order_status_start_time = time.time()
+        order_info = await self.get_order_info(client_order_id=client_order_id)
+        if order_info is not None:
+            order_status = order_info.status
+
+        while (
+            order_status in ["PENDING"] and time.time() - order_status_start_time < 10
+        ):
+            await asyncio.sleep(0.05)
+            order_info = await self.get_order_info(client_order_id=client_order_id)
+            if order_info is not None:
+                order_status = order_info.status
+
+        if order_status == "PENDING":
+            raise Exception("Order not processed after 10 seconds")
+        else:
+            return order_info
 
     async def get_order_price(self, direction: str) -> Decimal:
         """Get the price of an order with GRVT using official SDK."""
