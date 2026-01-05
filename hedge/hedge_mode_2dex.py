@@ -355,15 +355,8 @@ class HedgeBot2DEX:
 
             else:
                 # Strategy A: Maker (POST_ONLY Order) - Wait for fill
-                # Determine maker price (post-only) - Original logic with 1 tick advantage
-                # BUY: Place inside spread (ask - tick) for better price
-                # SELL: Place inside spread (bid + tick) for better price
-                if direction == 'buy':
-                    makerPrice = bestAsk - self.primaryTickSize  # Buy inside spread (lower than ask)
-                else:
-                    makerPrice = bestBid + self.primaryTickSize  # Sell inside spread (higher than bid)
-
-                self.logger.info(f"[ORDER] Placing {direction.upper()} MAKER (post-only) on PRIMARY @ {makerPrice}")
+                # NOTE: Actual price is determined by API (aggressive maker: ask-tick for BUY, bid+tick for SELL)
+                self.logger.info(f"[ORDER] Placing {direction.upper()} MAKER (post-only) on PRIMARY")
                 primaryResult = await self.primaryClient.place_open_order(
                     self.primaryContractId,
                     self.orderQuantity,
@@ -374,9 +367,10 @@ class HedgeBot2DEX:
                     self.logger.warning(f"[WARN] PRIMARY maker order failed: {primaryResult.error_message}")
                     return False
 
-                # Store current order ID for filtering
+                # Store order info (price is determined by API: ask-tick for BUY, bid+tick for SELL)
                 self.currentOrderId = primaryResult.order_id
-                self.logger.info(f"[OK] PRIMARY maker order placed: ID={primaryResult.order_id}")
+                makerPrice = primaryResult.price  # Get actual price from API
+                self.logger.info(f"[OK] PRIMARY maker order placed: ID={primaryResult.order_id} @ {makerPrice}")
                 self.logTradeToCsv(
                     self.primaryExchangeName, 'PRIMARY_MAKER', direction,
                     str(makerPrice), str(self.orderQuantity), 'placed'
@@ -600,15 +594,8 @@ class HedgeBot2DEX:
 
             else:
                 # Strategy A: Maker (POST_ONLY Order) - Wait for fill
-                # Determine close price (opposite direction from open) - Original logic with 1 tick advantage
-                # BUY: Place inside spread (ask - tick) for better price
-                # SELL: Place inside spread (bid + tick) for better price
-                if oppositeDirection == 'buy':
-                    closePrice = bestAsk - self.primaryTickSize  # Buy to close short (inside spread)
-                else:
-                    closePrice = bestBid + self.primaryTickSize  # Sell to close long (inside spread)
-
-                self.logger.info(f"[ORDER] Placing {oppositeDirection.upper()} CLOSE MAKER (post-only) on PRIMARY @ {closePrice} (size={closeSize})")
+                # NOTE: Actual price is determined by API (aggressive maker: ask-tick for BUY, bid+tick for SELL)
+                self.logger.info(f"[ORDER] Placing {oppositeDirection.upper()} CLOSE MAKER (post-only) on PRIMARY (size={closeSize})")
 
                 # Use place_open_order for now (place_close_order may not be available on all exchanges)
                 primaryResult = await self.primaryClient.place_open_order(
@@ -621,9 +608,10 @@ class HedgeBot2DEX:
                     self.logger.warning(f"[WARN] PRIMARY close maker order failed: {primaryResult.error_message}")
                     return False
 
-                # Store current order ID for filtering
+                # Store order info (price is determined by API: ask-tick for BUY, bid+tick for SELL)
                 self.currentOrderId = primaryResult.order_id
-                self.logger.info(f"[OK] PRIMARY close maker order placed: ID={primaryResult.order_id}")
+                closePrice = primaryResult.price  # Get actual price from API
+                self.logger.info(f"[OK] PRIMARY close maker order placed: ID={primaryResult.order_id} @ {closePrice}")
                 self.logTradeToCsv(
                     self.primaryExchangeName, 'PRIMARY_MAKER', oppositeDirection,
                     str(closePrice), str(closeSize), 'placed_close'
@@ -806,14 +794,9 @@ class HedgeBot2DEX:
             bestBid, bestAsk = bboPrices
             self.logger.info(f"[BBO] PRIMARY: Bid={bestBid}, Ask={bestAsk}")
 
-            # Determine maker price (post-only)
-            if direction == 'buy':
-                makerPrice = bestBid  # Buy at bid (maker)
-            else:
-                makerPrice = bestAsk  # Sell at ask (maker)
-
             # Step 2: Place POST_ONLY maker order on PRIMARY
-            self.logger.info(f"[ORDER] Placing {direction.upper()} maker on PRIMARY @ {makerPrice}")
+            # NOTE: Actual price is determined by API (aggressive maker: ask-tick for BUY, bid+tick for SELL)
+            self.logger.info(f"[ORDER] Placing {direction.upper()} maker on PRIMARY")
             primaryResult = await self.primaryClient.place_open_order(
                 self.primaryContractId,
                 self.orderQuantity,
@@ -824,11 +807,12 @@ class HedgeBot2DEX:
                 self.logger.warning(f"[WARN] PRIMARY order failed: {primaryResult.error_message}")
                 return False
 
-            # DIAGNOSTIC Step 0.2: Store current order ID for filtering
+            # DIAGNOSTIC Step 0.2: Store order info (price is determined by API)
             self.currentOrderId = primaryResult.order_id
-            print(f"[DEBUG] Stored currentOrderId: {self.currentOrderId}")
+            makerPrice = primaryResult.price  # Get actual price from API
+            print(f"[DEBUG] Stored currentOrderId: {self.currentOrderId}, price: {makerPrice}")
 
-            self.logger.info(f"[OK] PRIMARY order placed: ID={primaryResult.order_id}")
+            self.logger.info(f"[OK] PRIMARY order placed: ID={primaryResult.order_id} @ {makerPrice}")
             self.logTradeToCsv(
                 self.primaryExchangeName, 'PRIMARY', direction,
                 str(makerPrice), str(self.orderQuantity), 'placed'
