@@ -209,9 +209,27 @@ class DNHedgeBot:
             f"{'-' * 55}"
         )
 
+    async def cleanup_connections(self):
+        if self.hedge_client:
+            try:
+                await self.hedge_client.disconnect()
+            except Exception:
+                pass
+        if self.primary_client:
+            try:
+                await self.primary_client.disconnect()
+            except Exception:
+                pass
+
     def shutdown(self, signum=None, frame=None):
         self.stop_flag = True
         self.logger.info("\n[SHUTDOWN] Stopping DN Hedge Bot...")
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.cleanup_connections())
+        except RuntimeError:
+            pass
 
         for handler in self.logger.handlers[:]:
             try:
@@ -906,6 +924,7 @@ class DNHedgeBot:
             self.logger.info("\nReceived interrupt signal...")
         finally:
             self.logger.info("Cleaning up...")
+            await self.cleanup_connections()
             self.shutdown()
 
 
