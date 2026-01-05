@@ -18,16 +18,26 @@ def patch_paradex_http_client():
     try:
         from paradex_py.api.http_client import HttpClient
 
-        def patched_request(self, url, http_method, params=None, payload=None, headers=None):
+        def patched_request(
+            self,
+            url,
+            http_method,
+            params=None,
+            payload=None,
+            headers=None,
+            timeout=None,
+        ):
             res = self.client.request(
                 method=http_method.value,
                 url=url,
                 params=params,
                 json=payload,
                 headers=headers,
+                timeout=timeout,
             )
             if res.status_code >= 300:
                 from paradex_py.api.models import ApiErrorSchema
+
                 error = ApiErrorSchema().loads(res.text)
                 raise Exception(error)
             try:
@@ -65,10 +75,10 @@ class ParadexClient(BaseExchangeClient):
         self.config = config
 
         # Paradex credentials from environment - L1 address + L2 private key
-        self.l1_address = os.getenv('PARADEX_L1_ADDRESS')
-        self.l2_private_key_hex = os.getenv('PARADEX_L2_PRIVATE_KEY')
-        self.l2_address = os.getenv('PARADEX_L2_ADDRESS')
-        self.environment = os.getenv('PARADEX_ENVIRONMENT', 'prod')
+        self.l1_address = os.getenv("PARADEX_L1_ADDRESS")
+        self.l2_private_key_hex = os.getenv("PARADEX_L2_PRIVATE_KEY")
+        self.l2_address = os.getenv("PARADEX_L2_ADDRESS")
+        self.environment = os.getenv("PARADEX_ENVIRONMENT", "prod")
 
         # Validate that required credentials are provided
         if not self.l1_address:
@@ -86,26 +96,29 @@ class ParadexClient(BaseExchangeClient):
         # Convert L2 private key from hex to int
         try:
             from starknet_py.common import int_from_hex
+
             self.l2_private_key = int_from_hex(self.l2_private_key_hex)
         except Exception as e:
             raise ValueError(f"Invalid L2 private key format: {e}")
 
         # Convert environment string to proper enum
         env_map = {
-            'prod': PROD,
-            'testnet': TESTNET,
-            'nightly': TESTNET  # Use testnet for nightly
+            "prod": PROD,
+            "testnet": TESTNET,
+            "nightly": TESTNET,  # Use testnet for nightly
         }
         self.env = env_map.get(self.environment.lower(), TESTNET)
 
         # Initialize logger
-        self.logger = TradingLogger(exchange="paradex", ticker=self.config.ticker, log_to_console=False)
+        self.logger = TradingLogger(
+            exchange="paradex", ticker=self.config.ticker, log_to_console=False
+        )
 
         # Initialize Paradex client with L2 credentials only
         self._initialize_paradex_client()
 
         self._order_update_handler = None
-        self.order_size_increment = ''
+        self.order_size_increment = ""
 
     def _initialize_paradex_client(self) -> None:
         """Initialize the Paradex client with L2 credentials only."""
@@ -116,13 +129,12 @@ class ParadexClient(BaseExchangeClient):
             # Initialize Paradex client without credentials first
             self.paradex = Paradex(
                 env=self.env,
-                logger=None  # Disabled native logging
+                logger=None,  # Disabled native logging
             )
 
             # Initialize account with L2 private key
             self.paradex.init_account(
-                l1_address=self.l1_address,
-                l2_private_key=self.l2_private_key
+                l1_address=self.l1_address, l2_private_key=self.l2_private_key
             )
 
             # Log the L2 address being used
@@ -155,7 +167,7 @@ class ParadexClient(BaseExchangeClient):
     async def disconnect(self) -> None:
         """Disconnect from Paradex."""
         try:
-            if hasattr(self, 'paradex') and self.paradex:
+            if hasattr(self, "paradex") and self.paradex:
                 await self.paradex.ws_client._close_connection()
                 self._ws_connected = False
         except Exception as e:
@@ -198,44 +210,53 @@ class ParadexClient(BaseExchangeClient):
 
                     # Map Paradex status to our status
                     status_map = {
-                        'NEW': 'OPEN',
-                        'OPEN': 'OPEN',
-                        'CLOSED': 'CANCELED' if data.get("cancel_reason") else 'FILLED'
+                        "NEW": "OPEN",
+                        "OPEN": "OPEN",
+                        "CLOSED": "CANCELED" if data.get("cancel_reason") else "FILLED",
                     }
                     mapped_status = status_map.get(status, status)
 
                     # Handle partially filled orders
-                    if status == 'OPEN' and Decimal(filled_size) > 0:
+                    if status == "OPEN" and Decimal(filled_size) > 0:
                         mapped_status = "PARTIALLY_FILLED"
 
-                    if mapped_status in ['OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED']:
+                    if mapped_status in [
+                        "OPEN",
+                        "PARTIALLY_FILLED",
+                        "FILLED",
+                        "CANCELED",
+                    ]:
                         if self._order_update_handler:
-                            self._order_update_handler({
-                                'order_id': order_id,
-                                'side': side,
-                                'order_type': order_type,
-                                'status': mapped_status,
-                                'size': size,
-                                'price': price,
-                                'contract_id': contract_id,
-                                'filled_size': filled_size
-                            })
+                            self._order_update_handler(
+                                {
+                                    "order_id": order_id,
+                                    "side": side,
+                                    "order_type": order_type,
+                                    "status": mapped_status,
+                                    "size": size,
+                                    "price": price,
+                                    "contract_id": contract_id,
+                                    "filled_size": filled_size,
+                                }
+                            )
 
         # Store the handler for later use
         self._ws_order_update_handler = order_update_handler
 
     async def _setup_websocket_subscription(self) -> None:
         """Setup WebSocket subscription for order updates."""
-        if not hasattr(self, '_ws_order_update_handler'):
+        if not hasattr(self, "_ws_order_update_handler"):
             return
 
         # Ensure WebSocket is connected
-        if not hasattr(self, '_ws_connected') or not self._ws_connected:
+        if not hasattr(self, "_ws_connected") or not self._ws_connected:
             is_connected = False
             while not is_connected:
                 is_connected = await self.paradex.ws_client.connect()
                 if not is_connected:
-                    self.logger.log("WebSocket connection failed, retrying in 1 second...", "WARN")
+                    self.logger.log(
+                        "WebSocket connection failed, retrying in 1 second...", "WARN"
+                    )
                     await asyncio.sleep(1)
             self._ws_connected = True
             self.logger.log("WebSocket connected for order monitoring", "INFO")
@@ -248,7 +269,7 @@ class ParadexClient(BaseExchangeClient):
             await self.paradex.ws_client.subscribe(
                 ParadexWebsocketChannel.ORDERS,
                 callback=self._ws_order_update_handler,
-                params={"market": contract_id}
+                params={"market": contract_id},
             )
             self.logger.log(f"Subscribed to order updates for {contract_id}", "INFO")
         except Exception as e:
@@ -258,17 +279,19 @@ class ParadexClient(BaseExchangeClient):
         stop=stop_after_attempt(5),
         wait=wait_fixed(3),
         retry=retry_if_exception_type(Exception),
-        reraise=True
+        reraise=True,
     )
     async def fetch_bbo_prices(self, contract_id: str) -> Dict[str, Any]:
         """Get orderbook using official SDK."""
-        orderbook_data = self.paradex.api_client.fetch_orderbook(contract_id, {"depth": 1})
+        orderbook_data = self.paradex.api_client.fetch_orderbook(
+            contract_id, {"depth": 1}
+        )
         if not orderbook_data:
             self.logger.log("Failed to get orderbook", "ERROR")
             raise ValueError("Failed to get orderbook")
 
-        bids = orderbook_data.get('bids', [])
-        asks = orderbook_data.get('asks', [])
+        bids = orderbook_data.get("bids", [])
+        asks = orderbook_data.get("asks", [])
         if not bids or not asks:
             self.logger.log("Failed to get bid/ask data", "ERROR")
             raise ValueError("Failed to get bid/ask data")
@@ -291,11 +314,11 @@ class ParadexClient(BaseExchangeClient):
         # Determine order side and price
         from paradex_py.common.order import OrderSide
 
-        if direction == 'buy':
+        if direction == "buy":
             # For buy orders, place slightly below best ask to ensure execution
             order_price = best_ask - self.config.tick_size
             order_side = OrderSide.Buy
-        elif direction == 'sell':
+        elif direction == "sell":
             # For sell orders, place slightly above best bid to ensure execution
             order_price = best_bid + self.config.tick_size
             order_side = OrderSide.Sell
@@ -305,12 +328,11 @@ class ParadexClient(BaseExchangeClient):
         order_price = self.round_to_tick(order_price)
         return order_price
 
-
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_fixed(3),
         retry=retry_if_exception_type(Exception),
-        reraise=True
+        reraise=True,
     )
     def _submit_order_with_retry(self, order) -> OrderResult:
         """Submit an order with Paradex using official SDK."""
@@ -318,13 +340,14 @@ class ParadexClient(BaseExchangeClient):
         order_result = self.paradex.api_client.submit_order(order)
 
         # Extract order ID from response
-        order_id = order_result.get('id')
+        order_id = order_result.get("id")
         if not order_id:
-            return OrderResult(success=False, error_message='No order ID in response')
+            return OrderResult(success=False, error_message="No order ID in response")
         return order_result
 
-    async def place_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                    side: str) -> OrderResult:
+    async def place_post_only_order(
+        self, contract_id: str, quantity: Decimal, price: Decimal, side: str
+    ) -> OrderResult:
         """Place a post only order with Paradex using official SDK."""
         from paradex_py.common.order import Order, OrderType, OrderSide, OrderStatus
 
@@ -335,33 +358,38 @@ class ParadexClient(BaseExchangeClient):
             order_side=side,
             size=quantity.quantize(self.order_size_increment, rounding=ROUND_HALF_UP),
             limit_price=price,
-            instruction="POST_ONLY"
+            instruction="POST_ONLY",
         )
 
         order_result = self._submit_order_with_retry(order)
 
-        order_id = order_result.get('id')
-        order_status = order_result.get('status')
+        order_id = order_result.get("id")
+        order_status = order_result.get("status")
         order_status_start_time = time.time()
         order_info = await self.get_order_info(order_id)
         if order_info is not None:
             order_status = order_info.status
-        while order_status in ['NEW'] and time.time() - order_status_start_time < 10:
+        while order_status in ["NEW"] and time.time() - order_status_start_time < 10:
             # Check order status after a short delay
             await asyncio.sleep(0.01)
             order_info = await self.get_order_info(order_id)
             if order_info is not None:
                 order_status = order_info.status
 
-        if order_status == 'NEW':
-            raise Exception('Paradex Server Error: Order not processed after 10 seconds')
+        if order_status == "NEW":
+            raise Exception(
+                "Paradex Server Error: Order not processed after 10 seconds"
+            )
         else:
             return order_info
 
-    async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+    async def place_open_order(
+        self, contract_id: str, quantity: Decimal, direction: str
+    ) -> OrderResult:
         """Place an open order with Paradex using official SDK."""
         attempt = 0
         from paradex_py.common.order import OrderSide
+
         while True:
             attempt += 1
             if attempt % 5 == 0:
@@ -372,34 +400,43 @@ class ParadexClient(BaseExchangeClient):
                     if order.side == self.config.direction:
                         active_open_orders += 1
                 if active_open_orders > 1:
-                    self.logger.log(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}", "ERROR")
-                    raise Exception(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}")
+                    self.logger.log(
+                        f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}",
+                        "ERROR",
+                    )
+                    raise Exception(
+                        f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}"
+                    )
 
-            if direction == 'buy':
+            if direction == "buy":
                 order_side = OrderSide.Buy
-            elif direction == 'sell':
+            elif direction == "sell":
                 order_side = OrderSide.Sell
             else:
                 raise Exception(f"[OPEN] Invalid direction: {direction}")
 
             order_price = await self.get_order_price(direction)
-            order_result = await self.place_post_only_order(contract_id, quantity, order_price, order_side)
+            order_result = await self.place_post_only_order(
+                contract_id, quantity, order_price, order_side
+            )
             order_status = order_result.status
             order_id = order_result.order_id
 
-            if order_status == 'CLOSED':
+            if order_status == "CLOSED":
                 remaining_size = order_result.remaining_size
                 cancel_reason = order_result.cancel_reason
                 if remaining_size == 0:
                     break
-                elif cancel_reason == 'POST_ONLY_WOULD_CROSS':
+                elif cancel_reason == "POST_ONLY_WOULD_CROSS":
                     continue
                 else:
-                    raise Exception(f"[OPEN] [{order_id}] Error placing order: {cancel_reason}")
+                    raise Exception(
+                        f"[OPEN] [{order_id}] Error placing order: {cancel_reason}"
+                    )
             else:
                 break
 
-        if order_status in ['OPEN']:
+        if order_status in ["OPEN"]:
             # Order successfully placed
             return OrderResult(
                 success=True,
@@ -407,19 +444,21 @@ class ParadexClient(BaseExchangeClient):
                 side=direction,
                 size=quantity,
                 price=order_price,
-                status=order_status
+                status=order_status,
             )
-        elif order_status == 'CLOSED' and remaining_size == 0:
+        elif order_status == "CLOSED" and remaining_size == 0:
             return OrderResult(
                 success=True,
                 order_id=order_id,
                 side=direction,
                 size=quantity,
                 price=order_price,
-                status=order_status
+                status=order_status,
             )
         else:
-            raise Exception(f"[OPEN] [{order_id}] Unexpected order status: {order_status}")
+            raise Exception(
+                f"[OPEN] [{order_id}] Unexpected order status: {order_status}"
+            )
 
     async def _get_active_close_orders(self, contract_id: str) -> int:
         """Get active close orders for a contract using official SDK."""
@@ -430,7 +469,9 @@ class ParadexClient(BaseExchangeClient):
                 active_close_orders += 1
         return active_close_orders
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
+    async def place_close_order(
+        self, contract_id: str, quantity: Decimal, price: Decimal, side: str
+    ) -> OrderResult:
         """Place a close order with Paradex using official SDK."""
         # Get current market prices
         attempt = 0
@@ -442,8 +483,13 @@ class ParadexClient(BaseExchangeClient):
                 current_close_orders = await self._get_active_close_orders(contract_id)
 
                 if current_close_orders - active_close_orders > 1:
-                    self.logger.log(f"[CLOSE] ERROR: Active close orders abnormal: {active_close_orders}, {current_close_orders}", "ERROR")
-                    raise Exception(f"[CLOSE] ERROR: Active close orders abnormal: {active_close_orders}, {current_close_orders}")
+                    self.logger.log(
+                        f"[CLOSE] ERROR: Active close orders abnormal: {active_close_orders}, {current_close_orders}",
+                        "ERROR",
+                    )
+                    raise Exception(
+                        f"[CLOSE] ERROR: Active close orders abnormal: {active_close_orders}, {current_close_orders}"
+                    )
                 else:
                     active_close_orders = current_close_orders
             # Get current market prices
@@ -451,16 +497,17 @@ class ParadexClient(BaseExchangeClient):
 
             # Convert side string to OrderSide enum
             from paradex_py.common.order import OrderSide
-            order_side = OrderSide.Buy if side.lower() == 'buy' else OrderSide.Sell
+
+            order_side = OrderSide.Buy if side.lower() == "buy" else OrderSide.Sell
 
             # Adjust order price based on market conditions and side
-            if side.lower() == 'sell':
+            if side.lower() == "sell":
                 # For sell orders, ensure price is above best bid to be a maker order
                 if price <= best_bid:
                     adjusted_price = best_bid + self.config.tick_size
                 else:
                     adjusted_price = price
-            elif side.lower() == 'buy':
+            elif side.lower() == "buy":
                 # For buy orders, ensure price is below best ask to be a maker order
                 if price >= best_ask:
                     adjusted_price = best_ask - self.config.tick_size
@@ -468,19 +515,23 @@ class ParadexClient(BaseExchangeClient):
                     adjusted_price = price
 
             adjusted_price = self.round_to_tick(adjusted_price)
-            order_result = await self.place_post_only_order(contract_id, quantity, adjusted_price, order_side)
+            order_result = await self.place_post_only_order(
+                contract_id, quantity, adjusted_price, order_side
+            )
             order_status = order_result.status
             order_id = order_result.order_id
 
-            if order_status == 'CLOSED':
+            if order_status == "CLOSED":
                 remaining_size = order_result.remaining_size
                 cancel_reason = order_result.cancel_reason
                 if remaining_size == 0:
                     break
-                elif cancel_reason == 'POST_ONLY_WOULD_CROSS':
+                elif cancel_reason == "POST_ONLY_WOULD_CROSS":
                     continue
                 else:
-                    raise Exception(f"[CLOSE] [{order_id}] Error placing order: {cancel_reason}")
+                    raise Exception(
+                        f"[CLOSE] [{order_id}] Error placing order: {cancel_reason}"
+                    )
             else:
                 break
 
@@ -490,7 +541,7 @@ class ParadexClient(BaseExchangeClient):
             side=side,
             size=quantity,
             price=adjusted_price,
-            status=order_status
+            status=order_status,
         )
 
     async def cancel_order(self, order_id: str) -> OrderResult:
@@ -508,17 +559,19 @@ class ParadexClient(BaseExchangeClient):
         try:
             # Get order by ID using official SDK
             order_data = self.paradex.api_client.fetch_order(order_id)
-            size = Decimal(order_data.get('size', 0)).quantize(self.order_size_increment, rounding=ROUND_HALF_UP)
-            remaining_size = Decimal(order_data.get('remaining_size', 0))
+            size = Decimal(order_data.get("size", 0)).quantize(
+                self.order_size_increment, rounding=ROUND_HALF_UP
+            )
+            remaining_size = Decimal(order_data.get("remaining_size", 0))
             return OrderInfo(
-                order_id=order_data.get('id', ''),
-                side=order_data.get('side', '').lower(),
+                order_id=order_data.get("id", ""),
+                side=order_data.get("side", "").lower(),
                 size=size,
-                price=Decimal(order_data.get('price', 0)),
-                status=order_data.get('status', ''),
+                price=Decimal(order_data.get("price", 0)),
+                status=order_data.get("status", ""),
                 filled_size=size - remaining_size,
                 remaining_size=remaining_size,
-                cancel_reason=order_data.get('cancel_reason', '')
+                cancel_reason=order_data.get("cancel_reason", ""),
             )
 
         except Exception as e:
@@ -529,16 +582,18 @@ class ParadexClient(BaseExchangeClient):
         stop=stop_after_attempt(5),
         wait=wait_fixed(3),
         retry=retry_if_exception_type(Exception),
-        reraise=True
+        reraise=True,
     )
     async def _fetch_orders_with_retry(self, contract_id: str) -> List[Dict[str, Any]]:
         """Get orders using official SDK."""
-        orders_response = self.paradex.api_client.fetch_orders({"market": contract_id, "status": "OPEN"})
-        if not orders_response or 'results' not in orders_response:
+        orders_response = self.paradex.api_client.fetch_orders(
+            {"market": contract_id, "status": "OPEN"}
+        )
+        if not orders_response or "results" not in orders_response:
             self.logger.log("Failed to get orders", "ERROR")
             raise ValueError("Failed to get orders")
 
-        return orders_response['results']
+        return orders_response["results"]
 
     async def get_active_orders(self, contract_id: str) -> List[OrderInfo]:
         """Get active orders for a contract using official SDK."""
@@ -547,15 +602,20 @@ class ParadexClient(BaseExchangeClient):
         # Filter orders for the specific market
         contract_orders = []
         for order in order_list:
-            contract_orders.append(OrderInfo(
-                order_id=order.get('id', ''),
-                side=order.get('side', '').lower(),
-                size=Decimal(order.get('remaining_size', 0)),  # FIXME: This is wrong. Should be size
-                price=Decimal(order.get('price', 0)),
-                status=order.get('status', ''),
-                filled_size=Decimal(order.get('size', 0)) - Decimal(order.get('remaining_size', 0)),
-                remaining_size=Decimal(order.get('remaining_size', 0))
-            ))
+            contract_orders.append(
+                OrderInfo(
+                    order_id=order.get("id", ""),
+                    side=order.get("side", "").lower(),
+                    size=Decimal(
+                        order.get("remaining_size", 0)
+                    ),  # FIXME: This is wrong. Should be size
+                    price=Decimal(order.get("price", 0)),
+                    status=order.get("status", ""),
+                    filled_size=Decimal(order.get("size", 0))
+                    - Decimal(order.get("remaining_size", 0)),
+                    remaining_size=Decimal(order.get("remaining_size", 0)),
+                )
+            )
 
         return contract_orders
 
@@ -563,16 +623,16 @@ class ParadexClient(BaseExchangeClient):
         stop=stop_after_attempt(5),
         wait=wait_fixed(3),
         retry=retry_if_exception_type(Exception),
-        reraise=True
+        reraise=True,
     )
     async def _fetch_positions_with_retry(self) -> List[Dict[str, Any]]:
         """Get positions using official SDK."""
         positions_response = self.paradex.api_client.fetch_positions()
-        if not positions_response or 'results' not in positions_response:
+        if not positions_response or "results" not in positions_response:
             self.logger.log("Failed to get positions", "ERROR")
             raise ValueError("Failed to get positions")
 
-        return positions_response['results']
+        return positions_response["results"]
 
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
@@ -581,13 +641,18 @@ class ParadexClient(BaseExchangeClient):
 
         # Find position for current market
         for position in positions:
-            if isinstance(position, dict) and position.get('market') == self.config.contract_id and position.get('status') == 'OPEN':
-                if position.get('side') == 'LONG' and self.config.direction == 'sell':
-                    raise ValueError("Long position found for sell direction")
-                elif position.get('side') == 'SHORT' and self.config.direction == 'buy':
-                    raise ValueError("Short position found for buy direction")
-
-                return abs(Decimal(position.get('size', 0)).quantize(self.order_size_increment, rounding=ROUND_HALF_UP))
+            if (
+                isinstance(position, dict)
+                and position.get("market") == self.config.contract_id
+                and position.get("status") == "OPEN"
+            ):
+                size = Decimal(str(position.get("size", "0"))).quantize(
+                    self.order_size_increment, rounding=ROUND_HALF_UP
+                )
+                # Return signed position: positive for LONG, negative for SHORT
+                if position.get("side") == "SHORT":
+                    return -abs(size)
+                return abs(size)
 
         return Decimal(0)
 
@@ -595,20 +660,20 @@ class ParadexClient(BaseExchangeClient):
         stop=stop_after_attempt(5),
         wait=wait_fixed(3),
         retry=retry_if_exception_type(Exception),
-        reraise=True
+        reraise=True,
     )
     async def _fetch_market_with_retry(self, symbol: str) -> Dict[str, Any]:
         """Get market using official SDK."""
         market_response = self.paradex.api_client.fetch_markets({"market": symbol})
-        if not market_response or 'results' not in market_response:
+        if not market_response or "results" not in market_response:
             self.logger.log("Failed to get markets", "ERROR")
             raise ValueError("Failed to get markets")
 
-        if not market_response['results']:
+        if not market_response["results"]:
             self.logger.log("Failed to get markets list", "ERROR")
             raise ValueError("Failed to get markets list")
 
-        market = market_response['results'][0]
+        market = market_response["results"][0]
 
         return market
 
@@ -616,15 +681,17 @@ class ParadexClient(BaseExchangeClient):
         stop=stop_after_attempt(5),
         wait=wait_fixed(3),
         retry=retry_if_exception_type(Exception),
-        reraise=True
+        reraise=True,
     )
     async def _fetch_markets_summary_with_retry(self, symbol: str) -> Dict[str, Any]:
         """Get markets summary using official SDK."""
-        market_summary_response = self.paradex.api_client.fetch_markets_summary({"market": symbol})
-        if not market_summary_response or 'results' not in market_summary_response:
+        market_summary_response = self.paradex.api_client.fetch_markets_summary(
+            {"market": symbol}
+        )
+        if not market_summary_response or "results" not in market_summary_response:
             self.logger.log("Failed to get markets summary", "ERROR")
             raise ValueError("Failed to get markets summary")
-        market_summary = market_summary_response['results'][0]
+        market_summary = market_summary_response["results"][0]
         return market_summary
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
@@ -639,29 +706,34 @@ class ParadexClient(BaseExchangeClient):
         market = await self._fetch_market_with_retry(symbol)
         market_summary = await self._fetch_markets_summary_with_retry(symbol)
 
-        last_price = Decimal(market_summary.get('mark_price', 0))
+        last_price = Decimal(market_summary.get("mark_price", 0))
 
         # Set contract_id to market name (Paradex uses market names as identifiers)
         self.config.contract_id = symbol
         try:
-            min_notional = Decimal(market.get('min_notional'))
+            min_notional = Decimal(market.get("min_notional"))
         except Exception:
             self.logger.log("Failed to get min notional", "ERROR")
             raise ValueError("Failed to get min notional")
 
         try:
-            self.order_size_increment = Decimal(market.get('order_size_increment'))
+            self.order_size_increment = Decimal(market.get("order_size_increment"))
         except Exception:
             self.logger.log("Failed to get min quantity", "ERROR")
             raise ValueError("Failed to get min quantity")
 
         order_notional = last_price * self.config.quantity
         if order_notional < min_notional:
-            self.logger.log(f"Order notional is less than min notional: {order_notional} < {min_notional}", "ERROR")
-            raise ValueError(f"Order notional is less than min notional: {order_notional} < {min_notional}")
+            self.logger.log(
+                f"Order notional is less than min notional: {order_notional} < {min_notional}",
+                "ERROR",
+            )
+            raise ValueError(
+                f"Order notional is less than min notional: {order_notional} < {min_notional}"
+            )
 
         try:
-            self.config.tick_size = Decimal(market.get('price_tick_size'))
+            self.config.tick_size = Decimal(market.get("price_tick_size"))
         except Exception:
             self.logger.log("Failed to get tick size", "ERROR")
             raise ValueError("Failed to get tick size")
