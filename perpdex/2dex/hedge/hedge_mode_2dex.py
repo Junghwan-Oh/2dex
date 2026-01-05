@@ -526,21 +526,35 @@ class HedgeBot2DEX:
                 
                 # 60 second timeout
                 if elapsed > 60:
-                    self.logger.error("[TIMEOUT] HEDGE passive maker order timeout after 60s, cancelling...")
-                    await self.hedgeClient.cancel_order(hedgeOrderId)
-                    self.fillRateStats['timeout'] += 1
-                    self.logTradeToCsv(
-                        self.hedgeExchangeName, 'HEDGE', oppositeDirection,
-                        str(hedgeMakerPrice), str(filledSize), 'timeout'
-                    )
-                    # Position imbalance - PRIMARY filled but HEDGE not
-                    self.positionImbalance += filledSize if direction == 'buy' else -filledSize
-                    return False
+                    self.logger.error("[TIMEOUT] HEDGE passive maker order timeout after 60s, checking status...")
+                    cancel_result = await self.hedgeClient.cancel_order(hedgeOrderId)
+                    # If filled_size >= target, order was already filled (cancel_order returns filled qty on error)
+                    if cancel_result.filled_size and cancel_result.filled_size >= filledSize:
+                        self.logger.info(f"[HEDGE] Order was already FILLED (filled_size={cancel_result.filled_size})")
+                        hedgeFilled = True
+                        hedgeFilledSize = cancel_result.filled_size
+                        break
+                    else:
+                        self.fillRateStats['timeout'] += 1
+                        self.logTradeToCsv(
+                            self.hedgeExchangeName, 'HEDGE', oppositeDirection,
+                            str(hedgeMakerPrice), str(filledSize), 'timeout'
+                        )
+                        # Position imbalance - PRIMARY filled but HEDGE not
+                        self.positionImbalance += filledSize if direction == 'buy' else -filledSize
+                        return False
                 
                 # Check order status (polling)
                 try:
                     orderInfo = await self.hedgeClient.get_order_info(hedgeOrderId)
-                    if orderInfo:
+                    self.logger.debug(f"[HEDGE] get_order_info result: {orderInfo}")
+                    if orderInfo is None:
+                        # Order not in open orders = already filled (get_open_order returns None for filled)
+                        self.logger.info(f"[HEDGE] Order {hedgeOrderId} not in open orders - assuming FILLED")
+                        hedgeFilled = True
+                        hedgeFilledSize = filledSize
+                        break
+                    else:
                         status = orderInfo.status.upper() if orderInfo.status else ''
                         if status in ['FILLED', 'COMPLETE']:
                             hedgeFilled = True
@@ -823,21 +837,35 @@ class HedgeBot2DEX:
                 
                 # 60 second timeout
                 if elapsed > 60:
-                    self.logger.error("[TIMEOUT] HEDGE close passive maker order timeout after 60s, cancelling...")
-                    await self.hedgeClient.cancel_order(hedgeOrderId)
-                    self.fillRateStats['timeout'] += 1
-                    self.logTradeToCsv(
-                        self.hedgeExchangeName, 'HEDGE', direction,
-                        str(hedgeMakerPrice), str(filledSize), 'timeout_close'
-                    )
-                    # Position imbalance - PRIMARY closed but HEDGE not
-                    self.positionImbalance += filledSize if oppositeDirection == 'buy' else -filledSize
-                    return False
+                    self.logger.error("[TIMEOUT] HEDGE close passive maker order timeout after 60s, checking status...")
+                    cancel_result = await self.hedgeClient.cancel_order(hedgeOrderId)
+                    # If filled_size >= target, order was already filled (cancel_order returns filled qty on error)
+                    if cancel_result.filled_size and cancel_result.filled_size >= filledSize:
+                        self.logger.info(f"[HEDGE] Close order was already FILLED (filled_size={cancel_result.filled_size})")
+                        hedgeFilled = True
+                        hedgeFilledSize = cancel_result.filled_size
+                        break
+                    else:
+                        self.fillRateStats['timeout'] += 1
+                        self.logTradeToCsv(
+                            self.hedgeExchangeName, 'HEDGE', direction,
+                            str(hedgeMakerPrice), str(filledSize), 'timeout_close'
+                        )
+                        # Position imbalance - PRIMARY closed but HEDGE not
+                        self.positionImbalance += filledSize if oppositeDirection == 'buy' else -filledSize
+                        return False
                 
                 # Check order status (polling)
                 try:
                     orderInfo = await self.hedgeClient.get_order_info(hedgeOrderId)
-                    if orderInfo:
+                    self.logger.debug(f"[HEDGE] Close get_order_info result: {orderInfo}")
+                    if orderInfo is None:
+                        # Order not in open orders = already filled (get_open_order returns None for filled)
+                        self.logger.info(f"[HEDGE] Close order {hedgeOrderId} not in open orders - assuming FILLED")
+                        hedgeFilled = True
+                        hedgeFilledSize = filledSize
+                        break
+                    else:
                         status = orderInfo.status.upper() if orderInfo.status else ''
                         if status in ['FILLED', 'COMPLETE']:
                             hedgeFilled = True
