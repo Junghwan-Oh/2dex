@@ -432,17 +432,6 @@ class HedgeBot2DEX:
                     currentTime = time.time()
                     elapsed = currentTime - startTime
 
-                    # Timeout check (original template: 180s per order)
-                    if elapsed > 180:
-                        self.logger.error("[TIMEOUT] PRIMARY order timeout after 180s, cancelling...")
-                        await self.primaryClient.cancel_order(primaryResult.order_id)
-                        self.fillRateStats['timeout'] += 1
-                        self.logTradeToCsv(
-                            self.primaryExchangeName, 'PRIMARY_MAKER', direction,
-                            str(makerPrice), str(self.orderQuantity), 'timeout'
-                        )
-                        return False
-
                     if elapsed > 10:  # After 10 seconds, check if order price is stale
                         # Fetch current BBO to check if our order is still competitive
                         bboPrices = await self.get_bbo(self.primaryClient, self.primaryContractId)
@@ -462,19 +451,8 @@ class HedgeBot2DEX:
                             lastCancelTime = currentTime
                             # Cancellation will trigger new order placement in next iteration
 
-                    # Active monitoring with 180s timeout (original template pattern)
+                    # Active monitoring (no timeout - wait indefinitely like original)
                     await asyncio.sleep(0.5)  # Check every 0.5s
-
-                # Handle fill status for maker orders
-                if not orderFilled or filledSize <= 0:
-                    self.logger.info(f"[TIMEOUT] PRIMARY maker order not filled within {self.fillTimeout}s, cancelling...")
-                    await self.primaryClient.cancel_order(primaryResult.order_id)
-                    self.fillRateStats['timeout'] += 1
-                    self.logTradeToCsv(
-                        self.primaryExchangeName, 'PRIMARY_MAKER', direction,
-                        str(makerPrice), str(self.orderQuantity), 'cancelled'
-                    )
-                    return False
 
                 executionPrice = makerPrice
 
@@ -677,17 +655,6 @@ class HedgeBot2DEX:
                     currentTime = time.time()
                     elapsed = currentTime - startTime
 
-                    # Timeout check (original template: 180s per order)
-                    if elapsed > 180:
-                        self.logger.error("[TIMEOUT] PRIMARY close order timeout after 180s, cancelling...")
-                        await self.primaryClient.cancel_order(primaryResult.order_id)
-                        self.fillRateStats['timeout'] += 1
-                        self.logTradeToCsv(
-                            self.primaryExchangeName, 'PRIMARY_MAKER', oppositeDirection,
-                            str(closePrice), str(closeSize), 'timeout_close'
-                        )
-                        return False
-
                     if elapsed > 10:  # After 10 seconds, check if order price is stale
                         # Fetch current BBO to check if our order is still competitive
                         bboPrices = await self.get_bbo(self.primaryClient, self.primaryContractId)
@@ -707,19 +674,8 @@ class HedgeBot2DEX:
                             lastCancelTime = currentTime
                             # Cancellation will trigger new order placement in next iteration
 
-                    # Active monitoring with 180s timeout (original template pattern)
+                    # Active monitoring (no timeout - wait indefinitely like original)
                     await asyncio.sleep(0.5)  # Check every 0.5s
-
-                # Handle fill status for maker orders
-                if not orderFilled or filledSize <= 0:
-                    self.logger.info(f"[TIMEOUT] PRIMARY close maker order not filled within {self.fillTimeout}s, cancelling...")
-                    await self.primaryClient.cancel_order(primaryResult.order_id)
-                    self.fillRateStats['timeout'] += 1
-                    self.logTradeToCsv(
-                        self.primaryExchangeName, 'PRIMARY_MAKER', oppositeDirection,
-                        str(closePrice), str(closeSize), 'cancelled_close'
-                    )
-                    return False
 
                 executionPrice = closePrice
 
