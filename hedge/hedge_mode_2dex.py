@@ -355,11 +355,13 @@ class HedgeBot2DEX:
 
             else:
                 # Strategy A: Maker (POST_ONLY Order) - Wait for fill
-                # Determine maker price (post-only)
+                # Determine maker price (post-only) - Original logic with 1 tick advantage
+                # BUY: Place inside spread (ask - tick) for better price
+                # SELL: Place inside spread (bid + tick) for better price
                 if direction == 'buy':
-                    makerPrice = bestBid  # Buy at bid (maker)
+                    makerPrice = bestAsk - self.primaryTickSize  # Buy inside spread (lower than ask)
                 else:
-                    makerPrice = bestAsk  # Sell at ask (maker)
+                    makerPrice = bestBid + self.primaryTickSize  # Sell inside spread (higher than bid)
 
                 self.logger.info(f"[ORDER] Placing {direction.upper()} MAKER (post-only) on PRIMARY @ {makerPrice}")
                 primaryResult = await self.primaryClient.place_open_order(
@@ -598,11 +600,13 @@ class HedgeBot2DEX:
 
             else:
                 # Strategy A: Maker (POST_ONLY Order) - Wait for fill
-                # Determine close price (opposite direction from open)
+                # Determine close price (opposite direction from open) - Original logic with 1 tick advantage
+                # BUY: Place inside spread (ask - tick) for better price
+                # SELL: Place inside spread (bid + tick) for better price
                 if oppositeDirection == 'buy':
-                    closePrice = bestBid  # Buy to close short
+                    closePrice = bestAsk - self.primaryTickSize  # Buy to close short (inside spread)
                 else:
-                    closePrice = bestAsk  # Sell to close long
+                    closePrice = bestBid + self.primaryTickSize  # Sell to close long (inside spread)
 
                 self.logger.info(f"[ORDER] Placing {oppositeDirection.upper()} CLOSE MAKER (post-only) on PRIMARY @ {closePrice} (size={closeSize})")
 
