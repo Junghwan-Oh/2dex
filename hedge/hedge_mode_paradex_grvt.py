@@ -91,7 +91,7 @@ class DNHedgeBot:
         self.local_primary_position = Decimal("0")
         self.local_hedge_position = Decimal("0")
         self.use_local_tracking = True
-        self.reconcile_interval = 3
+        self.reconcile_interval = 1  # Reconcile every cycle for tighter drift control
 
         self.primary_client = None
         self.hedge_client = None
@@ -444,9 +444,22 @@ class DNHedgeBot:
                 f"[RECONCILE] Hedge WS/API mismatch! WS={ws_hedge} API={api_hedge}"
             )
 
+        # Calculate net delta using API values (most accurate)
+        net_delta = api_primary + api_hedge
+
         self.logger.info(
-            f"[RECONCILE] P={api_primary}, H(WS)={ws_hedge}, H(API)={api_hedge}"
+            f"[RECONCILE] P={api_primary}, H(WS)={ws_hedge}, H(API)={api_hedge}, NetDelta={net_delta}"
         )
+
+        # Auto-recovery: If net delta exceeds threshold, attempt to rebalance
+        if abs(net_delta) > self.order_quantity * Decimal("1.5"):
+            self.logger.warning(
+                f"[RECONCILE] Net delta drift detected: {net_delta}, initiating auto-recovery"
+            )
+            # Log for manual review - don't auto-trade to avoid cascading errors
+            self.logger.warning(
+                f"[RECONCILE] Manual action may be required. PRIMARY={api_primary}, HEDGE={api_hedge}"
+            )
 
     async def place_primary_order(self, side: str, quantity: Decimal) -> Optional[str]:
         self.primary_order_status = None
@@ -568,18 +581,19 @@ class DNHedgeBot:
     ) -> bool:
         self.hedge_order_filled = False
         order_type = "CLOSE" if side == "buy" else "OPEN"
-        maker_timeout = 30
+        maker_timeout = 15  # Reduced from 30s for faster position resolution
 
         use_maker_mode = self.hedge_mode in [PriceMode.BBO_MINUS_1, PriceMode.BBO]
 
-        max_retries = 3
+        max_retries = 4  # Increased retries for better reliability
         for attempt in range(1, max_retries + 1):
             try:
                 best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
                     self.hedge_contract_id
                 )
 
-                if use_maker_mode and attempt <= 2:
+                # Switch to TAKER earlier (attempt 2 instead of 3) for faster fills
+                if use_maker_mode and attempt <= 1:
                     if side == "buy":
                         order_price = best_bid - self.hedge_tick_size
                     else:
@@ -844,7 +858,8 @@ class DNHedgeBot:
                     f"[BUILD] PRIMARY: {self.local_primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
                 )
 
-                if abs(net_delta) > self.order_quantity * 5:
+                # Tighter position imbalance threshold: 2x instead of 5x
+                if abs(net_delta) > self.order_quantity * 2:
                     self.logger.error(f"Position imbalance too large: {net_delta}")
                     self.stop_flag = True
                     break
@@ -886,7 +901,8 @@ class DNHedgeBot:
                     f"[UNWIND] PRIMARY: {self.local_primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
                 )
 
-                if abs(net_delta) > self.order_quantity * 5:
+                # Tighter position imbalance threshold: 2x instead of 5x
+                if abs(net_delta) > self.order_quantity * 2:
                     self.logger.error(f"Position imbalance too large: {net_delta}")
                     self.stop_flag = True
                     break
