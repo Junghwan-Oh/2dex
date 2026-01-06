@@ -419,46 +419,43 @@ class DNHedgeBot:
 
     async def get_positions(self, force_api: bool = False) -> Tuple[Decimal, Decimal]:
         if self.use_local_tracking and not force_api:
+            # Use WebSocket positions for both exchanges (faster, no API calls)
+            primary_ws_pos = self.primary_client.get_ws_position()
             hedge_ws_pos = self.hedge_client.get_ws_position()
-            return self.local_primary_position, hedge_ws_pos
+            return primary_ws_pos, hedge_ws_pos
 
         primary_pos = await self.primary_client.get_account_positions()
         hedge_pos = await self.hedge_client.get_account_positions()
         return primary_pos, hedge_pos
 
     async def reconcile_positions(self):
-        api_primary, api_hedge = await self.get_positions(force_api=True)
+        # Get WebSocket positions first (faster, no API calls)
+        ws_primary = self.primary_client.get_ws_position()
         ws_hedge = self.hedge_client.get_ws_position()
 
-        primary_diff = abs(self.local_primary_position - api_primary)
-        hedge_ws_diff = abs(ws_hedge - api_hedge)
-
-        if primary_diff > self.order_quantity * Decimal("0.5"):
-            self.logger.warning(
-                f"[RECONCILE] Primary mismatch! Local={self.local_primary_position} API={api_primary}"
-            )
-            self.local_primary_position = api_primary
-
-        if hedge_ws_diff > self.order_quantity * Decimal("0.5"):
-            self.logger.warning(
-                f"[RECONCILE] Hedge WS/API mismatch! WS={ws_hedge} API={api_hedge}"
-            )
-
-        # Calculate net delta using API values (most accurate)
-        net_delta = api_primary + api_hedge
+        # Calculate net delta using WS values (real-time)
+        ws_net_delta = ws_primary + ws_hedge
 
         self.logger.info(
-            f"[RECONCILE] P={api_primary}, H(WS)={ws_hedge}, H(API)={api_hedge}, NetDelta={net_delta}"
+            f"[RECONCILE] P(WS)={ws_primary}, H(WS)={ws_hedge}, NetDelta={ws_net_delta}"
         )
 
-        # Auto-recovery: If net delta exceeds threshold, attempt to rebalance
-        if abs(net_delta) > self.order_quantity * Decimal("1.5"):
+        # Sync local tracking with WS positions
+        if abs(
+            self.local_primary_position - ws_primary
+        ) > self.order_quantity * Decimal("0.5"):
             self.logger.warning(
-                f"[RECONCILE] Net delta drift detected: {net_delta}, initiating auto-recovery"
+                f"[RECONCILE] Primary local/WS mismatch! Local={self.local_primary_position} WS={ws_primary}"
             )
-            # Log for manual review - don't auto-trade to avoid cascading errors
+            self.local_primary_position = ws_primary
+
+        # Auto-recovery: If net delta exceeds threshold, stop and warn
+        if abs(ws_net_delta) > self.order_quantity * Decimal("1.5"):
             self.logger.warning(
-                f"[RECONCILE] Manual action may be required. PRIMARY={api_primary}, HEDGE={api_hedge}"
+                f"[RECONCILE] Net delta drift detected: {ws_net_delta}, initiating auto-recovery"
+            )
+            self.logger.warning(
+                f"[RECONCILE] Manual action may be required. PRIMARY(WS)={ws_primary}, HEDGE(WS)={ws_hedge}"
             )
 
     async def place_primary_order(self, side: str, quantity: Decimal) -> Optional[str]:
@@ -843,19 +840,21 @@ class DNHedgeBot:
             await self.reconcile_positions()
 
             while (
-                self.local_primary_position < self.max_position and not self.stop_flag
+                self.primary_client.get_ws_position() < self.max_position
+                and not self.stop_flag
             ):
                 cycle_count += 1
 
                 if cycle_count % self.reconcile_interval == 0:
                     await self.reconcile_positions()
 
-                self.primary_position = self.local_primary_position
+                # Use WebSocket positions for both exchanges (real-time tracking)
+                self.primary_position = self.primary_client.get_ws_position()
                 self.hedge_position = self.hedge_client.get_ws_position()
-                net_delta = self.local_primary_position + self.hedge_position
+                net_delta = self.primary_position + self.hedge_position
 
                 self.logger.info(
-                    f"[BUILD] PRIMARY: {self.local_primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
+                    f"[BUILD] PRIMARY(WS): {self.primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
                 )
 
                 # Tighter position imbalance threshold: 2x instead of 5x
@@ -886,19 +885,21 @@ class DNHedgeBot:
                 await asyncio.sleep(self.sleep_time)
 
             while (
-                self.local_primary_position > -self.max_position and not self.stop_flag
+                self.primary_client.get_ws_position() > -self.max_position
+                and not self.stop_flag
             ):
                 cycle_count += 1
 
                 if cycle_count % self.reconcile_interval == 0:
                     await self.reconcile_positions()
 
-                self.primary_position = self.local_primary_position
+                # Use WebSocket positions for both exchanges (real-time tracking)
+                self.primary_position = self.primary_client.get_ws_position()
                 self.hedge_position = self.hedge_client.get_ws_position()
-                net_delta = self.local_primary_position + self.hedge_position
+                net_delta = self.primary_position + self.hedge_position
 
                 self.logger.info(
-                    f"[UNWIND] PRIMARY: {self.local_primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
+                    f"[UNWIND] PRIMARY(WS): {self.primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
                 )
 
                 # Tighter position imbalance threshold: 2x instead of 5x

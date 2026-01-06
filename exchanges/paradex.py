@@ -119,6 +119,8 @@ class ParadexClient(BaseExchangeClient):
 
         self._order_update_handler = None
         self.order_size_increment = ""
+        self._position_update_handler = None
+        self._ws_position = Decimal("0")
 
     def _initialize_paradex_client(self) -> None:
         """Initialize the Paradex client with L2 credentials only."""
@@ -163,6 +165,9 @@ class ParadexClient(BaseExchangeClient):
 
         # Setup WebSocket subscription for order updates if handler is set
         await self._setup_websocket_subscription()
+
+        # Setup WebSocket subscription for position updates
+        await self._subscribe_to_positions()
 
     async def disconnect(self) -> None:
         """Disconnect from Paradex."""
@@ -274,6 +279,65 @@ class ParadexClient(BaseExchangeClient):
             self.logger.log(f"Subscribed to order updates for {contract_id}", "INFO")
         except Exception as e:
             self.logger.log(f"Failed to subscribe to order updates: {e}", "ERROR")
+
+    async def _subscribe_to_positions(self) -> None:
+        """Subscribe to position updates via WebSocket."""
+        from paradex_py.api.ws_client import ParadexWebsocketChannel
+
+        async def position_callback(ws_channel, message):
+            """Handle position updates from WebSocket."""
+            try:
+                params = message.get("params", {})
+                data = params.get("data", {})
+
+                if ws_channel == ParadexWebsocketChannel.POSITIONS:
+                    market = data.get("market", "")
+
+                    if market == self.config.contract_id:
+                        size = Decimal(str(data.get("size", "0")))
+                        side = data.get("side", "")
+
+                        # Return signed position: positive for LONG, negative for SHORT
+                        if side == "SHORT":
+                            self._ws_position = -abs(size)
+                        else:
+                            self._ws_position = abs(size)
+
+                        self.logger.log(
+                            f"[POSITION WS] Updated position: {self._ws_position}",
+                            "INFO",
+                        )
+
+                        if self._position_update_handler:
+                            self._position_update_handler(
+                                {
+                                    "market": market,
+                                    "size": self._ws_position,
+                                    "side": side,
+                                    "entry_price": data.get("average_entry_price", "0"),
+                                    "unrealized_pnl": data.get("unrealized_pnl", "0"),
+                                }
+                            )
+            except Exception as e:
+                self.logger.log(f"Error handling position update: {e}", "ERROR")
+
+        try:
+            await self.paradex.ws_client.subscribe(
+                ParadexWebsocketChannel.POSITIONS,
+                callback=position_callback,
+                params={},
+            )
+            self.logger.log("Subscribed to position updates", "INFO")
+        except Exception as e:
+            self.logger.log(f"Failed to subscribe to position updates: {e}", "ERROR")
+
+    def setup_position_update_handler(self, handler) -> None:
+        """Setup position update handler for WebSocket."""
+        self._position_update_handler = handler
+
+    def get_ws_position(self) -> Decimal:
+        """Get the current position from WebSocket updates."""
+        return self._ws_position
 
     @retry(
         stop=stop_after_attempt(5),
