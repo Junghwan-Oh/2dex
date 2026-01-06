@@ -640,6 +640,7 @@ class DNHedgeBot:
 
                 # Wait for position update with WebSocket polling
                 start_wait = time.time()
+                reprice_count = 0
                 while time.time() - start_wait < maker_timeout:
                     await asyncio.sleep(0.3)
                     # Use WebSocket position for faster confirmation
@@ -649,15 +650,66 @@ class DNHedgeBot:
                     new_bid, new_ask = await self.hedge_client.fetch_bbo_prices(
                         self.hedge_contract_id
                     )
+                    # Update order_price to current BBO if price moved unfavorable
+                    # Then place new order immediately (don't just break)
                     if side == "buy" and order_price < new_bid - self.hedge_tick_size:
-                        self.logger.info(f"[{order_type}] Price moved, repricing...")
-                        break
+                        order_price = new_ask
+                        order_price = self.hedge_client.round_to_tick(order_price)
+                        self.logger.info(
+                            f"[{order_type}] Price moved, repricing to {order_price}"
+                        )
+                        # Place new order with updated price
+                        if hasattr(self.hedge_client, "place_aggressive_limit_order"):
+                            await self.hedge_client.place_aggressive_limit_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                price=order_price,
+                                side=order_side,
+                            )
+                        else:
+                            await self.hedge_client.place_post_only_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                price=order_price,
+                                side=order_side,
+                            )
+                        reprice_count += 1
+                        if reprice_count >= 3:
+                            self.logger.warning(
+                                f"[{order_type}] Too many reprices, giving up"
+                            )
+                            break
+                        continue
                     elif (
                         side == "sell" and order_price > new_ask + self.hedge_tick_size
                     ):
-                        self.logger.info(f"[{order_type}] Price moved, repricing...")
-                        break
-                else:
+                        order_price = new_bid
+                        order_price = self.hedge_client.round_to_tick(order_price)
+                        self.logger.info(
+                            f"[{order_type}] Price moved, repricing to {order_price}"
+                        )
+                        # Place new order with updated price
+                        if hasattr(self.hedge_client, "place_aggressive_limit_order"):
+                            await self.hedge_client.place_aggressive_limit_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                price=order_price,
+                                side=order_side,
+                            )
+                        else:
+                            await self.hedge_client.place_post_only_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                price=order_price,
+                                side=order_side,
+                            )
+                        reprice_count += 1
+                        if reprice_count >= 3:
+                            self.logger.warning(
+                                f"[{order_type}] Too many reprices, giving up"
+                            )
+                            break
+                        continue
                     await self.hedge_client.place_post_only_order(
                         contract_id=self.hedge_contract_id,
                         quantity=quantity,
@@ -666,6 +718,7 @@ class DNHedgeBot:
                     )
 
                     start_wait = time.time()
+                    reprice_count = 0
                     while time.time() - start_wait < maker_timeout:
                         await asyncio.sleep(0.5)
                         # Use WebSocket position for faster confirmation
@@ -676,22 +729,53 @@ class DNHedgeBot:
                         new_bid, new_ask = await self.hedge_client.fetch_bbo_prices(
                             self.hedge_contract_id
                         )
+                        # Update order_price to current BBO if price moved unfavorable
                         if (
                             side == "buy"
                             and order_price < new_bid - self.hedge_tick_size
                         ):
+                            order_price = new_ask
+                            order_price = self.hedge_client.round_to_tick(order_price)
                             self.logger.info(
-                                f"[{order_type}] Price moved, repricing..."
+                                f"[{order_type}] Price moved up, repricing to {order_price}"
                             )
-                            break
+                            # Place new order with updated price
+                            await self.hedge_client.place_post_only_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                price=order_price,
+                                side=order_side,
+                            )
+                            reprice_count += 1
+                            if reprice_count >= 3:
+                                self.logger.warning(
+                                    f"[{order_type}] Too many reprices, giving up"
+                                )
+                                break
+                            continue
                         elif (
                             side == "sell"
                             and order_price > new_ask + self.hedge_tick_size
                         ):
+                            order_price = new_bid
+                            order_price = self.hedge_client.round_to_tick(order_price)
                             self.logger.info(
-                                f"[{order_type}] Price moved, repricing..."
+                                f"[{order_type}] Price moved down, repricing to {order_price}"
                             )
-                            break
+                            # Place new order with updated price
+                            await self.hedge_client.place_post_only_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                price=order_price,
+                                side=order_side,
+                            )
+                            reprice_count += 1
+                            if reprice_count >= 3:
+                                self.logger.warning(
+                                    f"[{order_type}] Too many reprices, giving up"
+                                )
+                                break
+                            continue
 
                 # Use WebSocket position for faster confirmation
                 pos_after = self.hedge_client.get_ws_position()
@@ -757,6 +841,9 @@ class DNHedgeBot:
                 price = best_ask * Decimal("1.005")
             else:
                 price = best_bid * Decimal("0.995")
+
+            # Round to tick size
+            price = self.primary_client.round_to_tick(price)
 
             from paradex_py.common.order import OrderSide
 
