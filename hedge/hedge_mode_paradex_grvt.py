@@ -568,28 +568,35 @@ class DNHedgeBot:
     ) -> bool:
         self.hedge_order_filled = False
         order_type = "CLOSE" if side == "buy" else "OPEN"
-        max_retries = 3
+        maker_timeout = 30
 
+        use_maker_mode = self.hedge_mode in [PriceMode.BBO_MINUS_1, PriceMode.BBO]
+
+        max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
                 best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
                     self.hedge_contract_id
                 )
 
-                if side == "buy":
-                    order_price = best_ask + (
-                        self.hedge_tick_size * Decimal(str(attempt))
-                    )
+                if use_maker_mode and attempt <= 2:
+                    if side == "buy":
+                        order_price = best_bid - self.hedge_tick_size
+                    else:
+                        order_price = best_ask + self.hedge_tick_size
+                    order_mode = "MAKER"
                 else:
-                    order_price = best_bid - (
-                        self.hedge_tick_size * Decimal(str(attempt))
-                    )
+                    if side == "buy":
+                        order_price = best_ask + (self.hedge_tick_size * Decimal("2"))
+                    else:
+                        order_price = best_bid - (self.hedge_tick_size * Decimal("2"))
+                    order_mode = "TAKER_FALLBACK"
 
                 order_price = self.hedge_client.round_to_tick(order_price)
 
                 self.logger.info(
                     f"[{order_type}] [{self.hedge_exchange.upper()}] [{side.upper()}] "
-                    f"AGGRESSIVE @ {order_price} (BBO: {best_bid}/{best_ask}, attempt {attempt}/{max_retries})"
+                    f"{order_mode} @ {order_price} (BBO: {best_bid}/{best_ask}, attempt {attempt}/{max_retries})"
                 )
 
                 if self.hedge_exchange == "paradex":
@@ -601,13 +608,16 @@ class DNHedgeBot:
 
                 pos_before = await self.hedge_client.get_account_positions()
 
-                if hasattr(self.hedge_client, "place_aggressive_limit_order"):
+                if order_mode == "TAKER_FALLBACK" and hasattr(
+                    self.hedge_client, "place_aggressive_limit_order"
+                ):
                     await self.hedge_client.place_aggressive_limit_order(
                         contract_id=self.hedge_contract_id,
                         quantity=quantity,
                         price=order_price,
                         side=order_side,
                     )
+                    await asyncio.sleep(0.5)
                 else:
                     await self.hedge_client.place_post_only_order(
                         contract_id=self.hedge_contract_id,
@@ -616,7 +626,32 @@ class DNHedgeBot:
                         side=order_side,
                     )
 
-                await asyncio.sleep(0.5)
+                    start_wait = time.time()
+                    while time.time() - start_wait < maker_timeout:
+                        await asyncio.sleep(1)
+                        pos_current = await self.hedge_client.get_account_positions()
+                        if abs(pos_current - pos_before) >= quantity * Decimal("0.99"):
+                            break
+
+                        new_bid, new_ask = await self.hedge_client.fetch_bbo_prices(
+                            self.hedge_contract_id
+                        )
+                        if (
+                            side == "buy"
+                            and order_price < new_bid - self.hedge_tick_size
+                        ):
+                            self.logger.info(
+                                f"[{order_type}] Price moved, repricing..."
+                            )
+                            break
+                        elif (
+                            side == "sell"
+                            and order_price > new_ask + self.hedge_tick_size
+                        ):
+                            self.logger.info(
+                                f"[{order_type}] Price moved, repricing..."
+                            )
+                            break
 
                 pos_after = await self.hedge_client.get_account_positions()
                 position_change = abs(pos_after - pos_before)
