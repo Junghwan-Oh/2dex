@@ -299,7 +299,35 @@ class GrvtClient(BaseExchangeClient):
             amount=quantity
         )
         if not order_result:
-            raise Exception(f"[OPEN] Error placing order")
+            return OrderResult(success=False, error_message="Error placing market order")
+
+        # Extract order info from result
+        order_id = order_result.get('metadata', {}).get('order_id')
+        if not order_id:
+            client_order_id = order_result.get('metadata', {}).get('client_order_id')
+            # Try to get order info
+            try:
+                order_info = await self.get_order_info(client_order_id=client_order_id)
+                if order_info:
+                    return OrderResult(
+                        success=True,
+                        order_id=order_info.order_id,
+                        side=side,
+                        size=quantity,
+                        price=order_info.price,
+                        status=order_info.status
+                    )
+            except Exception:
+                pass
+
+        return OrderResult(
+            success=True,
+            order_id=order_id or 'unknown',
+            side=side,
+            size=quantity,
+            price=Decimal('0'),
+            status='FILLED'
+        )
 
     async def get_order_price(self, direction: str) -> Decimal:
         """Get the price of an order with GRVT using official SDK."""

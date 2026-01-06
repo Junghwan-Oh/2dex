@@ -133,6 +133,14 @@ class HedgeBot2DEX:
         self.currentPosition = Decimal('0')  # Net position (+ for long, - for short)
         self.positionOpen = False  # Whether we have an open position
 
+        # Take Profit order tracking (Phase B)
+        self.tpOrderId = None  # TP order ID on PRIMARY
+        self.tpPrice = Decimal('0')  # TP price
+        self.tpDirection = None  # TP direction ('sell' for BUY entry, 'buy' for SELL entry)
+        self.entryPrice = Decimal('0')  # Entry price for TP calculation
+        self.openDirection = None  # Original open direction for close cycle
+        self.currentOrderId = None  # Track current order ID for WebSocket updates
+
     def _initializeCsvFile(self):
         """Initialize CSV file with headers if it doesn't exist."""
         if not os.path.exists(self.csvFilename):
@@ -586,7 +594,41 @@ class HedgeBot2DEX:
                 str(hedgePrice), str(hedgeFilledSize), 'filled'
             )
 
-            # Step 6: Update position tracking (OPEN position)
+            # Step 6: Place Take Profit order on PRIMARY
+            self.openDirection = direction  # Store for close cycle
+            self.entryPrice = executionPrice
+            self.tpDirection = 'sell' if direction == 'buy' else 'buy'
+            
+            # Calculate TP price: entry +/- 0.05%
+            if direction == 'buy':
+                self.tpPrice = self.entryPrice * Decimal('1.0005')  # 0.05% higher
+            else:
+                self.tpPrice = self.entryPrice * Decimal('0.9995')  # 0.05% lower
+            self.tpPrice = self.primaryClient.round_to_tick(self.tpPrice)
+            
+            self.logger.info(f"[TP] Placing {self.tpDirection.upper()} TP order on PRIMARY @ {self.tpPrice}")
+            try:
+                tpResult = await self.primaryClient.place_post_only_order(
+                    self.primaryContractId,
+                    filledSize,
+                    self.tpPrice,
+                    self.tpDirection
+                )
+                if tpResult and tpResult.order_id:
+                    self.tpOrderId = tpResult.order_id
+                    self.logger.info(f"[TP] TP order placed: ID={self.tpOrderId} @ {self.tpPrice}")
+                    self.logTradeToCsv(
+                        self.primaryExchangeName, 'TP', self.tpDirection,
+                        str(self.tpPrice), str(filledSize), 'placed'
+                    )
+                else:
+                    self.logger.warning(f"[TP] Failed to place TP order: No order ID returned")
+                    self.tpOrderId = None
+            except Exception as e:
+                self.logger.warning(f"[TP] Failed to place TP order: {e}")
+                self.tpOrderId = None
+
+            # Step 7: Update position tracking (OPEN position)
             if direction == 'buy':
                 self.currentPosition += filledSize  # Long position
             else:
@@ -603,7 +645,7 @@ class HedgeBot2DEX:
             return False
 
     async def executeCloseCycle(self, direction: str) -> bool:
-        """Execute close position cycle.
+        """Execute close position cycle - Wait for TP order to fill.
 
         Args:
             direction: Original open direction ('buy' or 'sell') - will close in opposite direction
@@ -616,7 +658,7 @@ class HedgeBot2DEX:
         oppositeDirection = 'sell' if direction == 'buy' else 'buy'
 
         self.logger.info(f"\n{'='*50}")
-        self.logger.info(f"[CLOSE CYCLE {self.orderCounter}] PRIMARY {oppositeDirection.upper()} -> HEDGE {direction.upper()}")
+        self.logger.info(f"[CLOSE CYCLE {self.orderCounter}] Waiting for TP on PRIMARY -> HEDGE {direction.upper()}")
 
         try:
             # Validation: Check if we have a position to close
@@ -624,75 +666,18 @@ class HedgeBot2DEX:
                 self.logger.error(f"[CLOSE] ERROR: No position to close! currentPosition={self.currentPosition}")
                 return False
 
-            # Step 1: Get BBO from PRIMARY
-            self.logger.info(f"[BBO] Fetching from PRIMARY ({self.primaryExchangeName})...")
-            bboPrices = await self.primaryClient.fetch_bbo_prices(self.primaryContractId)
-            if not bboPrices:
-                self.logger.warning("[WARN] Failed to get BBO prices from PRIMARY")
-                return False
-
-            bestBid, bestAsk = bboPrices
-            self.logger.info(f"[BBO] PRIMARY: Bid={bestBid}, Ask={bestAsk}")
-
-            # Step 2-3: Place CLOSE order on PRIMARY (Maker or Taker based on strategy)
             closeSize = abs(self.currentPosition)
             filledSize = Decimal('0')
             orderFilled = False
             executionPrice = None
 
-            if self.useTaker:
-                # Strategy B: Taker (Market Order) - Immediate fill
-                self.logger.info(f"[ORDER] Placing {oppositeDirection.upper()} CLOSE TAKER (market) on PRIMARY (size={closeSize})")
-                primaryResult = await self.primaryClient.place_market_order(
-                    self.primaryContractId,
-                    closeSize,
-                    oppositeDirection
-                )
-
-                if not primaryResult.success:
-                    self.logger.warning(f"[WARN] PRIMARY close taker order failed: {primaryResult.error_message}")
-                    return False
-
-                # Market orders fill immediately
-                orderFilled = True
-                filledSize = closeSize
-                executionPrice = primaryResult.price if primaryResult.price else 'market'
-                self.logger.info(f"[OK] PRIMARY close taker order FILLED immediately @ {executionPrice}")
-                self.logTradeToCsv(
-                    self.primaryExchangeName, 'PRIMARY_TAKER', oppositeDirection,
-                    str(executionPrice), str(filledSize), 'filled_close'
-                )
-
-            else:
-                # Strategy A: Maker (POST_ONLY Order) - Wait for fill
-                # NOTE: Actual price is determined by API (aggressive maker: ask-tick for BUY, bid+tick for SELL)
-                self.logger.info(f"[ORDER] Placing {oppositeDirection.upper()} CLOSE MAKER (post-only) on PRIMARY (size={closeSize})")
-
-                # Use place_open_order for now (place_close_order may not be available on all exchanges)
-                primaryResult = await self.primaryClient.place_open_order(
-                    self.primaryContractId,
-                    closeSize,
-                    oppositeDirection
-                )
-
-                if not primaryResult.success:
-                    self.logger.warning(f"[WARN] PRIMARY close maker order failed: {primaryResult.error_message}")
-                    return False
-
-                # Store order info (price is determined by API: ask-tick for BUY, bid+tick for SELL)
-                self.currentOrderId = primaryResult.order_id
-                closePrice = primaryResult.price  # Get actual price from API
-                self.logger.info(f"[OK] PRIMARY close maker order placed: ID={primaryResult.order_id} @ {closePrice}")
-                self.logTradeToCsv(
-                    self.primaryExchangeName, 'PRIMARY_MAKER', oppositeDirection,
-                    str(closePrice), str(closeSize), 'placed_close'
-                )
-
-                # Active monitoring with cancel-and-replace (restored from original template)
+            # Phase B: Wait for TP order to fill on PRIMARY
+            if self.tpOrderId:
+                self.logger.info(f"[TP] Waiting for TP order {self.tpOrderId} @ {self.tpPrice} to fill...")
+                self.currentOrderId = self.tpOrderId  # Track for WebSocket updates
                 self.orderFilledEvent.clear()
                 self.lastOrderUpdate = None
                 startTime = time.time()
-                lastCancelTime = 0
 
                 while not self.stopFlag:
                     # Check if order filled via WebSocket
@@ -701,96 +686,87 @@ class HedgeBot2DEX:
                         if status in ['FILLED', 'filled', 'Filled']:
                             filledSize = Decimal(self.lastOrderUpdate.get('filled_size', '0'))
                             orderFilled = True
-                            self.logger.info(f"[WebSocket] Close fill detected: {filledSize} {self.ticker}")
-                            break  # Exit loop, order filled
+                            executionPrice = self.tpPrice
+                            self.logger.info(f"[TP] TP order FILLED @ {self.tpPrice}: {filledSize} {self.ticker}")
+                            self.logTradeToCsv(
+                                self.primaryExchangeName, 'TP', self.tpDirection,
+                                str(self.tpPrice), str(filledSize), 'filled'
+                            )
+                            break
                         elif status in ['PARTIALLY_FILLED', 'partially_filled', 'PartiallyFilled']:
                             filledSize = Decimal(self.lastOrderUpdate.get('filled_size', '0'))
-                            if filledSize > 0:
+                            if filledSize >= closeSize:
                                 orderFilled = True
-                                self.logger.info(f"[WebSocket] Partial close fill: {filledSize}/{closeSize}")
+                                executionPrice = self.tpPrice
+                                self.logger.info(f"[TP] TP order partially filled: {filledSize}/{closeSize}")
                                 break
-                        elif status in ['CANCELED', 'CANCELLED', 'cancelled']:
-                            # Order was cancelled, place new close order and continue
-                            self.logger.info(f"[ACTIVE] Close order cancelled, placing new order at current BBO")
-                            bboPrices = await self.get_bbo(self.primaryClient, self.primaryContractId)
-                            bestBid, bestAsk = bboPrices
-                            closePrice = bestBid if oppositeDirection == 'buy' else bestAsk
-
-                            primaryResult = await self.primaryClient.place_open_order(
-                                self.primaryContractId, closeSize, oppositeDirection
-                            )
-                            self.currentOrderId = primaryResult.order_id
-                            startTime = time.time()
-                            lastCancelTime = 0
-                            self.orderFilledEvent.clear()
-                            self.lastOrderUpdate = None
-                            continue
-                        elif status in ['REJECTED', 'rejected']:
-                            self.logger.info(f"[WebSocket] Close order rejected")
-                            return False
-                        elif status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'new', 'open', 'pending']:
-                            # Normal waiting states - continue monitoring
-                            pass  # No action, staleness check will handle if needed
+                        elif status in ['CANCELED', 'CANCELLED', 'cancelled', 'REJECTED', 'rejected']:
+                            self.logger.warning(f"[TP] TP order was {status}")
+                            break
+                        elif status in ['NEW', 'OPEN', 'PENDING', 'new', 'open', 'pending']:
+                            pass  # Normal waiting state
                         else:
-                            # Truly unknown status - log warning and continue waiting
-                            self.logger.warning(f"[WebSocket] Unknown close order status: {status}")
-                            # Continue monitoring (no action taken)
+                            self.logger.debug(f"[TP] Unknown TP order status: {status}")
 
-                    # Active BBO monitoring for cancel-and-replace decision
+                    # Timeout check - 60 seconds (Phase C will make this configurable)
                     currentTime = time.time()
                     elapsed = currentTime - startTime
 
-                    # Timeout check (original template: 180s per order)
-                    if elapsed > 180:
-                        self.logger.error("[TIMEOUT] PRIMARY close order timeout after 180s, cancelling...")
-                        await self.primaryClient.cancel_order(primaryResult.order_id)
-                        self.fillRateStats['timeout'] += 1
-                        self.logTradeToCsv(
-                            self.primaryExchangeName, 'PRIMARY_MAKER', oppositeDirection,
-                            str(closePrice), str(closeSize), 'timeout_close'
-                        )
+                    if elapsed > 60:
+                        self.logger.warning(f"[TP] TP order timeout after 60s, cancelling and executing market close...")
+                        await self.primaryClient.cancel_order(self.tpOrderId)
+                        self.tpOrderId = None
+                        break
+
+                    await asyncio.sleep(0.5)
+
+                # If TP not filled, fall back to market close
+                if not orderFilled:
+                    self.logger.info(f"[FALLBACK] Executing market close on PRIMARY")
+                    primaryResult = await self.primaryClient.place_market_order(
+                        self.primaryContractId,
+                        closeSize,
+                        oppositeDirection
+                    )
+
+                    if not primaryResult.success:
+                        self.logger.error(f"[FAIL] Market close failed: {primaryResult.error_message}")
                         return False
 
-                    if elapsed > 10:  # After 10 seconds, check if order price is stale
-                        # Fetch current BBO to check if our order is still competitive
-                        bboPrices = await self.get_bbo(self.primaryClient, self.primaryContractId)
-                        bestBid, bestAsk = bboPrices
-
-                        shouldCancel = False
-                        if oppositeDirection == 'buy':
-                            if closePrice < bestBid:  # Our buy order is below best bid
-                                shouldCancel = True
-                        else:
-                            if closePrice > bestAsk:  # Our sell order is above best ask
-                                shouldCancel = True
-
-                        if shouldCancel and (currentTime - lastCancelTime > 5):  # Rate limiting: 5s between cancels
-                            self.logger.info(f"[ACTIVE] Cancelling close order due to stale price: {closePrice} vs BBO {bestBid}/{bestAsk}")
-                            await self.primaryClient.cancel_order(primaryResult.order_id)
-                            lastCancelTime = currentTime
-                            # Cancellation will trigger new order placement in next iteration
-
-                    # Active monitoring with 180s timeout (original template pattern)
-                    await asyncio.sleep(0.5)  # Check every 0.5s
-
-                # Handle fill status for maker orders
-                if not orderFilled or filledSize <= 0:
-                    self.logger.info(f"[TIMEOUT] PRIMARY close maker order not filled within {self.fillTimeout}s, cancelling...")
-                    await self.primaryClient.cancel_order(primaryResult.order_id)
-                    self.fillRateStats['timeout'] += 1
+                    orderFilled = True
+                    filledSize = closeSize
+                    executionPrice = primaryResult.price if primaryResult.price else 'market'
+                    self.logger.info(f"[OK] PRIMARY market close FILLED @ {executionPrice}")
                     self.logTradeToCsv(
-                        self.primaryExchangeName, 'PRIMARY_MAKER', oppositeDirection,
-                        str(closePrice), str(closeSize), 'cancelled_close'
+                        self.primaryExchangeName, 'PRIMARY_MARKET', oppositeDirection,
+                        str(executionPrice), str(filledSize), 'filled_close'
                     )
+            else:
+                # No TP order - shouldn't happen in Phase B, but fall back to market close
+                self.logger.warning("[WARN] No TP order found, executing market close")
+                primaryResult = await self.primaryClient.place_market_order(
+                    self.primaryContractId,
+                    closeSize,
+                    oppositeDirection
+                )
+
+                if not primaryResult.success:
+                    self.logger.error(f"[FAIL] Market close failed: {primaryResult.error_message}")
                     return False
 
-                executionPrice = closePrice
-
-                # Log fill (only if not already logged in taker branch above)
+                orderFilled = True
+                filledSize = closeSize
+                executionPrice = primaryResult.price if primaryResult.price else 'market'
+                self.logger.info(f"[OK] PRIMARY market close FILLED @ {executionPrice}")
                 self.logTradeToCsv(
-                    self.primaryExchangeName, 'PRIMARY_MAKER', oppositeDirection,
+                    self.primaryExchangeName, 'PRIMARY_MARKET', oppositeDirection,
                     str(executionPrice), str(filledSize), 'filled_close'
                 )
+
+            # Clear TP state
+            self.tpOrderId = None
+            self.tpPrice = Decimal('0')
+            self.tpDirection = None
 
             # Step 4: Validate fill (common for both strategies)
             if not orderFilled or filledSize <= 0:
