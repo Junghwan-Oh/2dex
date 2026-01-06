@@ -614,7 +614,7 @@ class DNHedgeBot:
                 else:
                     order_side = side
 
-                pos_before = await self.hedge_client.get_account_positions()
+                pos_before = self.hedge_client.get_ws_position()
 
                 if order_mode == "TAKER_FALLBACK" and hasattr(
                     self.hedge_client, "place_aggressive_limit_order"
@@ -637,7 +637,7 @@ class DNHedgeBot:
                     start_wait = time.time()
                     while time.time() - start_wait < maker_timeout:
                         await asyncio.sleep(1)
-                        pos_current = await self.hedge_client.get_account_positions()
+                        pos_current = self.hedge_client.get_ws_position()
                         if abs(pos_current - pos_before) >= quantity * Decimal("0.99"):
                             break
 
@@ -661,7 +661,7 @@ class DNHedgeBot:
                             )
                             break
 
-                pos_after = await self.hedge_client.get_account_positions()
+                pos_after = self.hedge_client.get_ws_position()
                 position_change = abs(pos_after - pos_before)
 
                 if position_change >= quantity * Decimal("0.99"):
