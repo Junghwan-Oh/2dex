@@ -708,6 +708,75 @@ class DNHedgeBot:
         await self.emergency_close_primary(quantity, side)
         return False
 
+
+    async def force_close_all_positions(self):
+        """Force close all positions (like original ext.py STEP 3)."""
+        try:
+            # Check both exchanges
+            for exchange_name, client in [("PRIMARY", self.primary_client), ("HEDGE", self.hedge_client)]:
+                if client is None:
+                    continue
+                
+                # Get current position
+                ws_pos = client.get_ws_position()
+                if ws_pos == 0:
+                    continue
+                
+                self.logger.warning(
+                    f"[FORCE_CLOSE] {exchange_name} has residual position: {ws_pos}, forcing close"
+                )
+                
+                # Determine close side
+                if ws_pos > 0:
+                    close_side = "sell"
+                else:
+                    close_side = "buy"
+                
+                close_qty = abs(ws_pos)
+                
+                # Get BBO and place market order
+                best_bid, best_ask = await client.fetch_bbo_prices(
+                    getattr(client, 'contract_id', None) or getattr(client, 'primary_contract_id', None)
+                )
+                
+                if close_side == "buy":
+                    close_price = best_ask + (client.tick_size * Decimal("2"))
+                else:
+                    close_price = best_bid - (client.tick_size * Decimal("2"))
+                
+                close_price = client.round_to_tick(close_price)
+                
+                self.logger.warning(
+                    f"[FORCE_CLOSE] {exchange_name} {close_side.upper()} {close_qty} @ {close_price}"
+                )
+                
+                # Place aggressive close order
+                if hasattr(client, "place_aggressive_limit_order"):
+                    await client.place_aggressive_limit_order(
+                        contract_id=getattr(client, 'contract_id', None) or getattr(client, 'primary_contract_id', None),
+                        quantity=close_qty,
+                        price=close_price,
+                        side=close_side,
+                    )
+                else:
+                    await client.place_post_only_order(
+                        contract_id=getattr(client, 'contract_id', None) or getattr(client, 'primary_contract_id', None),
+                        quantity=close_qty,
+                        price=close_price,
+                        side=close_side,
+                    )
+                
+                # Wait for fill
+                await asyncio.sleep(2)
+                
+                new_pos = client.get_ws_position()
+                self.logger.warning(
+                    f"[FORCE_CLOSE] {exchange_name} position after close: {new_pos}"
+                )
+        
+        except Exception as e:
+            self.logger.error(f"[FORCE_CLOSE] Error: {e}")
+
     async def emergency_close_primary(self, quantity: Decimal, failed_hedge_side: str):
         close_side = failed_hedge_side
 
