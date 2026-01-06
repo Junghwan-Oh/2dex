@@ -575,7 +575,7 @@ class DNHedgeBot:
     ) -> bool:
         self.hedge_order_filled = False
         order_type = "CLOSE" if side == "buy" else "OPEN"
-        maker_timeout = 15  # Reduced from 30s for faster position resolution
+        maker_timeout = 10  # Reduced from 15s for faster position resolution
 
         use_maker_mode = self.hedge_mode in [PriceMode.BBO_MINUS_1, PriceMode.BBO]
 
@@ -586,25 +586,30 @@ class DNHedgeBot:
                     self.hedge_contract_id
                 )
 
-                # Switch to TAKER earlier (attempt 2 instead of 3) for faster fills
-                if use_maker_mode and attempt <= 1:
+                # Use PRIMARY fill price as reference for HEDGE pricing
+                # HEDGE should match or beat PRIMARY price for no-loss
+                if order_type == "CLOSE":
+                    # CLOSE: Hedge BUY to close SHORT -> buy at PRIMARY price or better
+                    # CLOSE: Hedge SELL to close LONG -> sell at PRIMARY price or better
                     if side == "buy":
-                        order_price = best_bid - self.hedge_tick_size
+                        # Buy at reference (aggressive to ensure fill)
+                        order_price = reference_price
                     else:
-                        order_price = best_ask + self.hedge_tick_size
-                    order_mode = "MAKER"
+                        # Sell at reference (aggressive to ensure fill)
+                        order_price = reference_price
+                    order_mode = "TAKER_AGGRESSIVE"
                 else:
-                    if side == "buy":
-                        order_price = best_ask + (self.hedge_tick_size * Decimal("2"))
-                    else:
-                        order_price = best_bid - (self.hedge_tick_size * Decimal("2"))
-                    order_mode = "TAKER_FALLBACK"
+                    # OPEN: Hedge SELL to match PRIMARY BUY
+                    # Use reference price as limit, let it cross if better
+                    order_price = reference_price
+                    order_mode = "TAKER_AGGRESSIVE"
 
                 order_price = self.hedge_client.round_to_tick(order_price)
 
+                # Log HEDGE order
                 self.logger.info(
                     f"[{order_type}] [{self.hedge_exchange.upper()}] [{side.upper()}] "
-                    f"{order_mode} @ {order_price} (BBO: {best_bid}/{best_ask}, attempt {attempt}/{max_retries})"
+                    f"{order_mode} @ {order_price} (ref: {reference_price}, BBO: {best_bid}/{best_ask})"
                 )
 
                 if self.hedge_exchange == "paradex":
@@ -614,18 +619,44 @@ class DNHedgeBot:
                 else:
                     order_side = side
 
-                pos_before = await self.hedge_client.get_account_positions()
+                # Use WebSocket position for faster confirmation
+                pos_before = self.hedge_client.get_ws_position()
 
-                if order_mode == "TAKER_FALLBACK" and hasattr(
-                    self.hedge_client, "place_aggressive_limit_order"
-                ):
+                # Place HEDGE order using aggressive limit (match PRIMARY price)
+                if hasattr(self.hedge_client, "place_aggressive_limit_order"):
                     await self.hedge_client.place_aggressive_limit_order(
                         contract_id=self.hedge_contract_id,
                         quantity=quantity,
                         price=order_price,
                         side=order_side,
                     )
-                    await asyncio.sleep(0.5)
+                else:
+                    await self.hedge_client.place_post_only_order(
+                        contract_id=self.hedge_contract_id,
+                        quantity=quantity,
+                        price=order_price,
+                        side=order_side,
+                    )
+
+                # Wait for position update with WebSocket polling
+                start_wait = time.time()
+                while time.time() - start_wait < maker_timeout:
+                    await asyncio.sleep(0.3)
+                    # Use WebSocket position for faster confirmation
+                    pos_current = self.hedge_client.get_ws_position()
+                    if abs(pos_current - pos_before) >= quantity * Decimal("0.99"):
+                        break
+                    new_bid, new_ask = await self.hedge_client.fetch_bbo_prices(
+                        self.hedge_contract_id
+                    )
+                    if side == "buy" and order_price < new_bid - self.hedge_tick_size:
+                        self.logger.info(f"[{order_type}] Price moved, repricing...")
+                        break
+                    elif (
+                        side == "sell" and order_price > new_ask + self.hedge_tick_size
+                    ):
+                        self.logger.info(f"[{order_type}] Price moved, repricing...")
+                        break
                 else:
                     await self.hedge_client.place_post_only_order(
                         contract_id=self.hedge_contract_id,
@@ -636,8 +667,9 @@ class DNHedgeBot:
 
                     start_wait = time.time()
                     while time.time() - start_wait < maker_timeout:
-                        await asyncio.sleep(1)
-                        pos_current = await self.hedge_client.get_account_positions()
+                        await asyncio.sleep(0.5)
+                        # Use WebSocket position for faster confirmation
+                        pos_current = self.hedge_client.get_ws_position()
                         if abs(pos_current - pos_before) >= quantity * Decimal("0.99"):
                             break
 
@@ -661,7 +693,8 @@ class DNHedgeBot:
                             )
                             break
 
-                pos_after = await self.hedge_client.get_account_positions()
+                # Use WebSocket position for faster confirmation
+                pos_after = self.hedge_client.get_ws_position()
                 position_change = abs(pos_after - pos_before)
 
                 if position_change >= quantity * Decimal("0.99"):
