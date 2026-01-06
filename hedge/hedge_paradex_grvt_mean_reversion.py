@@ -66,18 +66,15 @@ class DNHedgeBot:
         self.primary_mode = primary_mode
         self.hedge_mode = hedge_mode
         self.min_spread_bps = min_spread_bps
+        self.strategy = "mean_reversion"  # Fixed strategy for this file
 
         self.max_position = (
             order_quantity if max_position == Decimal("0") else max_position
         )
 
         os.makedirs("logs", exist_ok=True)
-        self.log_filename = (
-            f"logs/dn_{self.primary_exchange}_{self.hedge_exchange}_{ticker}_log.txt"
-        )
-        self.csv_filename = (
-            f"logs/dn_{self.primary_exchange}_{self.hedge_exchange}_{ticker}_trades.csv"
-        )
+        self.log_filename = f"logs/dn_mean_reversion_{self.primary_exchange}_{self.hedge_exchange}_{ticker}_log.txt"
+        self.csv_filename = f"logs/dn_mean_reversion_{self.primary_exchange}_{self.hedge_exchange}_{ticker}_trades.csv"
 
         self._initialize_csv_file()
         self._setup_logger()
@@ -799,7 +796,7 @@ class DNHedgeBot:
 
     async def trading_loop(self):
         self.logger.info(f"{'=' * 60}")
-        self.logger.info("DN Hedge Bot Starting")
+        self.logger.info("DN Hedge Bot Starting (MEAN REVERSION STRATEGY)")
         self.logger.info(
             f"PRIMARY: {self.primary_exchange.upper()} ({self.primary_mode.value}) | "
             f"HEDGE: {self.hedge_exchange.upper()} ({self.hedge_mode.value})"
@@ -863,17 +860,20 @@ class DNHedgeBot:
                     self.stop_flag = True
                     break
 
-                if not await self.check_arbitrage_opportunity("buy"):
+                # Mean Reversion: SELL on PRIMARY (sell high) -> BUY on HEDGE (buy low)
+                if not await self.check_arbitrage_opportunity("sell"):
                     await asyncio.sleep(1)
                     continue
 
-                success, primary_price, hedge_price = await self.execute_dn_cycle("buy")
+                success, primary_price, hedge_price = await self.execute_dn_cycle(
+                    "sell"
+                )
                 if success and primary_price and hedge_price:
                     self.print_trade_summary(
                         cycle_count,
-                        "buy",
-                        primary_price,
                         "sell",
+                        primary_price,
+                        "buy",
                         hedge_price,
                         self.order_quantity,
                     )
@@ -917,19 +917,18 @@ class DNHedgeBot:
                     if remaining_qty == 0:
                         break
 
-                if not await self.check_arbitrage_opportunity("sell"):
+                # Mean Reversion UNWIND: BUY on PRIMARY (close short) -> SELL on HEDGE (close long)
+                if not await self.check_arbitrage_opportunity("buy"):
                     await asyncio.sleep(1)
                     continue
 
-                success, primary_price, hedge_price = await self.execute_dn_cycle(
-                    "sell"
-                )
+                success, primary_price, hedge_price = await self.execute_dn_cycle("buy")
                 if success and primary_price and hedge_price:
                     self.print_trade_summary(
                         cycle_count,
-                        "sell",
-                        primary_price,
                         "buy",
+                        primary_price,
+                        "sell",
                         hedge_price,
                         self.order_quantity,
                     )
@@ -1066,7 +1065,6 @@ Examples:
         default="0",
         help="Minimum spread in bps to enter trade (default: 0 = disabled)",
     )
-
     return parser.parse_args()
 
 
