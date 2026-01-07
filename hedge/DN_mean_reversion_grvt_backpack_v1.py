@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Delta Neutral (DN) Hedge Mode: GRVT + Backpack
+Delta Neutral (DN) Hedge Mode: GRVT + Backpack (Mean Reversion Strategy)
+
+Mean Reversion Strategy:
+    - When Primary exchange price > Hedge exchange price: SHORT on Primary
+    - When Primary exchange price < Hedge exchange price: LONG on Primary
+    - Profit from price convergence between exchanges
 
 Usage:
-    python hedge_mode_paradex_grvt.py --ticker SOL --size 1 --iter 10
-    python hedge_mode_paradex_grvt.py --ticker SOL --size 1 --iter 10 --primary-mode bbo_minus_1 --hedge-mode market
+    python DN_mean_reversion_grvt_backpack_v1.py --ticker SOL --size 1 --iter 10
+    python DN_mean_reversion_grvt_backpack_v1.py --ticker SOL --size 1 --iter 10 --primary-mode bbo_minus_1 --hedge-mode market
 """
 
 import asyncio
@@ -25,6 +30,18 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchanges.backpack import BackpackClient
 from exchanges.grvt import GrvtClient
+
+
+# Constants
+WS_CONNECTION_TIMEOUT = 120  # seconds
+WS_RETRY_DELAY = 5  # seconds
+WS_MAX_RETRIES = 3
+ORDER_MAX_ATTEMPTS = 20
+HEDGE_MAX_RETRIES = 4
+MAKER_TIMEOUT = 15  # seconds
+POSITION_IMBALANCE_THRESHOLD = Decimal("2")  # multiplier of order_quantity
+INIT_STABILIZE_DELAY = 3  # seconds
+POSITION_FETCH_TIMEOUT = 30  # seconds
 
 
 class PriceMode(Enum):
@@ -142,6 +159,14 @@ class DNHedgeBot:
         self.logger.addHandler(console_handler)
         self.logger.propagate = False
 
+    def _flush_log_handlers(self):
+        """Flush all log handlers to ensure output is written."""
+        for handler in self.logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
+
     def _initialize_csv_file(self):
         if not os.path.exists(self.csv_filename):
             with open(self.csv_filename, "w", newline="") as csvfile:
@@ -205,8 +230,8 @@ class DNHedgeBot:
             f"\n{'-' * 55}\n"
             f"  CYCLE {cycle_num} COMPLETE\n"
             f"{'-' * 55}\n"
-            f"  PARADEX: {primary_side.upper():4} @ ${primary_price:.3f}\n"
-            f"  GRVT:    {hedge_side.upper():4} @ ${hedge_price:.3f}\n"
+            f"  {self.primary_exchange.upper():8}: {primary_side.upper():4} @ ${primary_price:.3f}\n"
+            f"  {self.hedge_exchange.upper():8}: {hedge_side.upper():4} @ ${hedge_price:.3f}\n"
             f"  Spread: ${spread:.4f} ({spread_bps:+.2f} bps)\n"
             f"  Cycle PnL: ${gross_pnl:.4f}\n"
             f"{'-' * 55}\n"
@@ -293,12 +318,12 @@ class DNHedgeBot:
         """
         Mean Reversion: Compare mid prices and decide direction
 
-        - GRVT (primary) > Paradex (hedge) → GRVT SHORT (sell)
-        - GRVT (primary) < Paradex (hedge) → GRVT LONG (buy)
+        - Primary > Hedge → Primary SHORT (sell)
+        - Primary < Hedge → Primary LONG (buy)
 
         Returns:
-            "sell": GRVT에서 SHORT 진입
-            "buy": GRVT에서 LONG 진입
+            "sell": Primary에서 SHORT 진입
+            "buy": Primary에서 LONG 진입
             None: 스프레드 부족으로 진입 안함
         """
         # BBO 가격 가져오기
@@ -310,20 +335,20 @@ class DNHedgeBot:
         )
 
         # Mid price 계산
-        primary_mid = (primary_bid + primary_ask) / 2  # GRVT mid
-        hedge_mid = (hedge_bid + hedge_ask) / 2  # Paradex mid
+        primary_mid = (primary_bid + primary_ask) / 2  # Primary exchange mid
+        hedge_mid = (hedge_bid + hedge_ask) / 2  # Hedge exchange mid
 
         # 가격 비교 (핵심!)
         if primary_mid > hedge_mid:
-            # GRVT가 높음 → Mean Reversion: GRVT에서 SHORT
+            # Primary가 높음 → Mean Reversion: Primary에서 SHORT
             spread = primary_mid - hedge_mid
             spread_bps = (spread / hedge_mid) * Decimal("10000")
-            direction = "sell"  # GRVT에서 SELL
+            direction = "sell"  # Primary에서 SELL
         elif primary_mid < hedge_mid:
-            # GRVT가 낮음 → Mean Reversion: GRVT에서 LONG
+            # Primary가 낮음 → Mean Reversion: Primary에서 LONG
             spread = hedge_mid - primary_mid
             spread_bps = (spread / primary_mid) * Decimal("10000")
-            direction = "buy"  # GRVT에서 BUY
+            direction = "buy"  # Primary에서 BUY
         else:
             self.logger.debug(f"[ARB] Mid prices equal, no spread")
             return None
@@ -333,7 +358,8 @@ class DNHedgeBot:
 
         if spread_bps >= min_spread:
             self.logger.info(
-                f"[ARB] GRVT mid: {primary_mid:.4f}, Paradex mid: {hedge_mid:.4f}, "
+                f"[ARB] {self.primary_exchange.upper()} mid: {primary_mid:.4f}, "
+                f"{self.hedge_exchange.upper()} mid: {hedge_mid:.4f}, "
                 f"Spread: {spread_bps:.2f} bps -> {direction.upper()}"
             )
             return direction
@@ -346,7 +372,7 @@ class DNHedgeBot:
     async def initialize_clients(self):
         config = self._create_exchange_config(self.ticker, self.order_quantity)
 
-        if self.primary_exchange == "paradex":
+        if self.primary_exchange == "backpack":
             self.primary_client = BackpackClient(config)
         elif self.primary_exchange == "grvt":
             self.primary_client = GrvtClient(config)
@@ -359,7 +385,7 @@ class DNHedgeBot:
         hedge_config = self._create_exchange_config(self.ticker, self.order_quantity)
         if self.hedge_exchange == "grvt":
             self.hedge_client = GrvtClient(hedge_config)
-        elif self.hedge_exchange == "paradex":
+        elif self.hedge_exchange == "backpack":
             self.hedge_client = BackpackClient(hedge_config)
         else:
             raise ValueError(f"Unsupported hedge exchange: {self.hedge_exchange}")
@@ -485,8 +511,8 @@ class DNHedgeBot:
             # PRIMARY: Use WebSocket (GRVT WebSocket is reliable)
             primary_pos = self.primary_client.get_ws_position()
 
-            # HEDGE: ALWAYS use REST API for Paradex (WebSocket unreliable)
-            if self.hedge_exchange == "paradex":
+            # HEDGE: ALWAYS use REST API for Backpack (WebSocket may be unreliable)
+            if self.hedge_exchange == "backpack":
                 hedge_pos = await self.hedge_client.get_account_positions()
             else:
                 hedge_pos = self.hedge_client.get_ws_position()
@@ -504,14 +530,22 @@ class DNHedgeBot:
             ws_primary = self.primary_client.get_ws_position()
             ws_hedge = self.hedge_client.get_ws_position()
 
-            # Also get REST API positions for confirmation
+            # Also get REST API positions for confirmation (authoritative source)
             api_primary, api_hedge = await self.get_positions(force_api=True)
 
-            # Use the larger absolute position (most reliable source)
-            primary_pos = (
-                ws_primary if abs(ws_primary) >= abs(api_primary) else api_primary
-            )
-            hedge_pos = ws_hedge if abs(ws_hedge) >= abs(api_hedge) else api_hedge
+            # H4: Use REST API as authoritative source, WS for real-time reference
+            primary_pos = api_primary
+            hedge_pos = api_hedge
+
+            # Log drift warning if WS and API differ significantly
+            if abs(ws_primary - api_primary) > self.order_quantity * Decimal("0.1"):
+                self.logger.warning(
+                    f"[RECONCILE] PRIMARY position drift: WS={ws_primary}, API={api_primary}"
+                )
+            if abs(ws_hedge - api_hedge) > self.order_quantity * Decimal("0.1"):
+                self.logger.warning(
+                    f"[RECONCILE] HEDGE position drift: WS={ws_hedge}, API={api_hedge}"
+                )
 
             # Update instance variables
             self.primary_position = primary_pos
@@ -569,13 +603,8 @@ class DNHedgeBot:
                 return None
 
             try:
-                # Convert side based on exchange type
-                if self.primary_exchange == "paradex":
-                    from paradex_py.common.order import OrderSide
-
-                    order_side = OrderSide.Buy if side == "buy" else OrderSide.Sell
-                else:
-                    order_side = side  # GRVT expects lowercase string
+                # Both GRVT and Backpack expect lowercase string for side
+                order_side = side
 
                 order_result = await self.primary_client.place_post_only_order(
                     contract_id=self.primary_contract_id,
@@ -711,12 +740,8 @@ class DNHedgeBot:
                     f"{order_mode} @ {order_price} (BBO: {best_bid}/{best_ask}, attempt {attempt}/{max_retries})"
                 )
 
-                if self.hedge_exchange == "paradex":
-                    from paradex_py.common.order import OrderSide
-
-                    order_side = OrderSide.Buy if side == "buy" else OrderSide.Sell
-                else:
-                    order_side = side
+                # Both GRVT and Backpack expect lowercase string for side
+                order_side = side
 
                 pos_before = self.hedge_client.get_ws_position()
 
@@ -918,19 +943,21 @@ class DNHedgeBot:
 
                 close_qty = abs(ws_pos)
 
-                # Determine contract_id for this client
+                # M4: Determine contract_id and tick_size for this client
                 if exchange_name == "PRIMARY":
                     contract_id = self.primary_contract_id
+                    tick_size = self.primary_tick_size
                 else:  # HEDGE
                     contract_id = self.hedge_contract_id
+                    tick_size = self.hedge_tick_size
 
                 # Get BBO and place market order
                 best_bid, best_ask = await client.fetch_bbo_prices(contract_id)
 
                 if close_side == "buy":
-                    close_price = best_ask + (client.tick_size * Decimal("2"))
+                    close_price = best_ask + (tick_size * Decimal("2"))
                 else:
-                    close_price = best_bid - (client.tick_size * Decimal("2"))
+                    close_price = best_bid - (tick_size * Decimal("2"))
 
                 close_price = client.round_to_tick(close_price)
 
@@ -973,6 +1000,9 @@ class DNHedgeBot:
         )
 
         try:
+            # Get position before close for verification
+            pos_before = await self.primary_client.get_account_positions()
+
             # For emergency close, use market order to guarantee execution
             # (POST_ONLY might fail if price crosses spread)
             if self.primary_exchange == "grvt":
@@ -984,7 +1014,7 @@ class DNHedgeBot:
                 )
                 price = "MARKET"  # For logging
             else:
-                # Paradex: use aggressive limit order
+                # Backpack: use aggressive limit order
                 best_bid, best_ask = await self.primary_client.fetch_bbo_prices(
                     self.primary_contract_id
                 )
@@ -993,21 +1023,18 @@ class DNHedgeBot:
                 else:
                     price = best_bid * Decimal("0.995")
 
-                from paradex_py.common.order import OrderSide
-
-                order_side = OrderSide.Buy if close_side == "buy" else OrderSide.Sell
                 await self.primary_client.place_post_only_order(
                     contract_id=self.primary_contract_id,
                     quantity=quantity,
                     price=price,
-                    side=order_side,
+                    side=close_side,
                 )
 
-            # Update local position tracking
+            # Update local position tracking (C3 fix: correct direction)
             if close_side == "buy":
-                self.local_primary_position -= quantity
-            else:
                 self.local_primary_position += quantity
+            else:
+                self.local_primary_position -= quantity
 
             # Wait for fill confirmation
             start_wait = time.time()
@@ -1086,12 +1113,7 @@ class DNHedgeBot:
 
     async def trading_loop(self):
         self.logger.info(f"{'=' * 60}")
-        # Flush log handlers to ensure output
-        for handler in self.logger.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                pass
+        self._flush_log_handlers()
         self.logger.info("DN Hedge Bot Starting (MEAN REVERSION STRATEGY)")
         self.logger.info(
             f"PRIMARY: {self.primary_exchange.upper()} ({self.primary_mode.value}) | "
@@ -1101,12 +1123,7 @@ class DNHedgeBot:
             f"Ticker: {self.ticker} | Quantity: {self.order_quantity} | Iterations: {self.iterations}"
         )
         self.logger.info(f"{'=' * 60}")
-        # Flush log handlers to ensure output
-        for handler in self.logger.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                pass
+        self._flush_log_handlers()
 
         try:
             await self.initialize_clients()
@@ -1166,9 +1183,8 @@ class DNHedgeBot:
                 # Use WebSocket positions for both exchanges (real-time tracking)
                 self.primary_position = self.primary_client.get_ws_position()
                 self.hedge_position = self.hedge_client.get_ws_position()
-                net_delta = self.primary_position + self.hedge_position
 
-                # Check position imbalance (like original hedge_mode_grvt.py)
+                # M2: Single position imbalance check (removed duplicate)
                 net_delta = self.local_primary_position + self.local_hedge_position
                 if abs(net_delta) > self.order_quantity * Decimal("2"):
                     self.logger.error(
@@ -1186,14 +1202,6 @@ class DNHedgeBot:
                     f"Local: {self.local_primary_position}/{self.local_hedge_position} | Net: {net_delta}"
                 )
 
-                # Tighter position imbalance threshold: 2x instead of 5x
-                if abs(net_delta) > self.order_quantity * 2:
-                    self.logger.error(f"Position imbalance too large: {net_delta}")
-                    self.logger.error("[BUILD] Attempting to close all positions...")
-                    await self.force_close_all_positions()
-                    self.stop_flag = True
-                    break
-
                 # Mean Reversion: 가격 비교 후 방향 결정
                 direction = await self.should_enter_trade()
                 if direction is None:
@@ -1204,11 +1212,13 @@ class DNHedgeBot:
                     direction
                 )
                 if success and primary_price and hedge_price:
+                    # H2: Use dynamic side based on direction
+                    hedge_side = "sell" if direction == "buy" else "buy"
                     self.print_trade_summary(
                         cycle_count,
-                        "sell",
+                        direction,
                         primary_price,
-                        "buy",
+                        hedge_side,
                         hedge_price,
                         self.order_quantity,
                     )
@@ -1254,21 +1264,27 @@ class DNHedgeBot:
                     if remaining_qty == 0:
                         break
 
-                # Mean Reversion UNWIND: 기존 포지션 청산 (역방향)
-                direction = "buy" if self.primary_position > 0 else "sell"
-                if not await self.should_enter_trade():
+                # Mean Reversion UNWIND: Check spread before unwinding
+                # M1: Use should_enter_trade() for spread check, but determine direction from position
+                arb_direction = await self.should_enter_trade()
+                if arb_direction is None:
                     await asyncio.sleep(1)
                     continue
+
+                # For UNWIND, direction is based on current position (close it)
+                direction = "buy" if self.primary_position > 0 else "sell"
 
                 success, primary_price, hedge_price = await self.execute_dn_cycle(
                     direction
                 )
                 if success and primary_price and hedge_price:
+                    # H2: Use dynamic side based on direction
+                    hedge_side = "sell" if direction == "buy" else "buy"
                     self.print_trade_summary(
                         cycle_count,
-                        "buy",
+                        direction,
                         primary_price,
-                        "sell",
+                        hedge_side,
                         hedge_price,
                         self.order_quantity,
                     )
@@ -1297,32 +1313,11 @@ class DNHedgeBot:
         self.logger.info(f"  Average Edge: {avg_pnl_bps:+.2f} bps")
         self.logger.info(f"{'-' * 60}")
         self.logger.info(
-            f"  Final Positions - PARADEX: {final_primary}, GRVT: {final_hedge}"
+            f"  Final Positions - {self.primary_exchange.upper()}: {final_primary}, {self.hedge_exchange.upper()}: {final_hedge}"
         )
         self.logger.info(f"  Net Delta: {final_primary + final_hedge}")
         self.logger.info(f"{'=' * 60}")
-        # Flush log handlers to ensure output
-        for handler in self.logger.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                pass
-        self.logger.info(f"  Completed Cycles: {self.completed_cycles}")
-        self.logger.info(f"  Total Volume: ${self.total_volume:.2f}")
-        self.logger.info(f"  Total Gross PnL: ${self.total_gross_pnl:.4f}")
-        self.logger.info(f"  Average Edge: {avg_pnl_bps:+.2f} bps")
-        self.logger.info(f"{'─' * 60}")
-        self.logger.info(
-            f"  Final Positions - PARADEX: {final_primary}, GRVT: {final_hedge}"
-        )
-        self.logger.info(f"  Net Delta: {final_primary + final_hedge}")
-        self.logger.info(f"{'=' * 60}")
-        # Flush log handlers to ensure output
-        for handler in self.logger.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                pass
+        self._flush_log_handlers()
 
     async def run(self):
         self.setup_signal_handlers()
@@ -1341,21 +1336,21 @@ def parse_arguments():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Delta Neutral Hedge Bot: Paradex + GRVT",
+        description="Delta Neutral Hedge Bot: GRVT + Backpack (Mean Reversion)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     # Test 1: PRIMARY=BBO-1tick, HEDGE=market (default)
-    python hedge_mode_paradex_grvt.py --ticker SOL --size 1 --iter 10
+    python DN_mean_reversion_grvt_backpack_v1.py --ticker SOL --size 1 --iter 10
 
     # Test 2: PRIMARY=BBO, HEDGE=market
-    python hedge_mode_paradex_grvt.py --ticker SOL --size 1 --iter 10 --primary-mode bbo
+    python DN_mean_reversion_grvt_backpack_v1.py --ticker SOL --size 1 --iter 10 --primary-mode bbo
 
     # Test 3: PRIMARY=BBO-1tick, HEDGE=BBO-1tick
-    python hedge_mode_paradex_grvt.py --ticker SOL --size 1 --iter 10 --hedge-mode bbo_minus_1
+    python DN_mean_reversion_grvt_backpack_v1.py --ticker SOL --size 1 --iter 10 --hedge-mode bbo_minus_1
 
     # Test 4: PRIMARY=BBO, HEDGE=BBO
-    python hedge_mode_paradex_grvt.py --ticker SOL --size 1 --iter 10 --primary-mode bbo --hedge-mode bbo
+    python DN_mean_reversion_grvt_backpack_v1.py --ticker SOL --size 1 --iter 10 --primary-mode bbo --hedge-mode bbo
         """,
     )
 
@@ -1390,15 +1385,15 @@ Examples:
         "--primary",
         type=str,
         default="grvt",
-        choices=["paradex", "grvt"],
+        choices=["backpack", "grvt"],
         help="Primary exchange for POST_ONLY orders (default: grvt)",
     )
     parser.add_argument(
         "--hedge",
         type=str,
-        default="paradex",
-        choices=["paradex", "grvt"],
-        help="Hedge exchange for market orders (default: paradex)",
+        default="backpack",
+        choices=["backpack", "grvt"],
+        help="Hedge exchange for market orders (default: backpack)",
     )
     parser.add_argument(
         "--primary-mode",
