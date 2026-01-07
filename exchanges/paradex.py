@@ -56,6 +56,14 @@ def patch_paradex_http_client():
         pass
 
 
+
+class Config:
+    """Simple config class to wrap dictionary for Paradex client."""
+    def __init__(self, config_dict):
+        for key, value in config_dict.items():
+            setattr(self, key, value)
+
+
 class ParadexClient(BaseExchangeClient):
     """Simplified Paradex exchange client - L2 credentials only."""
 

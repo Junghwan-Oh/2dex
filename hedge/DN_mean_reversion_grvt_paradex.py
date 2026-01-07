@@ -391,8 +391,30 @@ class DNHedgeBot:
         await self.primary_client.connect()
         self.logger.info(f"[WS] PRIMARY ({self.primary_exchange.upper()}) connected")
 
-        await self.hedge_client.connect()
-        self.logger.info(f"[WS] HEDGE ({self.hedge_exchange.upper()}) connected")
+        # Connect to hedge exchange with retries
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.logger.info(f"[WS] Connecting to HEDGE (attempt {attempt}/{max_retries})...")
+                await asyncio.wait_for(self.hedge_client.connect(), timeout=60.0)
+                self.logger.info(f"[WS] HEDGE ({self.hedge_exchange.upper()}) connected")
+                break
+            except asyncio.TimeoutError:
+                self.logger.warning(f"[WS] HEDGE connection timeout (attempt {attempt}/{max_retries})")
+                if attempt < max_retries:
+                    self.logger.info("[WS] Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+                else:
+                    self.logger.error("[WS] HEDGE connection failed after all retries")
+                    raise
+            except Exception as e:
+                self.logger.warning(f"[WS] HEDGE connection error: {e} (attempt {attempt}/{max_retries})")
+                if attempt < max_retries:
+                    self.logger.info("[WS] Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+                else:
+                    self.logger.error("[WS] HEDGE connection failed after all retries")
+                    raise
 
     def _handle_primary_order_update(self, order_data):
         if order_data.get("contract_id") != self.primary_contract_id:
@@ -1032,6 +1054,12 @@ class DNHedgeBot:
 
     async def trading_loop(self):
         self.logger.info(f"{'=' * 60}")
+        # Flush log handlers to ensure output
+        for handler in self.logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
         self.logger.info("DN Hedge Bot Starting (MEAN REVERSION STRATEGY)")
         self.logger.info(
             f"PRIMARY: {self.primary_exchange.upper()} ({self.primary_mode.value}) | "
@@ -1041,6 +1069,12 @@ class DNHedgeBot:
             f"Ticker: {self.ticker} | Quantity: {self.order_quantity} | Iterations: {self.iterations}"
         )
         self.logger.info(f"{'=' * 60}")
+        # Flush log handlers to ensure output
+        for handler in self.logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
 
         try:
             await self.initialize_clients()
@@ -1049,9 +1083,21 @@ class DNHedgeBot:
             self.logger.error(f"Failed to initialize: {e}")
             return
 
+        self.logger.info("[INIT] Waiting for connections to stabilize...")
         await asyncio.sleep(3)
+        self.logger.info("[INIT] Fetching initial positions...")
 
-        api_primary, api_hedge = await self.get_positions(force_api=True)
+        try:
+            api_primary, api_hedge = await asyncio.wait_for(
+                self.get_positions(force_api=True), timeout=30.0
+            )
+            self.logger.info(f"[INIT] Positions fetched: PRIMARY={api_primary}, HEDGE={api_hedge}")
+        except asyncio.TimeoutError:
+            self.logger.error("[INIT] Timeout fetching positions, using WS positions")
+            api_primary, api_hedge = await self.get_positions(force_api=False)
+        except Exception as e:
+            self.logger.error(f"[INIT] Error fetching positions: {e}, using WS positions")
+            api_primary, api_hedge = await self.get_positions(force_api=False)
         self.local_primary_position = api_primary
         self.local_hedge_position = api_hedge
         self.primary_position = api_primary
@@ -1193,6 +1239,12 @@ class DNHedgeBot:
         self.logger.info(f"\n{'=' * 60}")
         self.logger.info("TRADING COMPLETE - FINAL SUMMARY")
         self.logger.info(f"{'=' * 60}")
+        # Flush log handlers to ensure output
+        for handler in self.logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
         self.logger.info(f"  Completed Cycles: {self.completed_cycles}")
         self.logger.info(f"  Total Volume: ${self.total_volume:.2f}")
         self.logger.info(f"  Total Gross PnL: ${self.total_gross_pnl:.4f}")
@@ -1203,6 +1255,12 @@ class DNHedgeBot:
         )
         self.logger.info(f"  Net Delta: {final_primary + final_hedge}")
         self.logger.info(f"{'=' * 60}")
+        # Flush log handlers to ensure output
+        for handler in self.logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
         self.logger.info(f"  Completed Cycles: {self.completed_cycles}")
         self.logger.info(f"  Total Volume: ${self.total_volume:.2f}")
         self.logger.info(f"  Total Gross PnL: ${self.total_gross_pnl:.4f}")
@@ -1213,6 +1271,12 @@ class DNHedgeBot:
         )
         self.logger.info(f"  Net Delta: {final_primary + final_hedge}")
         self.logger.info(f"{'=' * 60}")
+        # Flush log handlers to ensure output
+        for handler in self.logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
 
     async def run(self):
         self.setup_signal_handlers()
