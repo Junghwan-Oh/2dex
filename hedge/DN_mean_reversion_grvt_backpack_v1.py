@@ -756,7 +756,27 @@ class DNHedgeBot:
                 else:
                     pos_before = self.hedge_client.get_ws_position()
 
-                if order_mode == "TAKER_FALLBACK" and hasattr(
+                # FIX: BackpackClient doesn't have place_aggressive_limit_order or place_post_only_order
+                # Use place_market_order for hedge exchange (Backpack)
+                if self.hedge_exchange == "backpack":
+                    # Backpack: Use market order for immediate fill
+                    await self.hedge_client.place_market_order(
+                        contract_id=self.hedge_contract_id,
+                        quantity=quantity,
+                        direction=order_side,  # Backpack uses 'direction' not 'side'
+                    )
+                    # Wait for fill confirmation
+                    start_wait = time.time()
+                    while time.time() - start_wait < 5:
+                        await asyncio.sleep(0.3)
+                        try:
+                            pos_api = await self.hedge_client.get_account_positions()
+                            pos_change = abs(pos_api - pos_before)
+                            if pos_change >= quantity * Decimal("0.99"):
+                                break
+                        except Exception:
+                            pass
+                elif order_mode == "TAKER_FALLBACK" and hasattr(
                     self.hedge_client, "place_aggressive_limit_order"
                 ):
                     await self.hedge_client.place_aggressive_limit_order(
@@ -786,6 +806,7 @@ class DNHedgeBot:
                         if pos_change >= quantity * Decimal("0.99"):
                             break
                 else:
+                    # Other exchanges with place_post_only_order
                     await self.hedge_client.place_post_only_order(
                         contract_id=self.hedge_contract_id,
                         quantity=quantity,
