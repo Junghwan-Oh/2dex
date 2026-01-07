@@ -560,6 +560,21 @@ class BackpackClient(BaseExchangeClient):
             success=False, error_message="Max retries exceeded for close order"
         )
 
+    async def place_post_only_order(
+        self, contract_id: str, quantity: Decimal, price: Decimal, side: str
+    ) -> OrderResult:
+        """Place a post-only (maker) limit order. Used by DN hedge bot for maker orders.
+
+        This is a thin wrapper around place_close_order since both use post_only=True.
+        The naming convention matches other exchange clients for compatibility.
+        """
+        return await self.place_close_order(
+            contract_id=contract_id,
+            quantity=quantity,
+            price=price,
+            side=side,
+        )
+
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Backpack using official SDK."""
         try:

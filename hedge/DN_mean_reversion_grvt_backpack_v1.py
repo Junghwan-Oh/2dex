@@ -756,26 +756,52 @@ class DNHedgeBot:
                 else:
                     pos_before = self.hedge_client.get_ws_position()
 
-                # FIX: BackpackClient doesn't have place_aggressive_limit_order or place_post_only_order
-                # Use place_market_order for hedge exchange (Backpack)
+                # FIX: BackpackClient now has place_post_only_order
+                # Use maker orders for better PnL, fallback to market only if maker fails
                 if self.hedge_exchange == "backpack":
-                    # Backpack: Use market order for immediate fill
-                    await self.hedge_client.place_market_order(
-                        contract_id=self.hedge_contract_id,
-                        quantity=quantity,
-                        direction=order_side,  # Backpack uses 'direction' not 'side'
-                    )
-                    # Wait for fill confirmation
-                    start_wait = time.time()
-                    while time.time() - start_wait < 5:
-                        await asyncio.sleep(0.3)
-                        try:
-                            pos_api = await self.hedge_client.get_account_positions()
-                            pos_change = abs(pos_api - pos_before)
-                            if pos_change >= quantity * Decimal("0.99"):
-                                break
-                        except Exception:
-                            pass
+                    # Backpack: Try maker order first for better spread capture
+                    if order_mode in ["MAKER", "AGGRESSIVE"]:
+                        # Use post_only order (maker)
+                        await self.hedge_client.place_post_only_order(
+                            contract_id=self.hedge_contract_id,
+                            quantity=quantity,
+                            price=order_price,
+                            side=order_side,
+                        )
+                        # Wait for fill confirmation
+                        start_wait = time.time()
+                        maker_timeout = 10  # 10 seconds for maker order
+                        while time.time() - start_wait < maker_timeout:
+                            await asyncio.sleep(0.5)
+                            try:
+                                pos_api = (
+                                    await self.hedge_client.get_account_positions()
+                                )
+                                pos_change = abs(pos_api - pos_before)
+                                if pos_change >= quantity * Decimal("0.99"):
+                                    break
+                            except Exception:
+                                pass
+                    else:
+                        # TAKER_FALLBACK: Use market order for immediate fill
+                        await self.hedge_client.place_market_order(
+                            contract_id=self.hedge_contract_id,
+                            quantity=quantity,
+                            direction=order_side,  # Backpack uses 'direction' not 'side'
+                        )
+                        # Wait for fill confirmation
+                        start_wait = time.time()
+                        while time.time() - start_wait < 5:
+                            await asyncio.sleep(0.3)
+                            try:
+                                pos_api = (
+                                    await self.hedge_client.get_account_positions()
+                                )
+                                pos_change = abs(pos_api - pos_before)
+                                if pos_change >= quantity * Decimal("0.99"):
+                                    break
+                            except Exception:
+                                pass
                 elif order_mode == "TAKER_FALLBACK" and hasattr(
                     self.hedge_client, "place_aggressive_limit_order"
                 ):
@@ -1410,13 +1436,16 @@ class DNHedgeBot:
                 if not hasattr(self, "_unwind_start_time"):
                     self._unwind_start_time = time.time()
 
-                unwind_timeout = 300  # 5 minutes max wait for spread
+                unwind_timeout = 180  # 3 minutes max wait for spread (reduced from 5)
+                force_unwind = False
+
                 if time.time() - self._unwind_start_time > unwind_timeout:
                     self.logger.warning(
                         f"[UNWIND] Spread wait timeout ({unwind_timeout}s), forcing close without spread check"
                     )
-                    # Reset timeout tracker and proceed with force close
+                    # Reset timeout tracker and FORCE unwind regardless of spread
                     delattr(self, "_unwind_start_time")
+                    force_unwind = True
                 else:
                     arb_direction = await self.should_enter_trade()
                     if arb_direction is None:
@@ -1429,6 +1458,12 @@ class DNHedgeBot:
                 # For UNWIND, direction is based on current position (close it)
                 # FIX: To close LONG position, we need to SELL. To close SHORT, we need to BUY.
                 direction = "sell" if self.primary_position > 0 else "buy"
+
+                # If force_unwind, skip spread check and execute immediately
+                if force_unwind:
+                    self.logger.warning(
+                        f"[UNWIND] Force executing {direction.upper()} without spread check"
+                    )
 
                 success, primary_price, hedge_price = await self.execute_dn_cycle(
                     direction
