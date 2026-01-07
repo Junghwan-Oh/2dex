@@ -23,7 +23,9 @@ from helpers.logger import TradingLogger
 class BackpackWebSocketManager:
     """WebSocket manager for Backpack order updates."""
 
-    def __init__(self, public_key: str, secret_key: str, symbol: str, order_update_callback):
+    def __init__(
+        self, public_key: str, secret_key: str, symbol: str, order_update_callback
+    ):
         self.public_key = public_key
         self.secret_key = secret_key
         self.symbol = symbol
@@ -38,7 +40,9 @@ class BackpackWebSocketManager:
             base64.b64decode(secret_key)
         )
 
-    def _generate_signature(self, instruction: str, timestamp: int, window: int = 5000) -> str:
+    def _generate_signature(
+        self, instruction: str, timestamp: int, window: int = 5000
+    ) -> str:
         """Generate ED25519 signature for WebSocket authentication."""
         # Create the message string in the same format as BPX package
         message = f"instruction={instruction}&timestamp={timestamp}&window={window}"
@@ -64,17 +68,14 @@ class BackpackWebSocketManager:
                 subscribe_message = {
                     "method": "SUBSCRIBE",
                     "params": [f"account.orderUpdate.{self.symbol}"],
-                    "signature": [
-                        self.public_key,
-                        signature,
-                        str(timestamp),
-                        "5000"
-                    ]
+                    "signature": [self.public_key, signature, str(timestamp), "5000"],
                 }
 
                 await self.websocket.send(json.dumps(subscribe_message))
                 if self.logger:
-                    self.logger.log(f"Subscribed to order updates for {self.symbol}", "INFO")
+                    self.logger.log(
+                        f"Subscribed to order updates for {self.symbol}", "INFO"
+                    )
 
                 # Start listening for messages
                 await self._listen()
@@ -95,10 +96,14 @@ class BackpackWebSocketManager:
                     await self._handle_message(data)
                 except json.JSONDecodeError as e:
                     if self.logger:
-                        self.logger.log(f"Failed to parse WebSocket message: {e}", "ERROR")
+                        self.logger.log(
+                            f"Failed to parse WebSocket message: {e}", "ERROR"
+                        )
                 except Exception as e:
                     if self.logger:
-                        self.logger.log(f"Error handling WebSocket message: {e}", "ERROR")
+                        self.logger.log(
+                            f"Error handling WebSocket message: {e}", "ERROR"
+                        )
 
         except websockets.exceptions.ConnectionClosed:
             if self.logger:
@@ -110,10 +115,10 @@ class BackpackWebSocketManager:
     async def _handle_message(self, data: Dict[str, Any]):
         """Handle incoming WebSocket messages."""
         try:
-            stream = data.get('stream', '')
-            payload = data.get('data', {})
+            stream = data.get("stream", "")
+            payload = data.get("data", {})
 
-            if 'orderUpdate' in stream:
+            if "orderUpdate" in stream:
                 await self._handle_order_update(payload)
             else:
                 self.logger.log(f"Unknown WebSocket message: {data}", "ERROR")
@@ -126,7 +131,7 @@ class BackpackWebSocketManager:
         """Handle order update messages."""
         try:
             # Call the order update callback if it exists
-            if hasattr(self, 'order_update_callback') and self.order_update_callback:
+            if hasattr(self, "order_update_callback") and self.order_update_callback:
                 await self.order_update_callback(order_data)
         except Exception as e:
             if self.logger:
@@ -157,24 +162,28 @@ class BackpackClient(BaseExchangeClient):
         super().__init__(config)
 
         # Backpack credentials from environment
-        self.public_key = os.getenv('BACKPACK_PUBLIC_KEY')
-        self.secret_key = os.getenv('BACKPACK_SECRET_KEY')
+        self.public_key = os.getenv("BACKPACK_PUBLIC_KEY")
+        self.secret_key = os.getenv("BACKPACK_SECRET_KEY")
 
         if not self.public_key or not self.secret_key:
-            raise ValueError("BACKPACK_PUBLIC_KEY and BACKPACK_SECRET_KEY must be set in environment variables")
+            raise ValueError(
+                "BACKPACK_PUBLIC_KEY and BACKPACK_SECRET_KEY must be set in environment variables"
+            )
 
         # Initialize Backpack clients using official SDK
         self.public_client = Public()
         self.account_client = Account(
-            public_key=self.public_key,
-            secret_key=self.secret_key
+            public_key=self.public_key, secret_key=self.secret_key
         )
 
         self._order_update_handler = None
+        self._local_position = Decimal(
+            "0"
+        )  # Local position tracking for get_ws_position()
 
     def _validate_config(self) -> None:
         """Validate Backpack configuration."""
-        required_env_vars = ['BACKPACK_PUBLIC_KEY', 'BACKPACK_SECRET_KEY']
+        required_env_vars = ["BACKPACK_PUBLIC_KEY", "BACKPACK_SECRET_KEY"]
         missing_vars = [var for var in required_env_vars if not os.getenv(var)]
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {missing_vars}")
@@ -186,13 +195,15 @@ class BackpackClient(BaseExchangeClient):
             public_key=self.public_key,
             secret_key=self.secret_key,
             symbol=self.config.contract_id,  # Use contract_id as symbol for Backpack
-            order_update_callback=self._handle_websocket_order_update
+            order_update_callback=self._handle_websocket_order_update,
         )
         # Pass config to WebSocket manager for order type determination
         self.ws_manager.config = self.config
 
         # Initialize logger using the same format as helpers
-        self.logger = TradingLogger(exchange="backpack", ticker=self.config.ticker, log_to_console=True)
+        self.logger = TradingLogger(
+            exchange="backpack", ticker=self.config.ticker, log_to_console=True
+        )
         self.ws_manager.set_logger(self.logger)
 
         try:
@@ -207,7 +218,7 @@ class BackpackClient(BaseExchangeClient):
     async def disconnect(self) -> None:
         """Disconnect from Backpack."""
         try:
-            if hasattr(self, 'ws_manager') and self.ws_manager:
+            if hasattr(self, "ws_manager") and self.ws_manager:
                 await self.ws_manager.disconnect()
         except Exception as e:
             self.logger.log(f"Error during Backpack disconnect: {e}", "ERROR")
@@ -223,65 +234,74 @@ class BackpackClient(BaseExchangeClient):
     async def _handle_websocket_order_update(self, order_data: Dict[str, Any]):
         """Handle order updates from WebSocket."""
         try:
-            event_type = order_data.get('e', '')
-            order_id = order_data.get('i', '')
-            symbol = order_data.get('s', '')
-            side = order_data.get('S', '')
-            quantity = order_data.get('q', '0')
-            price = order_data.get('p', '0')
-            if price == '0':
-                price = order_data.get('L', '0')
-            fill_quantity = order_data.get('z', '0')
+            event_type = order_data.get("e", "")
+            order_id = order_data.get("i", "")
+            symbol = order_data.get("s", "")
+            side = order_data.get("S", "")
+            quantity = order_data.get("q", "0")
+            price = order_data.get("p", "0")
+            if price == "0":
+                price = order_data.get("L", "0")
+            fill_quantity = order_data.get("z", "0")
 
             # Only process orders for our symbol
             if symbol != self.config.contract_id:
                 return
 
             # Determine order side
-            if side.upper() == 'BID':
-                order_side = 'buy'
-            elif side.upper() == 'ASK':
-                order_side = 'sell'
+            if side.upper() == "BID":
+                order_side = "buy"
+            elif side.upper() == "ASK":
+                order_side = "sell"
             else:
                 self.logger.log(f"Unexpected order side: {side}", "ERROR")
                 sys.exit(1)
 
             # Check if this is a close order (opposite side from bot direction)
-            is_close_order = (order_side == self.config.close_order_side)
+            is_close_order = order_side == self.config.close_order_side
             order_type = "CLOSE" if is_close_order else "OPEN"
 
-            if event_type == 'orderFill' and quantity == fill_quantity:
+            if event_type == "orderFill" and quantity == fill_quantity:
                 if self._order_update_handler:
-                    self._order_update_handler({
-                        'order_id': order_id,
-                        'side': order_side,
-                        'order_type': order_type,
-                        'status': 'FILLED',
-                        'size': quantity,
-                        'price': price,
-                        'contract_id': symbol,
-                        'filled_size': fill_quantity
-                    })
+                    self._order_update_handler(
+                        {
+                            "order_id": order_id,
+                            "side": order_side,
+                            "order_type": order_type,
+                            "status": "FILLED",
+                            "size": quantity,
+                            "price": price,
+                            "contract_id": symbol,
+                            "filled_size": fill_quantity,
+                        }
+                    )
 
-            elif event_type in ['orderFill', 'orderAccepted', 'orderCancelled', 'orderExpired']:
-                if event_type == 'orderFill':
-                    status = 'PARTIALLY_FILLED'
-                elif event_type == 'orderAccepted':
-                    status = 'OPEN'
-                elif event_type in ['orderCancelled', 'orderExpired']:
-                    status = 'CANCELED'
+            elif event_type in [
+                "orderFill",
+                "orderAccepted",
+                "orderCancelled",
+                "orderExpired",
+            ]:
+                if event_type == "orderFill":
+                    status = "PARTIALLY_FILLED"
+                elif event_type == "orderAccepted":
+                    status = "OPEN"
+                elif event_type in ["orderCancelled", "orderExpired"]:
+                    status = "CANCELED"
 
                 if self._order_update_handler:
-                    self._order_update_handler({
-                        'order_id': order_id,
-                        'side': order_side,
-                        'order_type': order_type,
-                        'status': status,
-                        'size': quantity,
-                        'price': price,
-                        'contract_id': symbol,
-                        'filled_size': fill_quantity
-                    })
+                    self._order_update_handler(
+                        {
+                            "order_id": order_id,
+                            "side": order_side,
+                            "order_type": order_type,
+                            "status": status,
+                            "size": quantity,
+                            "price": price,
+                            "contract_id": symbol,
+                            "filled_size": fill_quantity,
+                        }
+                    )
 
         except Exception as e:
             self.logger.log(f"Error handling WebSocket order update: {e}", "ERROR")
@@ -293,7 +313,7 @@ class BackpackClient(BaseExchangeClient):
             self.logger.log("Invalid bid/ask prices", "ERROR")
             raise ValueError("Invalid bid/ask prices")
 
-        if direction == 'buy':
+        if direction == "buy":
             # For buy orders, place slightly below best ask to ensure execution
             order_price = best_ask - self.config.tick_size
         else:
@@ -307,12 +327,14 @@ class BackpackClient(BaseExchangeClient):
         order_book = self.public_client.get_depth(contract_id)
 
         # Extract bids and asks directly from Backpack response
-        bids = order_book.get('bids', [])
-        asks = order_book.get('asks', [])
+        bids = order_book.get("bids", [])
+        asks = order_book.get("asks", [])
 
         # Sort bids and asks
-        bids = sorted(bids, key=lambda x: Decimal(x[0]), reverse=True)  # (highest price first)
-        asks = sorted(asks, key=lambda x: Decimal(x[0]))                # (lowest price first)
+        bids = sorted(
+            bids, key=lambda x: Decimal(x[0]), reverse=True
+        )  # (highest price first)
+        asks = sorted(asks, key=lambda x: Decimal(x[0]))  # (lowest price first)
 
         # Best bid is the highest price someone is willing to buy at
         best_bid = Decimal(bids[0][0]) if bids and len(bids) > 0 else 0
@@ -321,7 +343,9 @@ class BackpackClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
-    async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+    async def place_open_order(
+        self, contract_id: str, quantity: Decimal, direction: str
+    ) -> OrderResult:
         """Place an open order with Backpack using official SDK with retry logic for POST_ONLY rejections."""
         max_retries = 15
         retry_count = 0
@@ -332,16 +356,18 @@ class BackpackClient(BaseExchangeClient):
             best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
             if best_bid <= 0 or best_ask <= 0:
-                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+                return OrderResult(
+                    success=False, error_message="Invalid bid/ask prices"
+                )
 
-            if direction == 'buy':
+            if direction == "buy":
                 # Aggressive maker: place 1 tick below best ask
                 order_price = best_ask - self.config.tick_size
-                side = 'Bid'
+                side = "Bid"
             else:
                 # Aggressive maker: place 1 tick above best bid
                 order_price = best_bid + self.config.tick_size
-                side = 'Ask'
+                side = "Ask"
 
             # Place the order using Backpack SDK (post-only to ensure maker order)
             order_result = self.account_client.execute_order(
@@ -351,22 +377,26 @@ class BackpackClient(BaseExchangeClient):
                 quantity=str(quantity),
                 price=str(self.round_to_tick(order_price)),
                 post_only=True,
-                time_in_force=TimeInForceEnum.GTC
+                time_in_force=TimeInForceEnum.GTC,
             )
 
             if not order_result:
-                return OrderResult(success=False, error_message='Failed to place order')
+                return OrderResult(success=False, error_message="Failed to place order")
 
-            if 'code' in order_result:
-                message = order_result.get('message', 'Unknown error')
+            if "code" in order_result:
+                message = order_result.get("message", "Unknown error")
                 self.logger.log(f"[OPEN] Order rejected: {message}", "WARNING")
                 continue
 
             # Extract order ID from response
-            order_id = order_result.get('id')
+            order_id = order_result.get("id")
             if not order_id:
-                self.logger.log(f"[OPEN] No order ID in response: {order_result}", "ERROR")
-                return OrderResult(success=False, error_message='No order ID in response')
+                self.logger.log(
+                    f"[OPEN] No order ID in response: {order_result}", "ERROR"
+                )
+                return OrderResult(
+                    success=False, error_message="No order ID in response"
+                )
 
             # Order successfully placed
             return OrderResult(
@@ -375,18 +405,20 @@ class BackpackClient(BaseExchangeClient):
                 side=side.lower(),
                 size=quantity,
                 price=order_price,
-                status='New'
+                status="New",
             )
 
-        return OrderResult(success=False, error_message='Max retries exceeded')
+        return OrderResult(success=False, error_message="Max retries exceeded")
 
-    async def place_market_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+    async def place_market_order(
+        self, contract_id: str, quantity: Decimal, direction: str
+    ) -> OrderResult:
         """Place a market order with Backpack."""
         # Validate direction
-        if direction == 'buy':
-            side = 'Bid'
-        elif direction == 'sell':
-            side = 'Ask'
+        if direction == "buy":
+            side = "Bid"
+        elif direction == "sell":
+            side = "Ask"
         else:
             raise Exception(f"[OPEN] Invalid direction: {direction}")
 
@@ -394,37 +426,49 @@ class BackpackClient(BaseExchangeClient):
             symbol=contract_id,
             side=side,
             order_type=OrderTypeEnum.MARKET,
-            quantity=str(quantity)
+            quantity=str(quantity),
         )
 
         # Handle case where result is string instead of dict
         if isinstance(result, str):
             self.logger.log(f"Market order returned string: {result}", "ERROR")
-            return OrderResult(success=False, error_message=f'Unexpected response: {result}')
+            return OrderResult(
+                success=False, error_message=f"Unexpected response: {result}"
+            )
 
         if not isinstance(result, dict):
-            self.logger.log(f"Market order returned unexpected type: {type(result)}", "ERROR")
-            return OrderResult(success=False, error_message=f'Unexpected response type: {type(result)}')
+            self.logger.log(
+                f"Market order returned unexpected type: {type(result)}", "ERROR"
+            )
+            return OrderResult(
+                success=False, error_message=f"Unexpected response type: {type(result)}"
+            )
 
-        order_id = result.get('id')
-        order_status = result.get('status', '').upper()
+        order_id = result.get("id")
+        order_status = result.get("status", "").upper()
 
-        if order_status != 'FILLED':
+        if order_status != "FILLED":
             self.logger.log(f"Market order failed with status: {order_status}", "ERROR")
-            return OrderResult(success=False, error_message=f'Market order status: {order_status}')
+            return OrderResult(
+                success=False, error_message=f"Market order status: {order_status}"
+            )
 
         # For market orders, we expect them to be filled immediately
-        price = Decimal(result.get('executedQuoteQuantity', '0'))/Decimal(result.get('executedQuantity'))
+        price = Decimal(result.get("executedQuoteQuantity", "0")) / Decimal(
+            result.get("executedQuantity")
+        )
         return OrderResult(
             success=True,
             order_id=order_id,
             side=direction.lower(),
             size=quantity,
             price=price,
-            status='FILLED'
+            status="FILLED",
         )
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
+    async def place_close_order(
+        self, contract_id: str, quantity: Decimal, price: Decimal, side: str
+    ) -> OrderResult:
         """Place a close order with Backpack using official SDK with retry logic for POST_ONLY rejections."""
         max_retries = 15
         retry_count = 0
@@ -435,17 +479,19 @@ class BackpackClient(BaseExchangeClient):
             best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
             if best_bid <= 0 or best_ask <= 0:
-                return OrderResult(success=False, error_message='No bid/ask data available')
+                return OrderResult(
+                    success=False, error_message="No bid/ask data available"
+                )
 
             # Adjust order price based on market conditions and side
             adjusted_price = price
-            if side.lower() == 'sell':
-                order_side = 'Ask'
+            if side.lower() == "sell":
+                order_side = "Ask"
                 # For sell orders, ensure price is above best bid to be a maker order
                 if price <= best_bid:
                     adjusted_price = best_bid + self.config.tick_size
-            elif side.lower() == 'buy':
-                order_side = 'Bid'
+            elif side.lower() == "buy":
+                order_side = "Bid"
                 # For buy orders, ensure price is below best ask to be a maker order
                 if price >= best_ask:
                     adjusted_price = best_ask - self.config.tick_size
@@ -459,22 +505,26 @@ class BackpackClient(BaseExchangeClient):
                 quantity=str(quantity),
                 price=str(adjusted_price),
                 post_only=True,
-                time_in_force=TimeInForceEnum.GTC
+                time_in_force=TimeInForceEnum.GTC,
             )
 
             if not order_result:
-                return OrderResult(success=False, error_message='Failed to place order')
+                return OrderResult(success=False, error_message="Failed to place order")
 
-            if 'code' in order_result:
-                message = order_result.get('message', 'Unknown error')
+            if "code" in order_result:
+                message = order_result.get("message", "Unknown error")
                 self.logger.log(f"[CLOSE] Error placing order: {message}", "ERROR")
                 continue
 
             # Extract order ID from response
-            order_id = order_result.get('id')
+            order_id = order_result.get("id")
             if not order_id:
-                self.logger.log(f"[CLOSE] No order ID in response: {order_result}", "ERROR")
-                return OrderResult(success=False, error_message='No order ID in response')
+                self.logger.log(
+                    f"[CLOSE] No order ID in response: {order_result}", "ERROR"
+                )
+                return OrderResult(
+                    success=False, error_message="No order ID in response"
+                )
 
             # Order successfully placed
             return OrderResult(
@@ -483,28 +533,33 @@ class BackpackClient(BaseExchangeClient):
                 side=side.lower(),
                 size=quantity,
                 price=adjusted_price,
-                status='New'
+                status="New",
             )
 
-        return OrderResult(success=False, error_message='Max retries exceeded for close order')
+        return OrderResult(
+            success=False, error_message="Max retries exceeded for close order"
+        )
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Backpack using official SDK."""
         try:
             # Cancel the order using Backpack SDK
             cancel_result = self.account_client.cancel_order(
-                symbol=self.config.contract_id,
-                order_id=order_id
+                symbol=self.config.contract_id, order_id=order_id
             )
 
             if not cancel_result:
-                return OrderResult(success=False, error_message='Failed to cancel order')
-            if 'code' in cancel_result:
+                return OrderResult(
+                    success=False, error_message="Failed to cancel order"
+                )
+            if "code" in cancel_result:
                 self.logger.log(
-                    f"[CLOSE] Failed to cancel order {order_id}: {cancel_result.get('message', 'Unknown error')}", "ERROR")
+                    f"[CLOSE] Failed to cancel order {order_id}: {cancel_result.get('message', 'Unknown error')}",
+                    "ERROR",
+                )
                 filled_size = self.config.quantity
             else:
-                filled_size = Decimal(cancel_result.get('executedQuantity', 0))
+                filled_size = Decimal(cancel_result.get("executedQuantity", 0))
             return OrderResult(success=True, filled_size=filled_size)
 
         except Exception as e:
@@ -515,8 +570,7 @@ class BackpackClient(BaseExchangeClient):
         """Get order information from Backpack using official SDK."""
         # Get order information using Backpack SDK
         order_result = self.account_client.get_open_order(
-            symbol=self.config.contract_id,
-            order_id=order_id
+            symbol=self.config.contract_id, order_id=order_id
         )
 
         if not order_result:
@@ -524,13 +578,14 @@ class BackpackClient(BaseExchangeClient):
 
         # Return the order data as OrderInfo
         return OrderInfo(
-            order_id=order_result.get('id', ''),
-            side=order_result.get('side', '').lower(),
-            size=Decimal(order_result.get('quantity', 0)),
-            price=Decimal(order_result.get('price', 0)),
-            status=order_result.get('status', ''),
-            filled_size=Decimal(order_result.get('executedQuantity', 0)),
-            remaining_size=Decimal(order_result.get('quantity', 0)) - Decimal(order_result.get('executedQuantity', 0))
+            order_id=order_result.get("id", ""),
+            side=order_result.get("side", "").lower(),
+            size=Decimal(order_result.get("quantity", 0)),
+            price=Decimal(order_result.get("price", 0)),
+            status=order_result.get("status", ""),
+            filled_size=Decimal(order_result.get("executedQuantity", 0)),
+            remaining_size=Decimal(order_result.get("quantity", 0))
+            - Decimal(order_result.get("executedQuantity", 0)),
         )
 
     @query_retry(default_return=[])
@@ -543,24 +598,31 @@ class BackpackClient(BaseExchangeClient):
             return []
 
         # Return the orders list as OrderInfo objects
-        order_list = active_orders if isinstance(active_orders, list) else active_orders.get('orders', [])
+        order_list = (
+            active_orders
+            if isinstance(active_orders, list)
+            else active_orders.get("orders", [])
+        )
         orders = []
 
         for order in order_list:
             if isinstance(order, dict):
-                if order.get('side', '') == 'Bid':
-                    side = 'buy'
-                elif order.get('side', '') == 'Ask':
-                    side = 'sell'
-                orders.append(OrderInfo(
-                    order_id=order.get('id', ''),
-                    side=side,
-                    size=Decimal(order.get('quantity', 0)),
-                    price=Decimal(order.get('price', 0)),
-                    status=order.get('status', ''),
-                    filled_size=Decimal(order.get('executedQuantity', 0)),
-                    remaining_size=Decimal(order.get('quantity', 0)) - Decimal(order.get('executedQuantity', 0))
-                ))
+                if order.get("side", "") == "Bid":
+                    side = "buy"
+                elif order.get("side", "") == "Ask":
+                    side = "sell"
+                orders.append(
+                    OrderInfo(
+                        order_id=order.get("id", ""),
+                        side=side,
+                        size=Decimal(order.get("quantity", 0)),
+                        price=Decimal(order.get("price", 0)),
+                        status=order.get("status", ""),
+                        filled_size=Decimal(order.get("executedQuantity", 0)),
+                        remaining_size=Decimal(order.get("quantity", 0))
+                        - Decimal(order.get("executedQuantity", 0)),
+                    )
+                )
 
         return orders
 
@@ -568,12 +630,23 @@ class BackpackClient(BaseExchangeClient):
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
         positions_data = self.account_client.get_open_positions()
-        position_amt = 0
+        position_amt = Decimal("0")
         for position in positions_data:
-            if position.get('symbol', '') == self.config.contract_id:
-                position_amt = Decimal(position.get('netQuantity', 0))
+            if position.get("symbol", "") == self.config.contract_id:
+                position_amt = Decimal(position.get("netQuantity", 0))
                 break
+        # Update local position tracking
+        self._local_position = position_amt
         return position_amt
+
+    def get_ws_position(self) -> Decimal:
+        """Get position from local tracking.
+
+        Note: Backpack WebSocket doesn't provide real-time position updates,
+        so we use REST API position cached from last get_account_positions() call.
+        For real-time accuracy, call get_account_positions() before using this.
+        """
+        return getattr(self, "_local_position", Decimal("0"))
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
@@ -584,20 +657,32 @@ class BackpackClient(BaseExchangeClient):
 
         markets = self.public_client.get_markets()
         for market in markets:
-            if (market.get('marketType', '') == 'PERP' and market.get('baseSymbol', '') == ticker and
-                    market.get('quoteSymbol', '') == 'USDC'):
-                self.config.contract_id = market.get('symbol', '')
-                min_quantity = Decimal(market.get('filters', {}).get('quantity', {}).get('minQuantity', 0))
-                self.config.tick_size = Decimal(market.get('filters', {}).get('price', {}).get('tickSize', 0))
+            if (
+                market.get("marketType", "") == "PERP"
+                and market.get("baseSymbol", "") == ticker
+                and market.get("quoteSymbol", "") == "USDC"
+            ):
+                self.config.contract_id = market.get("symbol", "")
+                min_quantity = Decimal(
+                    market.get("filters", {}).get("quantity", {}).get("minQuantity", 0)
+                )
+                self.config.tick_size = Decimal(
+                    market.get("filters", {}).get("price", {}).get("tickSize", 0)
+                )
                 break
 
-        if self.config.contract_id == '':
+        if self.config.contract_id == "":
             self.logger.log("Failed to get contract ID for ticker", "ERROR")
             raise ValueError("Failed to get contract ID for ticker")
 
         if self.config.quantity < min_quantity:
-            self.logger.log(f"Order quantity is less than min quantity: {self.config.quantity} < {min_quantity}", "ERROR")
-            raise ValueError(f"Order quantity is less than min quantity: {self.config.quantity} < {min_quantity}")
+            self.logger.log(
+                f"Order quantity is less than min quantity: {self.config.quantity} < {min_quantity}",
+                "ERROR",
+            )
+            raise ValueError(
+                f"Order quantity is less than min quantity: {self.config.quantity} < {min_quantity}"
+            )
 
         if self.config.tick_size == 0:
             self.logger.log("Failed to get tick size for ticker", "ERROR")

@@ -743,7 +743,18 @@ class DNHedgeBot:
                 # Both GRVT and Backpack expect lowercase string for side
                 order_side = side
 
-                pos_before = self.hedge_client.get_ws_position()
+                # FIX: For Backpack, always use REST API for position before hedge order
+                # because Backpack WebSocket doesn't provide real-time position updates
+                if self.hedge_exchange == "backpack":
+                    try:
+                        pos_before = await self.hedge_client.get_account_positions()
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[{order_type}] Failed to get position via REST: {e}"
+                        )
+                        pos_before = self.hedge_client.get_ws_position()
+                else:
+                    pos_before = self.hedge_client.get_ws_position()
 
                 if order_mode == "TAKER_FALLBACK" and hasattr(
                     self.hedge_client, "place_aggressive_limit_order"
@@ -851,6 +862,12 @@ class DNHedgeBot:
                                 mode="aggressive_taker",
                             )
 
+                            # FIX: Update local hedge position tracking
+                            if side == "buy":
+                                self.local_hedge_position += quantity
+                            else:
+                                self.local_hedge_position -= quantity
+
                             self.hedge_order_filled = True
                             self.order_execution_complete = True
                             self.last_hedge_fill_price = actual_fill_price
@@ -887,6 +904,12 @@ class DNHedgeBot:
                         order_type="hedge",
                         mode="aggressive_taker",
                     )
+
+                    # FIX: Update local hedge position tracking
+                    if side == "buy":
+                        self.local_hedge_position += quantity
+                    else:
+                        self.local_hedge_position -= quantity
 
                     self.hedge_order_filled = True
                     self.order_execution_complete = True
@@ -993,7 +1016,10 @@ class DNHedgeBot:
             self.logger.error(f"[FORCE_CLOSE] Error: {e}")
 
     async def emergency_close_primary(self, quantity: Decimal, failed_hedge_side: str):
-        close_side = failed_hedge_side
+        # FIX: To close the primary position, we need the OPPOSITE of the failed hedge side.
+        # If hedge was trying to SELL (primary was BUY), we need to SELL primary to close.
+        # If hedge was trying to BUY (primary was SELL), we need to BUY primary to close.
+        close_side = "sell" if failed_hedge_side == "sell" else "buy"
 
         self.logger.warning(
             f"[EMERGENCY] Closing PRIMARY position: {close_side.upper()} {quantity}"
@@ -1079,8 +1105,13 @@ class DNHedgeBot:
     async def execute_dn_cycle(
         self, direction: str
     ) -> Tuple[bool, Optional[Decimal], Optional[Decimal]]:
+        # FIX: Reset all state variables to prevent race conditions and stale data
         self.order_execution_complete = False
         self.waiting_for_hedge_fill = False
+        self.current_hedge_side = None
+        self.current_hedge_quantity = None
+        self.current_hedge_price = None
+        self.primary_order_status = None
 
         order_id = await self.place_primary_order(direction, self.order_quantity)
 
@@ -1093,6 +1124,17 @@ class DNHedgeBot:
 
         while not self.order_execution_complete and not self.stop_flag:
             if self.waiting_for_hedge_fill:
+                # FIX: Validate hedge order parameters before placing
+                if (
+                    self.current_hedge_side is None
+                    or self.current_hedge_quantity is None
+                ):
+                    self.logger.error(
+                        f"[CYCLE] Invalid hedge parameters: side={self.current_hedge_side}, "
+                        f"qty={self.current_hedge_quantity}, price={self.current_hedge_price}"
+                    )
+                    return False, None, None
+
                 primary_fill_price = self.current_hedge_price
                 success = await self.place_hedge_order(
                     self.current_hedge_side,
@@ -1171,8 +1213,13 @@ class DNHedgeBot:
 
             await self.reconcile_positions()
 
+            # ============================================================
+            # BUILD Phase: Build position up to max_position
+            # FIX: Use abs() to handle both LONG and SHORT positions correctly
+            # Mean Reversion can enter in either direction based on price spread
+            # ============================================================
             while (
-                self.primary_client.get_ws_position() < self.max_position
+                abs(self.primary_client.get_ws_position()) < self.max_position
                 and not self.stop_flag
             ):
                 cycle_count += 1
@@ -1229,8 +1276,12 @@ class DNHedgeBot:
                 self.logger.info(f"Sleeping {self.sleep_time}s...")
                 await asyncio.sleep(self.sleep_time)
 
+            # ============================================================
+            # UNWIND Phase: Close positions back to zero
+            # FIX: Continue while we have any position (LONG or SHORT)
+            # ============================================================
             while (
-                self.primary_client.get_ws_position() > -self.max_position
+                abs(self.primary_client.get_ws_position()) > Decimal("0")
                 and not self.stop_flag
             ):
                 cycle_count += 1
@@ -1272,7 +1323,8 @@ class DNHedgeBot:
                     continue
 
                 # For UNWIND, direction is based on current position (close it)
-                direction = "buy" if self.primary_position > 0 else "sell"
+                # FIX: To close LONG position, we need to SELL. To close SHORT, we need to BUY.
+                direction = "sell" if self.primary_position > 0 else "buy"
 
                 success, primary_price, hedge_price = await self.execute_dn_cycle(
                     direction
