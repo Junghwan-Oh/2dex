@@ -85,8 +85,16 @@ class DNHedgeBot:
         self.primary_position = Decimal("0")
         self.hedge_position = Decimal("0")
 
+        # Local position tracking (like original hedge_mode_grvt.py)
         self.local_primary_position = Decimal("0")
         self.local_hedge_position = Decimal("0")
+        
+        # Position change tracking for fill confirmation
+        self.last_primary_fill_size = Decimal("0")
+        self.last_hedge_fill_size = Decimal("0")
+        self.last_primary_fill_side = None
+        self.last_hedge_fill_side = None
+        
         self.use_local_tracking = True
         self.reconcile_interval = 1  # Reconcile every cycle for tighter drift control
 
@@ -453,34 +461,47 @@ class DNHedgeBot:
         return primary_pos, hedge_pos
 
     async def reconcile_positions(self):
-        # Get WebSocket positions first (faster, no API calls)
-        ws_primary = self.primary_client.get_ws_position()
-        ws_hedge = self.hedge_client.get_ws_position()
+        """Reconcile positions from both exchanges using multiple sources."""
+        try:
+            # Get WebSocket positions first (faster, no API calls)
+            ws_primary = self.primary_client.get_ws_position()
+            ws_hedge = self.hedge_client.get_ws_position()
 
-        # Calculate net delta using WS values (real-time)
-        ws_net_delta = ws_primary + ws_hedge
+            # Also get REST API positions for confirmation
+            api_primary, api_hedge = await self.get_positions(force_api=True)
 
-        self.logger.info(
-            f"[RECONCILE] P(WS)={ws_primary}, H(WS)={ws_hedge}, NetDelta={ws_net_delta}"
-        )
+            # Use the larger absolute position (most reliable source)
+            primary_pos = ws_primary if abs(ws_primary) >= abs(api_primary) else api_primary
+            hedge_pos = ws_hedge if abs(ws_hedge) >= abs(api_hedge) else api_hedge
 
-        # Sync local tracking with WS positions
-        if abs(
-            self.local_primary_position - ws_primary
-        ) > self.order_quantity * Decimal("0.5"):
-            self.logger.warning(
-                f"[RECONCILE] Primary local/WS mismatch! Local={self.local_primary_position} WS={ws_primary}"
+            # Update instance variables
+            self.primary_position = primary_pos
+            self.hedge_position = hedge_pos
+
+            # Update local tracking to match actual positions
+            self.local_primary_position = primary_pos
+            self.local_hedge_position = hedge_pos
+
+            # Calculate net delta
+            net_delta = primary_pos + hedge_pos
+
+            self.logger.info(
+                f"[RECONCILE] PRIMARY: {primary_pos} (WS:{ws_primary}, API:{api_primary}) | "
+                f"HEDGE: {hedge_pos} (WS:{ws_hedge}, API:{api_hedge}) | Net: {net_delta}"
             )
-            self.local_primary_position = ws_primary
 
-        # Auto-recovery: If net delta exceeds threshold, stop and warn
-        if abs(ws_net_delta) > self.order_quantity * Decimal("1.5"):
-            self.logger.warning(
-                f"[RECONCILE] Net delta drift detected: {ws_net_delta}, initiating auto-recovery"
-            )
-            self.logger.warning(
-                f"[RECONCILE] Manual action may be required. PRIMARY(WS)={ws_primary}, HEDGE(WS)={ws_hedge}"
-            )
+            # Check for position imbalance (like original hedge_mode_grvt.py)
+            if abs(net_delta) > self.order_quantity * Decimal("2"):
+                self.logger.error(
+                    f"[RECONCILE] CRITICAL: Position imbalance too large! "
+                    f"Primary: {primary_pos}, Hedge: {hedge_pos}, Net: {net_delta}"
+                )
+                self.logger.error("[RECONCILE] Stopping bot to prevent further losses")
+                self.stop_flag = True
+
+        except Exception as e:
+            self.logger.error(f"Error reconciling positions: {e}")
+            self.logger.error(traceback.format_exc())
 
     async def place_primary_order(self, side: str, quantity: Decimal) -> Optional[str]:
         self.primary_order_status = None
@@ -928,11 +949,33 @@ class DNHedgeBot:
                     side=order_side,
                 )
 
+            # Update local position tracking
             if close_side == "buy":
-                self.local_primary_position += quantity
-                self.local_primary_position += quantity
-            else:
                 self.local_primary_position -= quantity
+            else:
+                self.local_primary_position += quantity
+
+            # Wait for fill confirmation
+            start_wait = time.time()
+            filled = False
+            
+            while time.time() - start_wait < 10 and not filled:
+                await asyncio.sleep(0.5)
+                
+                # Check via REST API (more reliable)
+                try:
+                    pos_current = await self.primary_client.get_account_positions()
+                    pos_change = abs(pos_current - pos_before)
+                    if pos_change >= quantity * Decimal("0.99"):
+                        filled = True
+                        self.logger.warning(
+                            f"[EMERGENCY] PRIMARY position closed: {pos_before} -> {pos_current}"
+                        )
+                except Exception as e:
+                    self.logger.debug(f"[EMERGENCY] Position check failed: {e}")
+
+            if not filled:
+                self.logger.error(f"[EMERGENCY] PRIMARY position close NOT confirmed!")
 
             self.logger.warning(
                 f"[EMERGENCY] Close order placed: {close_side.upper()} {quantity} @ {price}"
@@ -1043,8 +1086,20 @@ class DNHedgeBot:
                 self.hedge_position = self.hedge_client.get_ws_position()
                 net_delta = self.primary_position + self.hedge_position
 
+                # Check position imbalance (like original hedge_mode_grvt.py)
+                net_delta = self.local_primary_position + self.local_hedge_position
+                if abs(net_delta) > self.order_quantity * Decimal("2"):
+                    self.logger.error(
+                        f"[BUILD] CRITICAL: Position imbalance too large! "
+                        f"Primary: {self.local_primary_position}, Hedge: {self.local_hedge_position}, Net: {net_delta}"
+                    )
+                    self.logger.error("[BUILD] Stopping bot to prevent further losses")
+                    self.stop_flag = True
+                    break
+
                 self.logger.info(
-                    f"[BUILD] PRIMARY(WS): {self.primary_position} | HEDGE(WS): {self.hedge_position} | Net: {net_delta}"
+                    f"[BUILD] PRIMARY(WS): {self.primary_position} | HEDGE(WS): {self.hedge_position} | "
+                    f"Local: {self.local_primary_position}/{self.local_hedge_position} | Net: {net_delta}"
                 )
 
                 # Tighter position imbalance threshold: 2x instead of 5x
