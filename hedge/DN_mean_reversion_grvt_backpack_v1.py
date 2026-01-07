@@ -949,22 +949,42 @@ class DNHedgeBot:
                 if client is None:
                     continue
 
-                # Get current position
+                # FIX: Check BOTH WS and API positions, use larger absolute value
                 ws_pos = client.get_ws_position()
-                if ws_pos == 0:
+                try:
+                    api_pos = await client.get_account_positions()
+                except Exception as e:
+                    self.logger.debug(
+                        f"[FORCE_CLOSE] API position check failed for {exchange_name}: {e}"
+                    )
+                    api_pos = Decimal("0")
+
+                # Use the position with larger absolute value (more conservative)
+                if abs(api_pos) > abs(ws_pos):
+                    actual_pos = api_pos
+                    self.logger.debug(
+                        f"[FORCE_CLOSE] {exchange_name} using API position: {api_pos} (WS: {ws_pos})"
+                    )
+                else:
+                    actual_pos = ws_pos
+                    self.logger.debug(
+                        f"[FORCE_CLOSE] {exchange_name} using WS position: {ws_pos} (API: {api_pos})"
+                    )
+
+                if actual_pos == 0:
                     continue
 
                 self.logger.warning(
-                    f"[FORCE_CLOSE] {exchange_name} has residual position: {ws_pos}, forcing close"
+                    f"[FORCE_CLOSE] {exchange_name} has residual position: {actual_pos}, forcing close"
                 )
 
-                # Determine close side
-                if ws_pos > 0:
+                # Determine close side based on actual_pos
+                if actual_pos > 0:
                     close_side = "sell"
                 else:
                     close_side = "buy"
 
-                close_qty = abs(ws_pos)
+                close_qty = abs(actual_pos)
 
                 # M4: Determine contract_id and tick_size for this client
                 if exchange_name == "PRIMARY":
@@ -1083,6 +1103,54 @@ class DNHedgeBot:
 
             if not filled:
                 self.logger.error(f"[EMERGENCY] PRIMARY position close NOT confirmed!")
+                # FIX: Retry emergency close up to 3 times
+                for retry in range(3):
+                    self.logger.warning(
+                        f"[EMERGENCY] Retry {retry + 1}/3: Attempting to close again..."
+                    )
+                    try:
+                        # Get fresh BBO
+                        best_bid, best_ask = await self.primary_client.fetch_bbo_prices(
+                            self.primary_contract_id
+                        )
+                        if close_side == "buy":
+                            retry_price = best_ask * Decimal("1.01")  # More aggressive
+                        else:
+                            retry_price = best_bid * Decimal("0.99")
+
+                        if self.primary_exchange == "grvt":
+                            await self.primary_client.place_market_order(
+                                contract_id=self.primary_contract_id,
+                                quantity=quantity,
+                                side=close_side,
+                            )
+                        else:
+                            await self.primary_client.place_post_only_order(
+                                contract_id=self.primary_contract_id,
+                                quantity=quantity,
+                                price=retry_price,
+                                side=close_side,
+                            )
+
+                        await asyncio.sleep(3)
+                        pos_after_retry = (
+                            await self.primary_client.get_account_positions()
+                        )
+                        if abs(pos_after_retry) < abs(pos_before) * Decimal("0.1"):
+                            self.logger.warning(
+                                f"[EMERGENCY] Retry {retry + 1} succeeded: position closed"
+                            )
+                            filled = True
+                            break
+                    except Exception as retry_err:
+                        self.logger.error(
+                            f"[EMERGENCY] Retry {retry + 1} failed: {retry_err}"
+                        )
+
+                if not filled:
+                    self.logger.error(
+                        "[EMERGENCY] All retries failed! Manual intervention may be required."
+                    )
 
             self.logger.warning(
                 f"[EMERGENCY] Close order placed: {close_side.upper()} {quantity} @ {price}"
@@ -1317,10 +1385,25 @@ class DNHedgeBot:
 
                 # Mean Reversion UNWIND: Check spread before unwinding
                 # M1: Use should_enter_trade() for spread check, but determine direction from position
-                arb_direction = await self.should_enter_trade()
-                if arb_direction is None:
-                    await asyncio.sleep(1)
-                    continue
+                # FIX: Add timeout to prevent infinite loop waiting for spread
+                if not hasattr(self, "_unwind_start_time"):
+                    self._unwind_start_time = time.time()
+
+                unwind_timeout = 300  # 5 minutes max wait for spread
+                if time.time() - self._unwind_start_time > unwind_timeout:
+                    self.logger.warning(
+                        f"[UNWIND] Spread wait timeout ({unwind_timeout}s), forcing close without spread check"
+                    )
+                    # Reset timeout tracker and proceed with force close
+                    delattr(self, "_unwind_start_time")
+                else:
+                    arb_direction = await self.should_enter_trade()
+                    if arb_direction is None:
+                        await asyncio.sleep(1)
+                        continue
+                    # Reset timeout tracker on successful spread check
+                    if hasattr(self, "_unwind_start_time"):
+                        delattr(self, "_unwind_start_time")
 
                 # For UNWIND, direction is based on current position (close it)
                 # FIX: To close LONG position, we need to SELL. To close SHORT, we need to BUY.
@@ -1344,6 +1427,25 @@ class DNHedgeBot:
                     await asyncio.sleep(5)
 
         final_primary, final_hedge = await self.get_positions(force_api=True)
+
+        # FIX: Force close any residual positions before exiting
+        net_delta = final_primary + final_hedge
+        if abs(final_primary) > Decimal("0.0001") or abs(final_hedge) > Decimal(
+            "0.0001"
+        ):
+            self.logger.warning(
+                f"[CLEANUP] Residual positions detected - PRIMARY: {final_primary}, HEDGE: {final_hedge}, Net: {net_delta}"
+            )
+            self.logger.warning("[CLEANUP] Forcing close of all residual positions...")
+            await self.force_close_all_positions()
+
+            # Re-check positions after force close
+            await asyncio.sleep(3)
+            final_primary, final_hedge = await self.get_positions(force_api=True)
+            self.logger.warning(
+                f"[CLEANUP] After force close - PRIMARY: {final_primary}, HEDGE: {final_hedge}"
+            )
+
         avg_pnl_bps = (
             (self.total_gross_pnl / self.total_volume) * Decimal("10000")
             if self.total_volume > 0
