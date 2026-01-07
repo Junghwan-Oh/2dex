@@ -227,6 +227,15 @@ class BackpackClient(BaseExchangeClient):
         """Get the exchange name."""
         return "backpack"
 
+    def get_ws_position(self) -> Decimal:
+        """Get position from local WebSocket tracking.
+
+        Returns the locally tracked position based on order fills.
+        This may lag behind the actual position, use get_account_positions()
+        for authoritative position data.
+        """
+        return self._local_position
+
     def setup_order_update_handler(self, handler) -> None:
         """Setup order update handler for WebSocket."""
         self._order_update_handler = handler
@@ -262,6 +271,17 @@ class BackpackClient(BaseExchangeClient):
             order_type = "CLOSE" if is_close_order else "OPEN"
 
             if event_type == "orderFill" and quantity == fill_quantity:
+                # Update local position tracking
+                fill_qty = Decimal(fill_quantity)
+                if order_side == "buy":
+                    self._local_position += fill_qty
+                else:
+                    self._local_position -= fill_qty
+                self.logger.log(
+                    f"[WS_POSITION] Updated position: {self._local_position} ({order_side} {fill_qty})",
+                    "INFO",
+                )
+
                 if self._order_update_handler:
                     self._order_update_handler(
                         {
