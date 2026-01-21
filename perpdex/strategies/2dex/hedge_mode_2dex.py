@@ -28,10 +28,10 @@ load_dotenv()
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from exchanges.factory import ExchangeFactory
-from exchanges.base import BaseExchangeClient, OrderResult, OrderInfo
-from helpers.progressive_sizing import ProgressiveSizingManager
-from helpers.rebate_tracker import RebateTracker
+from .exchanges.factory import ExchangeFactory
+from .exchanges.base import BaseExchangeClient, OrderResult, OrderInfo
+from .helpers.progressive_sizing import ProgressiveSizingManager
+from .helpers.rebate_tracker import RebateTracker
 
 
 class Config:
