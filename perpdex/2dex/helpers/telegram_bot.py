@@ -19,10 +19,6 @@ class TelegramBot:
         self.session.verify = certifi.where()
         self.session.timeout = 10
 
-        # For receiving commands
-        self.lastUpdateId = 0
-        self.stopCommands = ['stop', 'kill', '/stop', '/kill', 'STOP', 'KILL']
-
     def __enter__(self):
         return self
 

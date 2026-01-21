@@ -30,6 +30,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchanges.factory import ExchangeFactory
 from exchanges.base import BaseExchangeClient, OrderResult, OrderInfo
+from helpers.progressive_sizing import ProgressiveSizingManager
+from helpers.rebate_tracker import RebateTracker
 
 
 class Config:
@@ -140,6 +142,39 @@ class HedgeBot2DEX:
         self.entryPrice = Decimal('0')  # Entry price for TP calculation
         self.openDirection = None  # Original open direction for close cycle
         self.currentOrderId = None  # Track current order ID for WebSocket updates
+
+        # Progressive Sizing Manager (STORY-002)
+        # Config format matches progressive_sizing.py requirements
+        progressiveSizingConfig = {
+            'progressive_sizing': {
+                'enabled': True,
+                'initial_size': 10.0,  # Start with $10 (key corrected from 'initial_size_usd')
+                'size_multiplier': 2.0,   # Double on each phase (key corrected from 'phase_multiplier')
+                'validation_count': 3,     # Require 3 consecutive successes before advancing
+                'max_position_value_usd': 500.0,  # Maximum position size
+                'downgrade_on_failure': True,     # Downgrade on consecutive failures
+                'max_consecutive_failures': 2     # Downgrade after 2 failures
+            }
+        }
+        self.progressiveSizing = ProgressiveSizingManager(
+            config=progressiveSizingConfig,
+            ticker=self.ticker,
+            logger=self.logger
+        )
+
+        # Rebate Tracker (STORY-004)
+        # Tracks GRVT rebate milestones: $1, $5, $10, $25, $50, $100
+        rebateTrackerConfig = {
+            'rebate_tracking': {  # Key corrected from 'rebate' to 'rebate_tracking'
+                'enabled': True,
+                'milestones': [1.0, 5.0, 10.0, 25.0, 50.0, 100.0]
+            }
+        }
+        self.rebateTracker = RebateTracker(
+            config=rebateTrackerConfig,
+            ticker=self.ticker,
+            logger=self.logger
+        )
 
     def _initializeCsvFile(self):
         """Initialize CSV file with headers if it doesn't exist."""
@@ -334,6 +369,11 @@ class HedgeBot2DEX:
             self.logger.info(f"[BBO] PRIMARY: Bid={bestBid}, Ask={bestAsk}")
 
             # Step 2-3: Place order on PRIMARY (Maker or Taker based on strategy)
+            # Calculate dynamic order size using progressive sizing
+            currentPrice = bestBid if direction == 'sell' else bestAsk
+            orderSize = self.progressiveSizing.get_current_size(currentPrice)
+            self.logger.info(f"[ProgressiveSizing] Using dynamic orderSize: {orderSize} (current phase: {self.progressiveSizing.current_phase}/{self.progressiveSizing.max_phase})")
+
             filledSize = Decimal('0')
             orderFilled = False
             executionPrice = None
@@ -343,7 +383,7 @@ class HedgeBot2DEX:
                 self.logger.info(f"[ORDER] Placing {direction.upper()} TAKER (market) on PRIMARY")
                 primaryResult = await self.primaryClient.place_market_order(
                     self.primaryContractId,
-                    self.orderQuantity,
+                    orderSize,
                     direction
                 )
 
@@ -353,7 +393,7 @@ class HedgeBot2DEX:
 
                 # Market orders fill immediately
                 orderFilled = True
-                filledSize = self.orderQuantity
+                filledSize = orderSize
                 executionPrice = primaryResult.price if primaryResult.price else 'market'
                 self.logger.info(f"[OK] PRIMARY taker order FILLED immediately @ {executionPrice}")
                 self.logTradeToCsv(
@@ -367,7 +407,7 @@ class HedgeBot2DEX:
                 self.logger.info(f"[ORDER] Placing {direction.upper()} MAKER (post-only) on PRIMARY")
                 primaryResult = await self.primaryClient.place_open_order(
                     self.primaryContractId,
-                    self.orderQuantity,
+                    orderSize,
                     direction
                 )
 
@@ -381,7 +421,7 @@ class HedgeBot2DEX:
                 self.logger.info(f"[OK] PRIMARY maker order placed: ID={primaryResult.order_id} @ {makerPrice}")
                 self.logTradeToCsv(
                     self.primaryExchangeName, 'PRIMARY_MAKER', direction,
-                    str(makerPrice), str(self.orderQuantity), 'placed'
+                    str(makerPrice), str(orderSize), 'placed'
                 )
 
                 # Active monitoring with cancel-and-replace (restored from original template)
@@ -485,6 +525,7 @@ class HedgeBot2DEX:
             # Step 4: Validate fill (common for both strategies)
             if not orderFilled or filledSize <= 0:
                 self.logger.error(f"[ERROR] PRIMARY order validation failed: orderFilled={orderFilled}, filledSize={filledSize}")
+                self.progressiveSizing.record_failure()
                 return False
 
             # Update fill rate stats
@@ -497,6 +538,13 @@ class HedgeBot2DEX:
                     self.primaryExchangeName, 'PRIMARY_MAKER', direction,
                     str(executionPrice), str(filledSize), 'filled'
                 )
+
+            # Track rebates (GRVT maker rebate: 0.02% = 0.0002)
+            if self.primaryExchangeName == 'grvt' and not self.useTaker:
+                rebateRate = Decimal('0.0002')  # 0.02%
+                rebateAmount = filledSize * executionPrice * rebateRate
+                self.rebateTracker.record_rebate(rebateAmount)
+                self.logger.info(f"[Rebate] Recorded ${rebateAmount:.4f} from GRVT maker order")
 
             # Step 5: Place PASSIVE MAKER limit order on HEDGE for filled amount
             self.logger.info(f"[HEDGE] Placing {oppositeDirection.upper()} PASSIVE MAKER on HEDGE for {filledSize}")
@@ -514,6 +562,7 @@ class HedgeBot2DEX:
                     self.hedgeExchangeName, 'HEDGE', oppositeDirection,
                     'N/A', str(filledSize), 'FAILED'
                 )
+                self.progressiveSizing.record_failure()
                 return False
 
             hedgeOrderId = hedgeResult.order_id
@@ -585,6 +634,7 @@ class HedgeBot2DEX:
             if not hedgeFilled:
                 self.logger.error("[ERROR] HEDGE order not filled")
                 self.positionImbalance += filledSize if direction == 'buy' else -filledSize
+                self.progressiveSizing.record_failure()
                 return False
 
             hedgePrice = hedgeMakerPrice
@@ -637,11 +687,16 @@ class HedgeBot2DEX:
             self.positionOpen = True
             self.logger.info(f"[POSITION] OPEN complete: currentPosition={self.currentPosition}")
 
+            # Record trading success for progressive sizing
+            self.progressiveSizing.record_success()
+            self.logger.info(f"[ProgressiveSizing] Trade successful, phase status: {self.progressiveSizing.get_status_summary()}")
+
             self.logger.info(f"[DONE] Open cycle {self.orderCounter} COMPLETE")
             return True
 
         except Exception as e:
             self.logger.error(f"[ERROR] Open cycle error: {e}")
+            self.progressiveSizing.record_failure()
             return False
 
     async def executeCloseCycle(self, direction: str) -> bool:

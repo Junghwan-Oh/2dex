@@ -1,5 +1,5 @@
 """
-Helper modules for perp-dex-toolkitkit.
+Helper modules for perp-dex-tools.
 """
 
 from .logger import TradingLogger
