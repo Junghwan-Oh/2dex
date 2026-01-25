@@ -430,9 +430,120 @@ NET_DELTA_TOLERANCE = 1%       # Tight control
 3. **Consider limit orders**: Alternative to market orders
 4. **Real-time liquidity checks**: Pre-trade validation
 
+
+### Test 4: ETH 0.5 × 10 Iterations (GRVT Limit Validation) - UPDATED 2026-01-25
+
+**Purpose**: Final validation of GRVT 0.2 ETH safety limit enforcement
+
+**Test Duration**: 43 minutes (aborted - infinite loop detected)
+
+**Results**:
+- **Cycles**: Infinite (never progressed past Iteration 1/10)
+- **GRVT Failures**: 100% (all hedge orders blocked by safety limit)
+- **Backpack Orders**: All filled successfully (0.5 ETH each)
+- **Emergency Recovery**: Activated correctly every time
+- **NetDelta**: Maintained at 0.0 throughout
+
+**Status**: INFINITE LOOP - ABORTED AFTER 43 MINUTES
+
+**Critical Discovery**: Incomplete GRVT limit implementation causing infinite loop
+
+### Root Cause Analysis
+
+#### 1. GRVT Limit Check Location Issue
+**File**: hedge/exchanges/grvt.py (Lines 404-411)
+**Problem**: Check happens AFTER primary order is already filled. No early validation BEFORE opening primary position.
+
+#### 2. Trading Loop Logic Flaw
+**File**: hedge/DN_alternate_backpack_grvt.py (Lines 1620-1635)
+**Problem**:
+- max_position (5 ETH) too large compared to order_quantity (0.5 ETH)
+- Loop condition: abs(0) < 5 is always True after emergency close
+- No exit mechanism when hedge consistently fails
+- Emergency close resets position to 0, triggering infinite repetition
+
+**Loop Pattern**:
+1. Backpack BUY 0.5 ETH filled (primary_position = 0.5)
+2. GRVT SELL 0.5 ETH blocked (safety limit: 0.2 ETH max)
+3. 4 retries all blocked
+4. Emergency close: Backpack SELL 0.5 ETH (primary_position = 0)
+5. While loop condition: abs(0) < 5 = True → repeat from step 1
+6. Infinite loop never reaches Iteration 2
+
+#### 3. Missing Safety Layers
+
+**Absent Pre-Trade Validation**:
+- No check if order_quantity exceeds GRVT limit BEFORE placing primary order
+- No validation if hedge is possible given current order size
+- No early termination when hedge failure is predictable
+
+**Absent Loop Exit Logic**:
+- No maximum retry count per BUILD phase
+- No hedge failure rate monitoring
+- No "give up after N consecutive hedge failures" logic
+
+### Required Fixes
+
+#### Solution 1: Pre-Trade Validation (CRITICAL)
+**Location**: DN_alternate_backpack_grvt.py - _pre_trade_check() method (Lines 1417-1460)
+
+**Add this validation**:
+```python
+# GRVT order size validation
+if self.hedge_exchange.lower() == "grvt":
+    GRVT_MAX_ORDER_SIZE = Decimal("0.2")
+    if self.order_quantity > GRVT_MAX_ORDER_SIZE:
+        raise ValueError(
+            f"[SAFETY] Order quantity {self.order_quantity} ETH "
+            f"exceeds GRVT maximum {GRVT_MAX_ORDER_SIZE} ETH. "
+            f"Please reduce --size parameter to 0.2 or less."
+        )
+```
+
+#### Solution 2: Loop Exit Logic (REQUIRED)
+**Location**: DN_alternate_backpack_grvt.py - trading_loop() method (Lines 1620-1635)
+
+**Add failure counter**:
+```python
+consecutive_hedge_failures = 0
+MAX_CONSECUTIVE_FAILURES = 3
+
+# In the BUILD phase loop:
+if not hedge_success:
+    consecutive_hedge_failures += 1
+    if consecutive_hedge_failures >= MAX_CONSECUTIVE_FAILURES:
+        self.logger.error(
+            f"[SAFETY] {consecutive_hedge_failures} consecutive hedge failures. "
+            f"Aborting BUILD phase to prevent infinite loop."
+        )
+        break  # Exit BUILD phase
+else:
+    consecutive_hedge_failures = 0  # Reset on success
+```
+
+### Lessons Learned
+
+1. **Early Validation > Late Validation**
+   - Pre-trade checks prevent problems before they occur
+   - Post-trade checks (current GRVT limit) are too late
+
+2. **Loop Exit Conditions Are Critical**
+   - Every while loop needs exit conditions
+   - Position-based loops dangerous when position can reset
+   - Failure counters prevent infinite repetition
+
+3. **Safety Limits Must Be Comprehensive**
+   - GRVT limit in grvt.py alone is insufficient
+   - Need validation at multiple layers
+
+4. **Testing Edge Cases Matters**
+   - 0.2 ETH test worked perfectly
+   - 0.5 ETH test revealed infinite loop bug
+
+
 ---
 
-## Conclusion
+## Conclusion (UPDATED)
 
 OMC v4 successfully transformed a failing system (ETH 1.0: $32 loss, position explosion) into a robust, scalable trading bot through:
 
@@ -442,13 +553,19 @@ OMC v4 successfully transformed a failing system (ETH 1.0: $32 loss, position ex
 4. **Emergency Validation**: Proven recovery under real failure conditions
 5. **GRVT Limit Discovery**: Identified 0.2 ETH optimal order size
 
-**Production Status**: Ready for deployment with 0.2 ETH order size limit.
+**CRITICAL GAP DISCOVERED (2026-01-25)**: GRVT limit implementation is incomplete, causing infinite loops when order_quantity exceeds exchange limits.
+
+**Production Status**:
+- ✅ READY for 0.2 ETH orders
+- ❌ NOT READY for orders >0.2 ETH until pre-trade validation is implemented
 
 **Key Achievement**: PnL% improved 10.6x at scale, demonstrating that larger orders execute more efficiently in percentage terms.
+
+**New Requirement**: All orders must be validated against exchange limits BEFORE trading begins.
 
 ---
 
 **Prepared by**: Claude (OMC v4 Analysis)
-**Date**: 2025-01-25
-**Version**: 2.0 (Complete Test Summary)
-**Status**: Production Ready ✅
+**Date**: 2025-01-25 (Updated: 2026-01-25)
+**Version**: 3.0 (Updated with ETH 0.5 infinite loop analysis)
+**Status**: Production Ready for ≤0.2 ETH - Requires Pre-Trade Validation for Larger Orders
