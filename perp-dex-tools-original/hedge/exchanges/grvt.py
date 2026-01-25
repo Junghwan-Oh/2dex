@@ -399,7 +399,17 @@ class GrvtClient(BaseExchangeClient):
         """Place a market order with GRVT using official SDK.
 
         Improved: Wait for fill confirmation and return OrderResult.
+        OMC v4: Enforce GRVT liquidity limit of 0.2 ETH based on testing.
         """
+        # OMC v4: GRVT liquidity limit enforcement
+        MAX_GRVT_ORDER_SIZE = Decimal("0.2")  # 0.2 ETH maximum based on testing
+        if quantity > MAX_GRVT_ORDER_SIZE:
+            raise ValueError(
+                f"[SAFETY] GRVT order size {quantity} ETH exceeds maximum {MAX_GRVT_ORDER_SIZE} ETH. "
+                f"Testing shows GRVT cannot reliably fill orders >0.2 ETH. "
+                f"Please split into smaller orders or reduce quantity."
+            )
+
         # Get current BBO for price reference
         best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
         expected_price = best_ask if side == "buy" else best_bid
