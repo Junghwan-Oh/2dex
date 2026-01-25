@@ -56,6 +56,7 @@ class OrderInfo:
     filled_size: Decimal = 0.0
     remaining_size: Decimal = 0.0
     cancel_reason: str = ''
+    avg_fill_price: Decimal = 0.0
 
 
 class BaseExchangeClient(ABC):

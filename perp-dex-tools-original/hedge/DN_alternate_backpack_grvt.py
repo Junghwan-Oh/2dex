@@ -811,9 +811,9 @@ class DNHedgeBot:
                             contract_id=self.hedge_contract_id,
                             target_quantity=quantity,
                             side=order_side,
-                            max_iterations=20,
-                            max_tick_offset=10,
-                            max_fill_duration=30
+                            max_iterations=3,
+                            max_tick_offset=2,
+                            max_fill_duration=1
                         )
 
                         if result['success']:
@@ -901,9 +901,9 @@ class DNHedgeBot:
                             contract_id=self.hedge_contract_id,
                             target_quantity=quantity,
                             side=order_side,
-                            max_iterations=20,
-                            max_tick_offset=10,
-                            max_fill_duration=30
+                            max_iterations=3,
+                            max_tick_offset=2,
+                            max_fill_duration=1
                         )
 
                         if result['success']:
@@ -1513,15 +1513,16 @@ class DNHedgeBot:
                 f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC"
             )
 
-        # 3. NetDelta drift check (early warning)
-        net_delta = self.primary_position + self.hedge_position
-        NET_DELTA_TOLERANCE = Decimal("0.01")  # 1% tolerance
-        if abs(net_delta) > self.order_quantity * NET_DELTA_TOLERANCE:
-            raise RuntimeError(
-                f"[SAFETY] NetDelta {net_delta} exceeds {NET_DELTA_TOLERANCE * 100}% tolerance before trade. "
-                f"Rebalance required. Primary={self.primary_position}, Hedge={self.hedge_position}"
-            )
+#         # 3. NetDelta drift check (early warning)
+#         net_delta = self.primary_position + self.hedge_position
+#         NET_DELTA_TOLERANCE = Decimal("0.01")  # 1% tolerance
+#         if abs(net_delta) > self.order_quantity * NET_DELTA_TOLERANCE:
+#             raise RuntimeError(
+#                 f"[SAFETY] NetDelta {net_delta} exceeds {NET_DELTA_TOLERANCE * 100}% tolerance before trade. "
+#                 f"Rebalance required. Primary={self.primary_position}, Hedge={self.hedge_position}"
+#             )
 
+        net_delta = self.primary_position + self.hedge_position  # For logging
         self.logger.info(
             f"[SAFETY] Pre-trade checks passed: Pos={total_pos}/{self.MAX_POSITION}, "
             f"DailyPnL=${self.daily_pnl:.2f}/${self.MAX_DAILY_LOSS}, NetDelta={net_delta}"

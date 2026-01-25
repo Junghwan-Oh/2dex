@@ -738,8 +738,9 @@ class GrvtClient(BaseExchangeClient):
         tick_offset = 0
         price_history = []
 
-        self.logger.info(
-            f"[ITERATIVE] Starting {side.upper()} {target_quantity} ETH fill"
+        self.logger.log(
+            f"[ITERATIVE] Starting {side.upper()} {target_quantity} ETH fill",
+            "INFO"
         )
 
         while total_filled < target_quantity:
@@ -748,7 +749,7 @@ class GrvtClient(BaseExchangeClient):
 
             if iteration > max_iterations:
                 reason = f"Max iterations ({max_iterations}) exceeded"
-                self.logger.error(f"[ITERATIVE] {reason}")
+                self.logger.log(f"[ITERATIVE] {reason}", "ERROR")
                 return {
                     'total_filled': total_filled,
                     'total_fees': total_fees,
@@ -760,7 +761,7 @@ class GrvtClient(BaseExchangeClient):
 
             if tick_offset > max_tick_offset:
                 reason = f"Max tick offset ({max_tick_offset}) exceeded"
-                self.logger.error(f"[ITERATIVE] {reason}")
+                self.logger.log(f"[ITERATIVE] {reason}", "ERROR")
                 return {
                     'total_filled': total_filled,
                     'total_fees': total_fees,
@@ -772,7 +773,7 @@ class GrvtClient(BaseExchangeClient):
 
             if time.time() - start_time > max_fill_duration:
                 reason = f"Max fill duration ({max_fill_duration}s) exceeded"
-                self.logger.error(f"[ITERATIVE] {reason}")
+                self.logger.log(f"[ITERATIVE] {reason}", "ERROR")
                 return {
                     'total_filled': total_filled,
                     'total_fees': total_fees,
@@ -811,7 +812,7 @@ class GrvtClient(BaseExchangeClient):
                 )
 
                 if not order_result:
-                    self.logger.warning(f"[ITERATIVE] Order failed (iteration {iteration})")
+                    self.logger.log(f"[ITERATIVE] Order failed (iteration {iteration})", "WARNING")
                     tick_offset += 1
                     continue
 
@@ -826,8 +827,8 @@ class GrvtClient(BaseExchangeClient):
                 order_info = await self.get_order_info(client_order_id=client_order_id)
 
                 if order_info and order_info.status == "FILLED":
-                    filled_quantity = order_info.executed_quantity
-                    fill_price = order_info.price
+                    filled_quantity = order_info.filled_size
+                    fill_price = order_info.avg_fill_price
 
                     total_filled += filled_quantity
                     price_history.append(float(fill_price))
@@ -836,7 +837,7 @@ class GrvtClient(BaseExchangeClient):
                     fee = filled_quantity * fill_price * Decimal("0.0005")
                     total_fees += fee
 
-                    self.logger.info(
+                    self.logger.log(
                         f"[ITERATIVE] Iteration {iteration}: Filled {filled_quantity} @ ${fill_price} "
                         f"(offset: {tick_offset} ticks, total: {total_filled}/{target_quantity})"
                     )
@@ -844,7 +845,7 @@ class GrvtClient(BaseExchangeClient):
                     # Check if we're done
                     if total_filled >= target_quantity:
                         avg_price = sum(price_history) / len(price_history)
-                        self.logger.info(
+                        self.logger.log(
                             f"[ITERATIVE] SUCCESS: Filled {total_filled} ETH @ avg ${avg_price:.2f} "
                             f"in {iteration} iterations"
                         )
@@ -873,13 +874,13 @@ class GrvtClient(BaseExchangeClient):
 
                 else:
                     # Order not filled or failed
-                    self.logger.warning(
-                        f"[ITERATIVE] Order not filled (iteration {iteration}, status: {order_info.status if order_info else 'UNKNOWN'})"
+                    self.logger.log(
+                        f"[ITERATIVE] Partial fill: {filled_quantity}/{remaining} ETH filled",
+                        "WARNING"
                     )
-                    tick_offset += 1
 
             except Exception as e:
-                self.logger.error(f"[ITERATIVE] Exception in iteration {iteration}: {e}")
+                self.logger.log(f"[ITERATIVE] Exception in iteration {iteration}: {e}", "ERROR")
                 tick_offset += 1
                 await asyncio.sleep(1)  # Wait before retry
 
@@ -949,6 +950,11 @@ class GrvtClient(BaseExchangeClient):
             remaining_size=(
                 Decimal(state.get("book_size", ["0"])[0])
                 if isinstance(state.get("book_size"), list)
+                else Decimal(0)
+            ),
+            avg_fill_price=(
+                Decimal(state.get("avg_fill_price", ["0"])[0])
+                if isinstance(state.get("avg_fill_price"), list)
                 else Decimal(0)
             ),
         )
