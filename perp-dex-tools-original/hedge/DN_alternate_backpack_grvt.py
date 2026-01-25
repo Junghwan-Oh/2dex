@@ -130,6 +130,12 @@ class DNHedgeBot:
         self.use_local_tracking = True
         self.reconcile_interval = 1  # Reconcile every cycle for tighter drift control
 
+        # OMC v4 Safety limits
+        self.MAX_POSITION = Decimal("5")  # Maximum 5 ETH total position (172 ETH liquidity available)
+        self.MAX_DAILY_LOSS = Decimal("5")  # Maximum $5 USD daily loss
+        self.daily_pnl = Decimal("0")  # Daily PnL tracker
+        self.daily_start_time = datetime.now(pytz.UTC)  # Daily reset time
+
         self.primary_client = None
         self.hedge_client = None
 
@@ -622,9 +628,11 @@ class DNHedgeBot:
             self.local_hedge_position = hedge_pos
 
             # Auto-recovery: If net delta exceeds threshold, force sync
-            if abs(net_delta) > self.order_quantity * Decimal("0.5"):
+            # OMC v4: Tightened tolerance from 50% to 1% for true Delta Neutral
+            NET_DELTA_TOLERANCE = Decimal("0.01")  # 1% tolerance
+            if abs(net_delta) > self.order_quantity * NET_DELTA_TOLERANCE:
                 self.logger.warning(
-                    f"[RECONCILE] Net delta drift detected: {net_delta}, initiating auto-recovery"
+                    f"[RECONCILE] Net delta drift detected: {net_delta} (exceeds {NET_DELTA_TOLERANCE * 100}% tolerance), initiating auto-recovery"
                 )
 
                 # Force sync WebSocket local positions with REST API values
@@ -1241,7 +1249,7 @@ class DNHedgeBot:
                 f"[FORCE_CLOSE] Final positions - PRIMARY: {final_primary}, HEDGE: {final_hedge}, Net: {final_net}"
             )
 
-            if abs(final_net) > self.order_quantity * Decimal("0.5"):
+            if abs(final_net) > self.order_quantity * Decimal("0.01"):
                 self.logger.error(
                     f"[FORCE_CLOSE] WARNING: Net delta still significant: {final_net}. "
                     f"Manual position check recommended."
@@ -1406,9 +1414,55 @@ class DNHedgeBot:
             total_cycle_time=cycle_time,
         )
 
+    async def _pre_trade_check(self):
+        """OMC v4: Pre-trade safety checks to prevent losses before they happen."""
+        # 1. Position limit check
+        total_pos = abs(self.primary_position) + abs(self.hedge_position)
+        if total_pos + self.order_quantity > self.MAX_POSITION:
+            raise RuntimeError(
+                f"[SAFETY] Cannot trade: projected position {total_pos + self.order_quantity} ETH "
+                f"would exceed MAX_POSITION {self.MAX_POSITION} ETH. "
+                f"Current positions: Primary={self.primary_position}, Hedge={self.hedge_position}. "
+                f"Reduce order size or close existing positions first."
+            )
+
+        # 2. Daily loss limit check (with UTC midnight reset)
+        now = datetime.now(pytz.UTC)
+        if now.date() > self.daily_start_time.date():
+            # New day (UTC midnight): reset daily PnL
+            self.logger.info(
+                f"[SAFETY] New day detected ({now.date()}). Resetting daily PnL from ${self.daily_pnl:.2f} to $0.00"
+            )
+            self.daily_pnl = Decimal("0")
+            self.daily_start_time = now
+
+        if self.daily_pnl < -self.MAX_DAILY_LOSS:
+            raise RuntimeError(
+                f"[SAFETY] Daily loss ${-self.daily_pnl:.2f} exceeds ${self.MAX_DAILY_LOSS} limit. "
+                f"Trading halted until next UTC midnight. "
+                f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            )
+
+        # 3. NetDelta drift check (early warning)
+        net_delta = self.primary_position + self.hedge_position
+        NET_DELTA_TOLERANCE = Decimal("0.01")  # 1% tolerance
+        if abs(net_delta) > self.order_quantity * NET_DELTA_TOLERANCE:
+            raise RuntimeError(
+                f"[SAFETY] NetDelta {net_delta} exceeds {NET_DELTA_TOLERANCE * 100}% tolerance before trade. "
+                f"Rebalance required. Primary={self.primary_position}, Hedge={self.hedge_position}"
+            )
+
+        self.logger.info(
+            f"[SAFETY] Pre-trade checks passed: Pos={total_pos}/{self.MAX_POSITION}, "
+            f"DailyPnL=${self.daily_pnl:.2f}/${self.MAX_DAILY_LOSS}, NetDelta={net_delta}"
+        )
+
     async def execute_dn_cycle(
         self, direction: str
     ) -> Tuple[bool, Optional[Decimal], Optional[Decimal]]:
+        # OMC v4: Pre-trade safety check BEFORE placing any order
+        await self._pre_trade_check()
+
         self.order_execution_complete = False
         self.waiting_for_hedge_fill = False
 
@@ -1481,6 +1535,12 @@ class DNHedgeBot:
         self.logger.info(
             f"Ticker: {self.ticker} | Quantity: {self.order_quantity} | Iterations: {self.iterations}"
         )
+        # OMC v4: Log safety limits
+        self.logger.info(
+            f"[SAFETY] MAX_POSITION: {self.MAX_POSITION} ETH | "
+            f"MAX_DAILY_LOSS: ${self.MAX_DAILY_LOSS} | "
+            f"NetDelta Tolerance: 1%"
+        )
         self.logger.info(f"{'=' * 60}")
 
         try:
@@ -1519,7 +1579,7 @@ class DNHedgeBot:
                 net_delta = api_primary + api_hedge
 
                 # Second attempt if still has residual positions
-                if abs(net_delta) > self.order_quantity * Decimal("0.5"):
+                if abs(net_delta) > self.order_quantity * Decimal("0.01"):
                     self.logger.warning(
                         f"[INIT] First attempt incomplete. Net: {net_delta}. Trying second cleanup..."
                     )
@@ -1530,7 +1590,7 @@ class DNHedgeBot:
                     api_primary, api_hedge = await self.get_positions(force_api=True)
                     net_delta = api_primary + api_hedge
 
-                if abs(net_delta) > self.order_quantity * Decimal("0.5"):
+                if abs(net_delta) > self.order_quantity * Decimal("0.01"):
                     self.logger.error(
                         f"[INIT] Failed to close residual positions after 2 attempts! Net: {net_delta}. Please manually close positions."
                     )
@@ -1719,7 +1779,7 @@ class DNHedgeBot:
 
         # Auto-cleanup residual positions at shutdown
         net_delta = final_primary + final_hedge
-        if abs(net_delta) > self.order_quantity * Decimal("0.5"):
+        if abs(net_delta) > self.order_quantity * Decimal("0.01"):
             self.logger.warning(f"[SHUTDOWN] Residual positions detected! Net: {net_delta}")
             self.logger.warning("[SHUTDOWN] Auto-closing residual positions...")
             await self.force_close_all_positions()
@@ -1729,7 +1789,7 @@ class DNHedgeBot:
             final_primary, final_hedge = await self.get_positions(force_api=True)
             net_delta = final_primary + final_hedge
 
-            if abs(net_delta) > self.order_quantity * Decimal("0.5"):
+            if abs(net_delta) > self.order_quantity * Decimal("0.01"):
                 self.logger.error(f"[SHUTDOWN] Failed to close residual positions! Net: {net_delta}")
             else:
                 self.logger.info(f"[SHUTDOWN] Residual positions closed successfully. Net: {net_delta}")
