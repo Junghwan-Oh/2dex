@@ -121,6 +121,7 @@ class DNHedgeBot:
 
         self.stop_flag = False
         self.order_counter = 0
+        self.first_build_completed = False  # Track first BUILD for cold start workaround
 
         self.primary_position = Decimal("0")
         self.hedge_position = Decimal("0")
@@ -619,6 +620,33 @@ class DNHedgeBot:
                 f"[RECONCILE] P={primary_pos}, H={hedge_pos}, NetDelta={net_delta}"
             )
 
+            # READ-ONLY: Monitor net delta and alert, DO NOT auto-trade
+            # Alert levels based on drift severity
+            NET_DELTA_WARNING_THRESHOLD = Decimal("0.01")  # 1%
+            NET_DELTA_CRITICAL_THRESHOLD = Decimal("0.02")  # 2%
+
+            if abs(net_delta) > self.order_quantity * NET_DELTA_WARNING_THRESHOLD:
+                if abs(net_delta) > self.order_quantity * NET_DELTA_CRITICAL_THRESHOLD:
+                    # CRITICAL: Log and send alert
+                    self.logger.error(
+                        f"[RECONCILE] CRITICAL: Net delta {net_delta} ({abs(net_delta)/self.order_quantity:.1%}) "
+                        f"exceeds critical threshold - MANUAL INTERVENTION REQUIRED"
+                    )
+                    self.logger.error(
+                        f"[RECONCILE] Positions: Primary={primary_pos}, Hedge={hedge_pos}, "
+                        f"Target={self.order_quantity}, NetDelta={net_delta}"
+                    )
+                    # TODO: Send Telegram/Slack alert here
+                else:
+                    # WARNING: Log but no action
+                    self.logger.warning(
+                        f"[RECONCILE] WARNING: Net delta {net_delta} ({abs(net_delta)/self.order_quantity:.1%}) "
+                        f"exceeds warning threshold"
+                    )
+                    self.logger.warning(
+                        f"[RECONCILE] Positions: Primary={primary_pos}, Hedge={hedge_pos}"
+                    )
+
             # Update instance variables
             self.primary_position = primary_pos
             self.hedge_position = hedge_pos
@@ -811,9 +839,9 @@ class DNHedgeBot:
                             contract_id=self.hedge_contract_id,
                             target_quantity=quantity,
                             side=order_side,
-                            max_iterations=3,
-                            max_tick_offset=2,
-                            max_fill_duration=1
+                            max_iterations=10,   # Increased from 3 - fixes cold start failures
+                            max_tick_offset=2,    # Sufficient for liquidity depth
+                            max_fill_duration=30  # Increased from 1 - removes timeout constraint
                         )
 
                         if result['success']:
@@ -894,16 +922,16 @@ class DNHedgeBot:
                     # Get position before placing order
                     pos_before = await self.hedge_client.get_account_positions()
 
-                    # Use iterative approach for GRVT orders > 0.2 ETH
-                    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2"):
+                    # Use iterative approach for GRVT orders > 0.2 ETH, EXCEPT for first BUILD (cold start workaround)
+                    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and self.first_build_completed:
                         self.logger.info(f"[OPEN] Using ITERATIVE market order for {quantity} ETH")
                         result = await self.hedge_client.place_iterative_market_order(
                             contract_id=self.hedge_contract_id,
                             target_quantity=quantity,
                             side=order_side,
-                            max_iterations=3,
-                            max_tick_offset=2,
-                            max_fill_duration=1
+                            max_iterations=10,   # Increased from 3 - fixes cold start failures
+                            max_tick_offset=2,    # Sufficient for liquidity depth
+                            max_fill_duration=30  # Increased from 1 - removes timeout constraint
                         )
 
                         if result['success']:
@@ -930,6 +958,11 @@ class DNHedgeBot:
                             return False
 
                     # Place market order for immediate fill
+                    # First BUILD workaround: Use regular MARKET to avoid GRVT cold start issue
+                    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:
+                        self.logger.info(
+                            f"[OPEN] [FIRST BUILD] Using regular MARKET (not ITERATIVE) to avoid cold start issue"
+                        )
                     order_info = await self.hedge_client.place_market_order(
                         contract_id=self.hedge_contract_id,
                         quantity=quantity,
@@ -1568,9 +1601,19 @@ class DNHedgeBot:
                 # Track hedge order fill time
                 self.current_order_to_fill_hedge = (time.time() - hedge_order_start) * 1000  # ms
 
+                # SCENARIO 2 HANDLING: Check if hedge BUILD succeeded
+                # If Primary BUILD FULL succeeded but Hedge BUILD failed → EMERGENCY UNWIND
+                if not success:
+                    self.logger.error(
+                        f"[BUILD_CYCLE] Primary BUILD succeeded (FULL) but Hedge BUILD failed - "
+                        f"triggering EMERGENCY UNWIND of Primary position"
+                    )
+                    await self._emergency_unwind_primary_position()
+                    return False, None, None  # Signal BUILD loop to STOP
+
                 if success and hasattr(self, "last_hedge_fill_price"):
                     hedge_fill_price = self.last_hedge_fill_price
-                break
+                break  # Only break if hedge succeeded
 
             await asyncio.sleep(0.01)
 
@@ -1587,6 +1630,10 @@ class DNHedgeBot:
             if self.current_hedge_entry_price is None:
                 self.current_hedge_entry_price = hedge_fill_price or Decimal("0")
                 self.current_hedge_entry_time = time.time()
+            # First BUILD completed successfully
+            if not self.first_build_completed:
+                self.first_build_completed = True
+                self.logger.info("[BUILD] First BUILD completed - cold start workaround disabled")
         else:
             # Unwinding (selling)
             self.current_primary_exit_price = primary_fill_price or Decimal("0")
@@ -1595,6 +1642,50 @@ class DNHedgeBot:
             self.current_hedge_exit_time = time.time()
 
         return True, primary_fill_price, hedge_fill_price
+
+    async def _emergency_unwind_primary_position(self):
+        """Emergency UNWIND of Primary position when Hedge BUILD fails.
+
+        Scenario 2: Primary has FULL position, Hedge has NO position.
+        Must UNWIND Primary immediately to prevent delta exposure.
+
+        Uses ACTUAL API position to determine UNWIND direction.
+        """
+        from decimal import Decimal
+
+        # Get ACTUAL Primary position from API (authoritative source)
+        # NOTE: Verify this returns Decimal scalar, not dict/list
+        actual_position = await self.primary_client.get_account_positions()
+
+        if abs(actual_position) < Decimal("0.001"):
+            self.logger.warning("[EMERGENCY_UNWIND] No Primary position to unwind")
+            return
+
+        # Determine UNWIND direction based on ACTUAL position
+        # If position > 0 (LONG), need to SELL to close
+        # If position < 0 (SHORT), need to BUY to close
+        unwind_side = "sell" if actual_position > 0 else "buy"
+        unwind_qty = abs(actual_position)
+
+        self.logger.error(
+            f"[EMERGENCY_UNWIND] Unwinding Primary: {unwind_side.upper()} {unwind_qty} ETH "
+            f"(actual position: {actual_position})"
+        )
+
+        try:
+            await self.primary_client.place_market_order(
+                contract_id=self.primary_contract_id,
+                quantity=unwind_qty,
+                side=unwind_side
+            )
+            self.logger.error(
+                f"[EMERGENCY_UNWIND] Successfully unwound Primary: "
+                f"{unwind_side.upper()} {unwind_qty}"
+            )
+        except Exception as e:
+            self.logger.error(f"[EMERGENCY_UNWIND] Failed to unwind Primary: {e}")
+            # Set stop flag to prevent further trading
+            self.stop_flag = True
 
     async def trading_loop(self):
         self.logger.info(f"{'=' * 60}")

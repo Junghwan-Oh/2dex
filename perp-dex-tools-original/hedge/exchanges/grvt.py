@@ -416,6 +416,11 @@ class GrvtClient(BaseExchangeClient):
             symbol=contract_id, order_type="market", side=side, amount=quantity
         )
         if not order_result:
+            # Log the actual result for debugging
+            self.logger.log(
+                f"[MARKET] API returned falsy result: {order_result} (type: {type(order_result)})",
+                "ERROR"
+            )
             raise Exception(f"[MARKET] Error placing order")
 
         # Extract order info
@@ -812,7 +817,11 @@ class GrvtClient(BaseExchangeClient):
                 )
 
                 if not order_result:
-                    self.logger.log(f"[ITERATIVE] Order failed (iteration {iteration})", "WARNING")
+                    self.logger.log(
+                        f"[ITERATIVE] Order failed (iteration {iteration}): API returned {order_result} "
+                        f"(type: {type(order_result)}, remaining: {remaining}, side: {side})",
+                        "WARNING"
+                    )
                     tick_offset += 1
                     continue
 
