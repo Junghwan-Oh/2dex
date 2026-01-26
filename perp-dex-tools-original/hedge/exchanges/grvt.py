@@ -355,22 +355,44 @@ class GrvtClient(BaseExchangeClient):
     async def place_post_only_order(
         self, contract_id: str, quantity: Decimal, price: Decimal, side: str
     ) -> OrderResult:
-        """Place a post only order with GRVT using official SDK."""
+        """Place a post only order with GRVT using official SDK.
 
-        # Place the order using GRVT SDK
-        order_result = self.rest_client.create_limit_order(
-            symbol=contract_id,
-            side=side,
-            amount=quantity,
-            price=price,
-            params={
-                "post_only": True,
-                "order_duration_secs": 30 * 86400
-                - 1,  # GRVT SDK: signature expired cap is 30 days (default 1 day)
-            },
-        )
-        if not order_result:
-            raise Exception(f"[OPEN] Error placing order")
+        v5: Add REST client recovery on empty response.
+        """
+
+        # Place the order using GRVT SDK with retry on empty response
+        max_retries = 2
+        for attempt in range(max_retries):
+            order_result = self.rest_client.create_limit_order(
+                symbol=contract_id,
+                side=side,
+                amount=quantity,
+                price=price,
+                params={
+                    "post_only": True,
+                    "order_duration_secs": 30 * 86400
+                    - 1,  # GRVT SDK: signature expired cap is 30 days (default 1 day)
+                },
+            )
+
+            if not order_result:
+                self.logger.log(
+                    f"[POST_ONLY] API returned empty response (attempt {attempt + 1}/{max_retries})",
+                    "WARNING"
+                )
+
+                if attempt < max_retries - 1:
+                    self.logger.log("[POST_ONLY] Reinitializing REST client...", "INFO")
+                    try:
+                        self._initialize_grvt_clients()
+                        await asyncio.sleep(1)
+                        continue
+                    except Exception as e:
+                        self.logger.log(f"[POST_ONLY] Failed to reinitialize: {e}", "ERROR")
+
+                raise Exception(f"[POST_ONLY] Error placing order after {max_retries} attempts")
+
+            break  # Success
 
         client_order_id = order_result.get("metadata").get("client_order_id")
         order_status = order_result.get("state").get("status")
@@ -402,6 +424,7 @@ class GrvtClient(BaseExchangeClient):
 
         Improved: Wait for fill confirmation and return OrderResult.
         OMC v4: Enforce GRVT liquidity limit of 0.2 ETH based on testing.
+        v5: Add REST client recovery on empty response.
         """
         # NOTE: Hard 0.2 ETH limit removed - using iterative market order approach instead
         # The place_iterative_market_order method handles large orders by:
@@ -413,17 +436,40 @@ class GrvtClient(BaseExchangeClient):
         best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
         expected_price = best_ask if side == "buy" else best_bid
 
-        # Place the order using GRVT SDK
-        order_result = self.rest_client.create_order(
-            symbol=contract_id, order_type="market", side=side, amount=quantity
-        )
-        if not order_result:
-            # Log the actual result for debugging
-            self.logger.log(
-                f"[MARKET] API returned falsy result: {order_result} (type: {type(order_result)})",
-                "ERROR"
+        # Place the order using GRVT SDK with retry on empty response
+        max_retries = 2
+        for attempt in range(max_retries):
+            order_result = self.rest_client.create_order(
+                symbol=contract_id, order_type="market", side=side, amount=quantity
             )
-            raise Exception(f"[MARKET] Error placing order")
+
+            if not order_result:
+                # Empty response - try to recover REST client connection
+                self.logger.log(
+                    f"[MARKET] API returned empty response (attempt {attempt + 1}/{max_retries})",
+                    "WARNING"
+                )
+
+                if attempt < max_retries - 1:
+                    # Reinitialize REST client and retry
+                    self.logger.log("[MARKET] Reinitializing REST client...", "INFO")
+                    try:
+                        self._initialize_grvt_clients()
+                        await asyncio.sleep(1)  # Brief delay before retry
+                        continue
+                    except Exception as e:
+                        self.logger.log(f"[MARKET] Failed to reinitialize: {e}", "ERROR")
+                        # Fall through to raise exception
+
+                # Final attempt failed - log details and raise
+                self.logger.log(
+                    f"[MARKET] API returned falsy result: {order_result} (type: {type(order_result)})",
+                    "ERROR"
+                )
+                raise Exception(f"[MARKET] Error placing order after {max_retries} attempts")
+
+            # Success - break out of retry loop
+            break
 
         # Extract order info
         metadata = order_result.get("metadata", {})
