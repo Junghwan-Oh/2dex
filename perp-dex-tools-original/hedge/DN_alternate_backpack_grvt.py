@@ -799,7 +799,7 @@ class DNHedgeBot:
 
         use_maker_mode = self.hedge_mode in [PriceMode.BBO_MINUS_1, PriceMode.BBO]
 
-        max_retries = 4  # Increased retries for better reliability
+        max_retries = 6  # ENHANCED: 6 retries with exponential backoff for GRVT API stability
         for attempt in range(1, max_retries + 1):
             try:
                 best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
@@ -1106,8 +1106,10 @@ class DNHedgeBot:
                     f"Error placing HEDGE order (attempt {attempt}/{max_retries}): {e}"
                 )
                 if attempt < max_retries:
-                    self.logger.info(f"Retrying hedge order in 1 second...")
-                    await asyncio.sleep(1)
+                    # ENHANCED: Exponential backoff (1s, 2s, 4s, 8s, 16s, 32s)
+                    delay = 2 ** (attempt - 1)
+                    self.logger.info(f"Retrying hedge order in {delay} second(s)...")
+                    await asyncio.sleep(delay)
                 else:
                     self.logger.error(f"All {max_retries} hedge attempts failed!")
                     self.logger.error(traceback.format_exc())
@@ -1676,10 +1678,11 @@ class DNHedgeBot:
         )
 
         try:
+            # FIX: Changed side= to direction= (Backpack API expects 'direction' parameter)
             await self.primary_client.place_market_order(
                 contract_id=self.primary_contract_id,
                 quantity=unwind_qty,
-                side=unwind_side
+                direction=unwind_side
             )
             self.logger.error(
                 f"[EMERGENCY_UNWIND] Successfully unwound Primary: "
