@@ -70,6 +70,10 @@ class TradeMetrics:
     # Other metrics
     repricing_count: int
     total_cycle_time: float  # seconds
+    hedge_entry_order_type: str = "MARKET"  # "POST_ONLY" or "MARKET"
+    hedge_exit_order_type: str = "MARKET"   # "POST_ONLY" or "MARKET"
+    hedge_entry_fee_saved: bool = False     # True if POST_ONLY filled
+    hedge_exit_fee_saved: bool = False      # True if POST_ONLY filled
 
     def to_dict(self):
         """Convert to dictionary for CSV export."""
@@ -94,6 +98,7 @@ class DNHedgeBot:
         hedge_exchange: str = "grvt",
         primary_mode: PriceMode = PriceMode.BBO,  # Changed from BBO_MINUS_1 for better fill rate
         hedge_mode: PriceMode = PriceMode.MARKET,
+        hedge_post_only: bool = True,
         min_spread_bps: Decimal = Decimal("0"),
     ):
         self.ticker = ticker
@@ -105,6 +110,7 @@ class DNHedgeBot:
         self.hedge_exchange = hedge_exchange.lower()
         self.primary_mode = primary_mode
         self.hedge_mode = hedge_mode
+        self.hedge_post_only = hedge_post_only
         self.min_spread_bps = min_spread_bps
         self.strategy = "alternative"  # Fixed strategy for this file
 
@@ -163,6 +169,12 @@ class DNHedgeBot:
         self.trade_metrics_list: List[TradeMetrics] = []
         self.current_cycle_start_time = None
         self.repricing_count = 0
+
+        # POST_ONLY tracking
+        self.current_hedge_entry_order_type = "MARKET"
+        self.current_hedge_exit_order_type = "MARKET"
+        self.current_hedge_entry_fee_saved = False
+        self.current_hedge_exit_fee_saved = False
 
         # Current cycle metrics (reset each cycle)
         self.current_primary_entry_price = None
@@ -870,52 +882,157 @@ class DNHedgeBot:
                             self.order_execution_complete = False
                             return False
                     else:
-                        # Regular market order for small sizes or non-GRVT
-                        self.logger.info(
-                            f"[CLOSE] [{self.hedge_exchange.upper()}] Using MARKET order for immediate execution"
-                        )
-                        # Get position before placing order (REST API for reliability)
-                        pos_before_close = await self.hedge_client.get_account_positions()
+                        # NEW: Try POST_ONLY first for 0% fee, fall back to MARKET if needed
+                        hedge_filled = False
+                        hedge_fill_price = None
 
-                        # Use true market order (no timeout, immediate fill)
-                        order_info = await self.hedge_client.place_market_order(
-                        contract_id=self.hedge_contract_id,
-                        quantity=quantity,
-                        side=order_side,
-                    )
+                        # Reference: Primary order uses POST_ONLY at line 703
+                        if self.hedge_post_only and self.hedge_exchange.lower() == "grvt":
+                            try:
+                                # Get BBO for POST_ONLY pricing
+                                # VERIFIED: fetch_bbo_prices exists at grvt.py line 340-353
+                                best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
+                                    self.hedge_contract_id
+                                )
 
-                    # Market orders fill immediately - verify with REST API
-                    await asyncio.sleep(1.0)  # Brief wait for execution
-                    pos_after_close = await self.hedge_client.get_account_positions()
-                    position_change = abs(pos_after_close - pos_before_close)
+                                # Calculate POST_ONLY price (1 tick inside spread)
+                                if order_side == "buy":
+                                    hedge_post_only_price = best_ask - self.hedge_tick_size
+                                else:  # sell
+                                    hedge_post_only_price = best_bid + self.hedge_tick_size
 
-                    if position_change >= quantity * Decimal("0.9"):
-                        actual_fill_price = best_ask if side == "buy" else best_bid
-                        self.logger.info(
-                            f"[CLOSE] [{self.hedge_exchange.upper()}] [FILLED]: "
-                            f"{quantity} @ ~{actual_fill_price} (pos: {pos_before_close} -> {pos_after_close})"
-                        )
+                                hedge_post_only_price = self.hedge_client.round_to_tick(hedge_post_only_price)
 
-                        self.log_trade_to_csv(
-                            exchange=self.hedge_exchange.upper(),
-                            side=side,
-                            price=str(actual_fill_price),
-                            quantity=str(quantity),
-                            order_type="hedge_close",
-                            mode="market_taker",
-                        )
+                                self.logger.info(
+                                    f"[CLOSE] [{self.hedge_exchange.upper()}] Attempting POST_ONLY @ {hedge_post_only_price} "
+                                    f"(side: {order_side}, fee: 0%)"
+                                )
 
-                        self.hedge_order_filled = True
-                        self.order_execution_complete = True
-                        self.last_hedge_fill_price = actual_fill_price
-                        return True
-                    else:
-                        self.logger.error(
-                            f"[CLOSE] Market order failed to fill (pos: {pos_before_close} -> {pos_after_close})"
-                        )
-                        self.hedge_order_filled = False
-                        self.order_execution_complete = False
-                        return False
+                                # Try POST_ONLY with 3 second timeout
+                                hedge_result = await asyncio.wait_for(
+                                    self.hedge_client.place_post_only_order(
+                                        contract_id=self.hedge_contract_id,
+                                        quantity=quantity,
+                                        price=hedge_post_only_price,
+                                        side=order_side
+                                    ),
+                                    timeout=3.0
+                                )
+
+                                if hedge_result.status == "FILLED":
+                                    hedge_filled = True
+                                    hedge_fill_price = hedge_result.price
+
+                                    self.logger.info(
+                                        f"[CLOSE] [POST_ONLY FILLED]: {quantity} @ {hedge_fill_price} "
+                                        f"(0% fee saved, from_post_only={hedge_result.from_post_only})"
+                                    )
+
+                                    # VERIFIED: _local_position is updated via WebSocket at grvt.py line 56
+                                    # Additional manual update for immediate tracking
+                                    if hasattr(self.hedge_client, '_local_position'):
+                                        if order_side == "buy":
+                                            self.hedge_client._local_position += quantity
+                                        else:
+                                            self.hedge_client._local_position -= quantity
+
+                                    # Set flags and return success
+                                    self.hedge_order_filled = True
+                                    self.order_execution_complete = True
+                                    self.last_hedge_fill_price = hedge_fill_price
+
+                                    # Update tracking variables
+                                    self.current_hedge_exit_order_type = "POST_ONLY"
+                                    self.current_hedge_exit_fee_saved = True
+
+                                    # Log to CSV with POST_ONLY indicator
+                                    self.log_trade_to_csv(
+                                        exchange=self.hedge_exchange.upper(),
+                                        side=side,
+                                        price=str(hedge_fill_price),
+                                        quantity=str(quantity),
+                                        order_type="hedge_close_post_only",
+                                        mode="post_only_maker",
+                                    )
+
+                                    return True
+
+                                elif hedge_result.status == "OPEN":
+                                    # POST_ONLY accepted but not filled - cancel and fallback
+                                    self.logger.warning(
+                                        f"[CLOSE] POST_ONLY not filled within 3s, canceling order_id={hedge_result.order_id}"
+                                    )
+                                    # VERIFIED: cancel_order exists at grvt.py line 906-920
+                                    cancel_result = await self.hedge_client.cancel_order(hedge_result.order_id)
+                                    if not cancel_result.success:
+                                        self.logger.error(f"[CLOSE] Failed to cancel POST_ONLY: {cancel_result.error_message}")
+                                else:
+                                    self.logger.warning(
+                                        f"[CLOSE] POST_ONLY rejected (status: {hedge_result.status}), falling back to MARKET"
+                                    )
+
+                            except asyncio.TimeoutError:
+                                self.logger.warning(
+                                    f"[CLOSE] POST_ONLY timeout after 3s, falling back to MARKET"
+                                )
+                            except Exception as e:
+                                self.logger.error(
+                                    f"[CLOSE] POST_ONLY failed: {e}, falling back to MARKET"
+                                )
+
+                        # FALLBACK: Use MARKET order (0.05% taker fee)
+                        if not hedge_filled:
+                            self.logger.info(
+                                f"[CLOSE] [{self.hedge_exchange.upper()}] Using MARKET fallback (0.05% taker fee)"
+                            )
+
+                            # Get position before placing order (REST API for reliability)
+                            pos_before_close = await self.hedge_client.get_account_positions()
+
+                            # Use true market order (no timeout, immediate fill)
+                            order_info = await self.hedge_client.place_market_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                side=order_side,
+                            )
+
+                            # Market orders fill immediately - verify with REST API
+                            await asyncio.sleep(1.0)  # Brief wait for execution
+                            pos_after_close = await self.hedge_client.get_account_positions()
+                            position_change = abs(pos_after_close - pos_before_close)
+
+                            if position_change >= quantity * Decimal("0.9"):
+                                actual_fill_price = best_ask if side == "buy" else best_bid
+                                self.logger.info(
+                                    f"[CLOSE] [MARKET FILLED]: "
+                                    f"{quantity} @ ~{actual_fill_price} (pos: {pos_before_close} -> {pos_after_close})"
+                                )
+
+                                self.log_trade_to_csv(
+                                    exchange=self.hedge_exchange.upper(),
+                                    side=side,
+                                    price=str(actual_fill_price),
+                                    quantity=str(quantity),
+                                    order_type="hedge_close_market_fallback",
+                                    mode="market_taker",
+                                )
+
+                                self.hedge_order_filled = True
+                                self.order_execution_complete = True
+                                self.last_hedge_fill_price = actual_fill_price
+
+                                # Update tracking variables
+                                self.current_hedge_exit_order_type = "MARKET"
+                                self.current_hedge_exit_fee_saved = False
+
+                                return True
+                            else:
+                                self.logger.error(
+                                    f"[CLOSE] Market fallback failed to fill (pos: {pos_before_close} -> {pos_after_close})"
+                                )
+                                self.hedge_order_filled = False
+                                self.order_execution_complete = False
+                                return False
                 else:
                     # OPEN: Use MARKET order for immediate fill (same as CLOSE)
                     self.logger.info(
@@ -961,49 +1078,185 @@ class DNHedgeBot:
                             return False
 
                     # Place market order for immediate fill
-                    # First BUILD workaround: Use regular MARKET to avoid GRVT cold start issue
+                    # First BUILD workaround: Try POST_ONLY first, fall back to MARKET if needed
                     if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:
                         self.logger.info(
-                            f"[OPEN] [FIRST BUILD] Using regular MARKET (not ITERATIVE) to avoid cold start issue"
-                        )
-                    order_info = await self.hedge_client.place_market_order(
-                        contract_id=self.hedge_contract_id,
-                        quantity=quantity,
-                        side=order_side,
-                    )
-
-                    # Wait briefly for execution and verify
-                    await asyncio.sleep(1.0)
-                    pos_after = await self.hedge_client.get_account_positions()
-                    position_change = abs(pos_after - pos_before)
-
-                    if position_change >= quantity * Decimal("0.9"):
-                        actual_fill_price = best_ask if side == "buy" else best_bid
-                        self.logger.info(
-                            f"[OPEN] [{self.hedge_exchange.upper()}] [MARKET FILLED]: "
-                            f"{quantity} @ ~{actual_fill_price} (pos: {pos_before} -> {pos_after})"
+                            f"[OPEN] [FIRST BUILD] Using POST_ONLY first to avoid cold start issue"
                         )
 
-                        self.log_trade_to_csv(
-                            exchange=self.hedge_exchange.upper(),
-                            side=side,
-                            price=str(actual_fill_price),
-                            quantity=str(quantity),
-                            order_type="hedge_open",
-                            mode="market_taker",
-                        )
+                        hedge_filled = False
 
-                        self.hedge_order_filled = True
-                        self.order_execution_complete = True
-                        self.last_hedge_fill_price = actual_fill_price
-                        return True
+                        if self.hedge_post_only and self.hedge_exchange.lower() == "grvt":
+                            try:
+                                # Get BBO for POST_ONLY pricing
+                                best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
+                                    self.hedge_contract_id
+                                )
+
+                                # Calculate POST_ONLY price (1 tick inside spread)
+                                if order_side == "buy":
+                                    hedge_post_only_price = best_ask - self.hedge_tick_size
+                                else:  # sell
+                                    hedge_post_only_price = best_bid + self.hedge_tick_size
+
+                                hedge_post_only_price = self.hedge_client.round_to_tick(hedge_post_only_price)
+
+                                self.logger.info(
+                                    f"[OPEN] [FIRST BUILD] Attempting POST_ONLY @ {hedge_post_only_price} "
+                                    f"(side: {order_side}, fee: 0%)"
+                                )
+
+                                # Try POST_ONLY with 3 second timeout
+                                hedge_result = await asyncio.wait_for(
+                                    self.hedge_client.place_post_only_order(
+                                        contract_id=self.hedge_contract_id,
+                                        quantity=quantity,
+                                        price=hedge_post_only_price,
+                                        side=order_side
+                                    ),
+                                    timeout=3.0
+                                )
+
+                                if hedge_result.status == "FILLED":
+                                    hedge_filled = True
+
+                                    self.logger.info(
+                                        f"[OPEN] [FIRST BUILD] [POST_ONLY FILLED]: {quantity} @ {hedge_result.price} "
+                                        f"(0% fee saved)"
+                                    )
+
+                                    # Update local position
+                                    if hasattr(self.hedge_client, '_local_position'):
+                                        if order_side == "buy":
+                                            self.hedge_client._local_position += quantity
+                                        else:
+                                            self.hedge_client._local_position -= quantity
+
+                                    # Set flags
+                                    self.hedge_order_filled = True
+                                    self.order_execution_complete = True
+                                    self.last_hedge_fill_price = hedge_result.price
+
+                                    # Update tracking variables
+                                    self.current_hedge_entry_order_type = "POST_ONLY"
+                                    self.current_hedge_entry_fee_saved = True
+
+                                    # Log to CSV
+                                    self.log_trade_to_csv(
+                                        exchange=self.hedge_exchange.upper(),
+                                        side=side,
+                                        price=str(hedge_result.price),
+                                        quantity=str(quantity),
+                                        order_type="hedge_open_first_build_post_only",
+                                        mode="post_only_maker",
+                                    )
+
+                                    return True
+
+                                elif hedge_result.status == "OPEN":
+                                    self.logger.warning(
+                                        f"[OPEN] [FIRST BUILD] POST_ONLY not filled, canceling and falling back"
+                                    )
+                                    await self.hedge_client.cancel_order(hedge_result.order_id)
+                                else:
+                                    self.logger.warning(
+                                        f"[OPEN] [FIRST BUILD] POST_ONLY rejected, falling back to MARKET"
+                                    )
+
+                            except asyncio.TimeoutError:
+                                self.logger.warning(f"[OPEN] [FIRST BUILD] POST_ONLY timeout, falling back to MARKET")
+                            except Exception as e:
+                                self.logger.error(f"[OPEN] [FIRST BUILD] POST_ONLY failed: {e}, falling back to MARKET")
+
+                        # FALLBACK: Use regular MARKET to avoid GRVT cold start issue
+                        if not hedge_filled:
+                            self.logger.info(
+                                f"[OPEN] [FIRST BUILD] Using MARKET fallback (0.05% taker fee)"
+                            )
+
+                            order_info = await self.hedge_client.place_market_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                side=order_side,
+                            )
+
+                            # Wait briefly for execution and verify
+                            await asyncio.sleep(1.0)
+                            pos_after = await self.hedge_client.get_account_positions()
+                            position_change = abs(pos_after - pos_before)
+
+                            if position_change >= quantity * Decimal("0.9"):
+                                actual_fill_price = best_ask if side == "buy" else best_bid
+                                self.logger.info(
+                                    f"[OPEN] [FIRST BUILD] [MARKET FILLED]: "
+                                    f"{quantity} @ ~{actual_fill_price} (pos: {pos_before} -> {pos_after})"
+                                )
+
+                                self.log_trade_to_csv(
+                                    exchange=self.hedge_exchange.upper(),
+                                    side=side,
+                                    price=str(actual_fill_price),
+                                    quantity=str(quantity),
+                                    order_type="hedge_open_first_build_market_fallback",
+                                    mode="market_taker",
+                                )
+
+                                self.hedge_order_filled = True
+                                self.order_execution_complete = True
+                                self.last_hedge_fill_price = actual_fill_price
+
+                                # Update tracking variables
+                                self.current_hedge_entry_order_type = "MARKET"
+                                self.current_hedge_entry_fee_saved = False
+
+                                return True
+                            else:
+                                self.logger.error(
+                                    f"[OPEN] [FIRST BUILD] Market fallback failed to fill (pos: {pos_before} -> {pos_after})"
+                                )
+                                self.hedge_order_filled = False
+                                self.order_execution_complete = False
+                                return False
                     else:
-                        self.logger.error(
-                            f"[OPEN] Market order failed to fill (pos: {pos_before} -> {pos_after})"
+                        # Regular market order for small sizes or non-first-build
+                        order_info = await self.hedge_client.place_market_order(
+                            contract_id=self.hedge_contract_id,
+                            quantity=quantity,
+                            side=order_side,
                         )
-                        self.hedge_order_filled = False
-                        self.order_execution_complete = False
-                        return False
+
+                        # Wait briefly for execution and verify
+                        await asyncio.sleep(1.0)
+                        pos_after = await self.hedge_client.get_account_positions()
+                        position_change = abs(pos_after - pos_before)
+
+                        if position_change >= quantity * Decimal("0.9"):
+                            actual_fill_price = best_ask if side == "buy" else best_bid
+                            self.logger.info(
+                                f"[OPEN] [{self.hedge_exchange.upper()}] [MARKET FILLED]: "
+                                f"{quantity} @ ~{actual_fill_price} (pos: {pos_before} -> {pos_after})"
+                            )
+
+                            self.log_trade_to_csv(
+                                exchange=self.hedge_exchange.upper(),
+                                side=side,
+                                price=str(actual_fill_price),
+                                quantity=str(quantity),
+                                order_type="hedge_open",
+                                mode="market_taker",
+                            )
+
+                            self.hedge_order_filled = True
+                            self.order_execution_complete = True
+                            self.last_hedge_fill_price = actual_fill_price
+                            return True
+                        else:
+                            self.logger.error(
+                                f"[OPEN] Market order failed to fill (pos: {pos_before} -> {pos_after})"
+                            )
+                            self.hedge_order_filled = False
+                            self.order_execution_complete = False
+                            return False
 
                 # Skip old OPEN logic - set order_filled for downstream code
                 order_filled = self.hedge_order_filled
@@ -1497,6 +1750,10 @@ class DNHedgeBot:
         self.current_websocket_latency = 0
         self.current_rest_latency = 0
         self.current_reconciliation_time = 0
+        self.current_hedge_entry_order_type = "MARKET"
+        self.current_hedge_exit_order_type = "MARKET"
+        self.current_hedge_entry_fee_saved = False
+        self.current_hedge_exit_fee_saved = False
 
     def _create_trade_metrics(self, iteration: int, direction: str) -> TradeMetrics:
         """Create TradeMetrics object from current cycle data."""
@@ -1520,6 +1777,10 @@ class DNHedgeBot:
             reconciliation_time=self.current_reconciliation_time,
             repricing_count=self.repricing_count,
             total_cycle_time=cycle_time,
+            hedge_entry_order_type=self.current_hedge_entry_order_type,
+            hedge_exit_order_type=self.current_hedge_exit_order_type,
+            hedge_entry_fee_saved=self.current_hedge_entry_fee_saved,
+            hedge_exit_fee_saved=self.current_hedge_exit_fee_saved,
         )
 
     async def _pre_trade_check(self):
@@ -2059,6 +2320,18 @@ Examples:
         help="Hedge order price mode (default: market). aggressive: BUY@ask, SELL@bid for instant fill",
     )
     parser.add_argument(
+        "--hedge-post-only",
+        action="store_true",
+        default=True,
+        help="Use POST_ONLY for hedge orders to save 0.05% taker fee (default: True)",
+    )
+    parser.add_argument(
+        "--hedge-market",
+        action="store_true",
+        default=False,
+        help="Use MARKET for hedge orders (0.05% taker fee) - disables POST_ONLY",
+    )
+    parser.add_argument(
         "--env-file", type=str, default=".env", help=".env file path (default: .env)"
     )
     parser.add_argument(
@@ -2088,6 +2361,7 @@ async def main():
 
     primary_mode = PriceMode(args.primary_mode)
     hedge_mode = PriceMode(args.hedge_mode)
+    hedge_post_only = args.hedge_post_only and not args.hedge_market
 
     bot = DNHedgeBot(
         ticker=args.ticker.upper(),
@@ -2100,6 +2374,7 @@ async def main():
         hedge_exchange=args.hedge,
         primary_mode=primary_mode,
         hedge_mode=hedge_mode,
+        hedge_post_only=hedge_post_only,
         min_spread_bps=Decimal(args.min_spread),
     )
 

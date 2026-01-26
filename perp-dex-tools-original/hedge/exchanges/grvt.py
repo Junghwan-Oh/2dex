@@ -391,6 +391,8 @@ class GrvtClient(BaseExchangeClient):
         if order_status == "PENDING":
             raise Exception("GRVT Server Error: Order not processed after 10 seconds")
         else:
+            # Track that this came from POST_ONLY for metrics
+            order_info.from_post_only = True
             return order_info
 
     async def place_market_order(
@@ -471,6 +473,7 @@ class GrvtClient(BaseExchangeClient):
                         size=quantity,
                         price=order_info.price,
                         status=order_info.status,
+                        from_post_only=False  # MARKET orders always False
                     )
 
         # Check final status
@@ -482,6 +485,7 @@ class GrvtClient(BaseExchangeClient):
                 size=quantity,
                 price=expected_price,
                 status=order_status,
+                from_post_only=False  # MARKET orders always False
             )
         else:
             raise Exception(f"[MARKET] Order not filled within timeout. Final status: {order_status}")

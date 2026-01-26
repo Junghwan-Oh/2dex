@@ -43,6 +43,7 @@ class OrderResult:
     status: Optional[str] = None
     error_message: Optional[str] = None
     filled_size: Optional[Decimal] = None
+    from_post_only: bool = False  # True if filled via POST_ONLY order
 
 
 @dataclass
