@@ -744,7 +744,10 @@ class DNHedgeBot:
                         ]:
                             await asyncio.sleep(0.1)  # Reduced from 0.5s for faster response
 
-                            if time.time() - start_time > 10:
+                            # OPTIMIZATION: Reduced timeout from 10s to 5s for faster execution
+                            # Expected: 50% speed improvement (77s → <50s per cycle)
+                            # Tradeoff: Fill rate may drop from 95% to 80-90%
+                            if time.time() - start_time > 5:
                                 (
                                     best_bid,
                                     best_ask,
