@@ -73,6 +73,252 @@ class GrvtClient(BaseExchangeClient):
         except Exception as e:
             raise ValueError(f"Failed to initialize GRVT client: {e}")
 
+    async def _verify_order_status(
+        self,
+        symbol: str,
+        client_order_id: str,
+        timeout: float = 10.0
+    ) -> Optional[Dict[str, Any]]:
+        """Verify order status via REST API.
+
+        After sending RPC request, use REST API to verify order execution.
+
+        Args:
+            symbol: Trading pair
+            client_order_id: Client order ID from RPC payload
+            timeout: Seconds to wait for order to fill (default: 10s)
+
+        Returns:
+            Order status dict or None if timeout/failed
+        """
+        if not self.rest_client:
+            return None
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                # Query order status via REST API using correct client_order_id
+                order_info = self.rest_client.fetch_order(params={"client_order_id": client_order_id})
+
+                if order_info:
+                    status = order_info.get('state', {}).get('status', 'UNKNOWN')
+                    self.logger.log(
+                        f"[ORDER_VERIFICATION] Order {client_order_id} status: {status}",
+                        "DEBUG"
+                    )
+
+                    if status in ["FILLED", "CANCELLED", "REJECTED"]:
+                        return order_info
+                    elif status in ["OPEN", "PENDING"]:
+                        await asyncio.sleep(0.1)  # Check every 100ms
+                        continue
+                    else:
+                        return order_info  # UNKNOWN status
+
+            except Exception as e:
+                self.logger.log(f"[ORDER_VERIFICATION] Error: {e}", "WARNING")
+                await asyncio.sleep(0.1)
+
+        # Timeout
+        self.logger.log(
+            f"[ORDER_VERIFICATION] Order {client_order_id} timeout after {timeout}s",
+            "WARNING"
+        )
+        return None
+
+    async def _ws_rpc_submit_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        amount: Decimal,
+        price: Optional[Decimal] = None,
+        params: Dict[str, Any] = None,
+        verify_with_rest: bool = True
+    ) -> Dict[str, Any]:
+        """Submit order via WebSocket RPC with REST verification.
+
+        Uses RPC for order submission and REST API for verification.
+
+        Args:
+            symbol: Trading pair
+            order_type: 'market' or 'limit'
+            side: 'buy' or 'sell'
+            amount: Order quantity
+            price: Limit price (required for limit orders)
+            params: Additional order parameters (can include client_order_id)
+            verify_with_rest: Whether to verify order status via REST (default: True)
+
+        Returns:
+            Standard order result dict with keys:
+            - 'success': bool
+            - 'order_id': str or None (client order ID)
+            - 'status': str or None
+            - 'error': str or None
+        """
+        if not self._ws_client:
+            self.logger.log("[WS_RPC] WebSocket client not available, using REST fallback", "WARNING")
+            return self.rest_client.create_limit_order(
+                symbol=symbol,
+                side=side,
+                amount=amount,
+                price=price,
+                params=params or {}
+            )
+
+        # Map order types
+        grpc_order_type = "limit" if order_type == "limit" else "market"
+        grpc_side = "buy" if side == "buy" else "sell"
+
+        # Prepare parameters
+        rpc_params = params.copy() if params else {}
+
+        try:
+            # Send RPC request with 10-second timeout
+            self.logger.log(
+                f"[WS_RPC] Submitting {order_type.upper()} order via WebSocket: {side} {amount} @ {price}",
+                "INFO"
+            )
+
+            # For market orders, use rpc_create_order with order_type="market"
+            # For limit orders, use rpc_create_limit_order (which internally passes "limit")
+            if order_type == "market":
+                result = await asyncio.wait_for(
+                    self._ws_client.rpc_create_order(
+                        symbol=symbol,
+                        order_type="market",
+                        side=grpc_side,
+                        amount=float(amount),
+                        price=None,  # Market orders don't need price
+                        params=rpc_params
+                    ),
+                    timeout=10.0
+                )
+            else:
+                # Limit order - use rpc_create_limit_order
+                result = await asyncio.wait_for(
+                    self._ws_client.rpc_create_limit_order(
+                        symbol=symbol,
+                        side=grpc_side,
+                        amount=float(amount),
+                        price=float(price),
+                        params=rpc_params
+                    ),
+                    timeout=10.0
+                )
+
+            # CORRECT: Extract client_order_id from payload structure
+            # Payload format: {'params': {'order': {'metadata': {'client_order_id': '123'}}}}
+            client_order_id = str(result.get('params', {}).get('order', {}).get('metadata', {}).get('client_order_id', ''))
+
+            self.logger.log(
+                f"[WS_RPC] RPC request sent with client_order_id: {client_order_id}",
+                "INFO"
+            )
+
+            # Verify order status via REST API (if enabled)
+            if verify_with_rest:
+                self.logger.log(
+                    f"[WS_RPC] Verifying order status via REST API...",
+                    "DEBUG"
+                )
+
+                order_info = await self._verify_order_status(
+                    symbol=symbol,
+                    client_order_id=client_order_id,
+                    timeout=10.0
+                )
+
+                if not order_info:
+                    self.logger.log(
+                        f"[WS_RPC] Order verification failed (timeout or error)",
+                        "WARNING"
+                    )
+                    # Fall back to REST submission
+                    if order_type == "market":
+                        return self.rest_client.create_order(
+                            symbol=symbol,
+                            order_type="market",
+                            side=side,
+                            amount=amount
+                        )
+                    else:
+                        return self.rest_client.create_limit_order(
+                            symbol=symbol,
+                            side=side,
+                            amount=amount,
+                            price=price,
+                            params=params or {}
+                        )
+
+                # Get status from REST API response
+                status = order_info.get('state', {}).get('status', 'OPEN')
+
+                self.logger.log(
+                    f"[WS_RPC] Order verification: {status}",
+                    "INFO"
+                )
+
+                return {
+                    'success': True,
+                    'metadata': {'client_order_id': client_order_id},
+                    'state': {'status': status},
+                    'raw_rpc_response': result,
+                    'raw_rest_response': order_info
+                }
+
+            # No verification - return immediately
+            return {
+                'success': True,
+                'metadata': {'client_order_id': client_order_id},
+                'state': {'status': 'PENDING'},
+                'raw_rpc_response': result
+            }
+
+        except asyncio.TimeoutError:
+            self.logger.log(
+                f"[WS_RPC] WebSocket order timeout after 10s, falling back to REST",
+                "WARNING"
+            )
+            # Fall back to REST
+            if order_type == "market":
+                return self.rest_client.create_order(
+                    symbol=symbol,
+                    order_type="market",
+                    side=side,
+                    amount=amount
+                )
+            else:
+                return self.rest_client.create_limit_order(
+                    symbol=symbol,
+                    side=side,
+                    amount=amount,
+                    price=price,
+                    params=params or {}
+                )
+
+        except Exception as e:
+            self.logger.log(
+                f"[WS_RPC] WebSocket RPC failed: {e}, falling back to REST",
+                "ERROR"
+            )
+            # Fall back to REST
+            if order_type == "market":
+                return self.rest_client.create_order(
+                    symbol=symbol,
+                    order_type="market",
+                    side=side,
+                    amount=amount
+                )
+            else:
+                return self.rest_client.create_limit_order(
+                    symbol=symbol,
+                    side=side,
+                    amount=amount,
+                    price=price,
+                    params=params or {}
+                )
+
     def _validate_config(self) -> None:
         """Validate GRVT configuration."""
         required_env_vars = [
@@ -133,6 +379,23 @@ class GrvtClient(BaseExchangeClient):
                 await self._ws_client.__aexit__()
         except Exception as e:
             self.logger.log(f"Error during GRVT disconnect: {e}", "ERROR")
+
+    def trigger_websocket_reconnect(self) -> None:
+        """Trigger SDK's built-in reconnect mechanism.
+
+        The SDK's connect_all_channels() loop checks force_reconnect_flag
+        every 5 seconds and will reconnect when this flag is set.
+        """
+        if self._ws_client and hasattr(self._ws_client, 'force_reconnect_flag'):
+            self._ws_client.force_reconnect_flag = True
+            self.logger.log(
+                "[WS_RECONNECT] Triggered SDK reconnect (will execute within 5s)",
+                "INFO"
+            )
+        else:
+            self.logger.warning(
+                "[WS_RECONNECT] Cannot trigger reconnect: _ws_client or force_reconnect_flag not available"
+            )
 
     def get_ws_position(self) -> Decimal:
         """Get position from local WebSocket tracking.
@@ -357,42 +620,22 @@ class GrvtClient(BaseExchangeClient):
     ) -> OrderResult:
         """Place a post only order with GRVT using official SDK.
 
-        v5: Add REST client recovery on empty response.
+        v5: Use WebSocket RPC for order submission with REST fallback.
         """
 
-        # Place the order using GRVT SDK with retry on empty response
-        max_retries = 2
-        for attempt in range(max_retries):
-            order_result = self.rest_client.create_limit_order(
-                symbol=contract_id,
-                side=side,
-                amount=quantity,
-                price=price,
-                params={
-                    "post_only": True,
-                    "order_duration_secs": 30 * 86400
-                    - 1,  # GRVT SDK: signature expired cap is 30 days (default 1 day)
-                },
-            )
-
-            if not order_result:
-                self.logger.log(
-                    f"[POST_ONLY] API returned empty response (attempt {attempt + 1}/{max_retries})",
-                    "WARNING"
-                )
-
-                if attempt < max_retries - 1:
-                    self.logger.log("[POST_ONLY] Reinitializing REST client...", "INFO")
-                    try:
-                        self._initialize_grvt_clients()
-                        await asyncio.sleep(1)
-                        continue
-                    except Exception as e:
-                        self.logger.log(f"[POST_ONLY] Failed to reinitialize: {e}", "ERROR")
-
-                raise Exception(f"[POST_ONLY] Error placing order after {max_retries} attempts")
-
-            break  # Success
+        # Place the order using WebSocket RPC with REST verification
+        order_result = await self._ws_rpc_submit_order(
+            symbol=contract_id,
+            order_type='limit',
+            side=side,
+            amount=quantity,
+            price=price,
+            params={
+                "post_only": True,
+                "order_duration_secs": 30 * 86400 - 1,
+            },
+            verify_with_rest=True
+        )
 
         client_order_id = order_result.get("metadata").get("client_order_id")
         order_status = order_result.get("state").get("status")
@@ -436,40 +679,14 @@ class GrvtClient(BaseExchangeClient):
         best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
         expected_price = best_ask if side == "buy" else best_bid
 
-        # Place the order using GRVT SDK with retry on empty response
-        max_retries = 2
-        for attempt in range(max_retries):
-            order_result = self.rest_client.create_order(
-                symbol=contract_id, order_type="market", side=side, amount=quantity
-            )
-
-            if not order_result:
-                # Empty response - try to recover REST client connection
-                self.logger.log(
-                    f"[MARKET] API returned empty response (attempt {attempt + 1}/{max_retries})",
-                    "WARNING"
-                )
-
-                if attempt < max_retries - 1:
-                    # Reinitialize REST client and retry
-                    self.logger.log("[MARKET] Reinitializing REST client...", "INFO")
-                    try:
-                        self._initialize_grvt_clients()
-                        await asyncio.sleep(1)  # Brief delay before retry
-                        continue
-                    except Exception as e:
-                        self.logger.log(f"[MARKET] Failed to reinitialize: {e}", "ERROR")
-                        # Fall through to raise exception
-
-                # Final attempt failed - log details and raise
-                self.logger.log(
-                    f"[MARKET] API returned falsy result: {order_result} (type: {type(order_result)})",
-                    "ERROR"
-                )
-                raise Exception(f"[MARKET] Error placing order after {max_retries} attempts")
-
-            # Success - break out of retry loop
-            break
+        # Place the order using WebSocket RPC method with REST verification
+        order_result = await self._ws_rpc_submit_order(
+            symbol=contract_id,
+            order_type='market',
+            side=side,
+            amount=quantity,
+            verify_with_rest=True
+        )
 
         # Extract order info
         metadata = order_result.get("metadata", {})
@@ -859,11 +1076,12 @@ class GrvtClient(BaseExchangeClient):
             try:
                 # IMPORTANT: Remove the 0.2 ETH limit for iterative approach
                 # We handle this by iterating instead of rejecting
-                order_result = self.rest_client.create_order(
+                order_result = await self._ws_rpc_submit_order(
                     symbol=contract_id,
-                    order_type="market",
+                    order_type='market',
                     side=side,
-                    amount=remaining
+                    amount=remaining,
+                    verify_with_rest=True
                 )
 
                 if not order_result:
