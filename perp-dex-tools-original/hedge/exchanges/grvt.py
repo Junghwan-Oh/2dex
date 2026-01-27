@@ -15,6 +15,98 @@ from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
 
 
+def calculate_timeout(quantity: Decimal) -> int:
+    """Calculate timeout based on order size with realistic microstructure awareness.
+
+    Piecewise logic for predictable timeout values:
+    - 0.1 ETH → 5s (quick fills at BBO)
+    - 0.5 ETH → 10s (moderate spread)
+    - 1.0 ETH → 20s (must look deeper)
+
+    Args:
+        quantity: Order quantity in ETH
+
+    Returns:
+        Timeout in seconds (5-20 second range)
+
+    Example:
+        >>> calculate_timeout(Decimal('0.1'))
+        5
+        >>> calculate_timeout(Decimal('0.5'))
+        10
+        >>> calculate_timeout(Decimal('1.0'))
+        20
+    """
+    quantity_float = float(quantity)
+
+    if quantity_float <= 0.1:
+        return 5
+    elif quantity_float <= 0.5:
+        return 10
+    else:
+        return 20
+
+
+def extract_filled_quantity(order_result: dict) -> Decimal:
+    """Extract filled quantity from order result.
+
+    Handles various order result formats:
+    - dict with 'state/traded_size'
+    - dict with 'size'
+    - list/tuple format [price, size]
+    - dict with 'metadata' (market orders return 0)
+
+    Args:
+        order_result: Order result from REST or WebSocket API
+
+    Returns:
+        Filled quantity as Decimal, or 0 if extraction fails
+    """
+    try:
+        # Try direct key access first
+        if 'state' in order_result and 'traded_size' in order_result['state']:
+            return Decimal(order_result['state']['traded_size'])
+
+        # Try metadata access (WebSocket format - market orders don't have metadata)
+        if 'metadata' in order_result:
+            return Decimal('0')
+
+        # Try list format [price, size]
+        if isinstance(order_result, (list, tuple)) and len(order_result) >= 2:
+            return Decimal(order_result[1])
+
+        # Try dict format {'price': ..., 'size': ...}
+        if isinstance(order_result, dict):
+            if 'size' in order_result:
+                return Decimal(order_result['size'])
+            if 'traded_size' in order_result:
+                return Decimal(order_result['traded_size'])
+
+        return Decimal('0')
+
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        return Decimal('0')
+
+
+def calculate_slippage_bps(execution_price: Decimal, reference_price: Decimal) -> Decimal:
+    """Calculate slippage in basis points.
+
+    Basis point (bps) = 0.01%, where 100 bps = 1%
+
+    Args:
+        execution_price: Actual execution price
+        reference_price: Reference price (BBO midpoint or expected price)
+
+    Returns:
+        Slippage in basis points (1 bps = 0.01%)
+    """
+    if reference_price <= 0:
+        return Decimal('0')
+
+    slippage = abs(execution_price - reference_price) / reference_price * 10000
+    return Decimal(str(slippage))
+
+
 class GrvtClient(BaseExchangeClient):
     """GRVT exchange client implementation."""
 
@@ -615,6 +707,162 @@ class GrvtClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
+    async def fetch_bbo(self, symbol: str) -> dict:
+        """Fetch Best Bid/Ask prices with detailed information.
+
+        Returns dict format with all BBO details for smart routing.
+        This is a NEW method - existing fetch_bbo_prices() still returns Tuple[Decimal, Decimal].
+
+        Args:
+            symbol: Trading pair (uses existing contract_id format)
+
+        Returns:
+            {
+                'best_bid_price': Decimal,
+                'best_bid_size': Decimal,
+                'best_ask_price': Decimal,
+                'best_ask_size': Decimal,
+                'spread': Decimal,
+                'mid_price': Decimal
+            }
+        """
+        ticker = await self.rest_client.fetch_ticker(symbol)
+
+        # Verify required keys exist
+        required_keys = ['best_bid_price', 'best_bid_size', 'best_ask_price', 'best_ask_size']
+        for key in required_keys:
+            if key not in ticker:
+                raise ValueError(f"fetch_ticker() returned unexpected structure: {ticker}")
+
+        best_bid = Decimal(ticker['best_bid_price'])
+        best_bid_size = Decimal(ticker['best_bid_size'])
+        best_ask = Decimal(ticker['best_ask_price'])
+        best_ask_size = Decimal(ticker['best_ask_size'])
+
+        return {
+            'best_bid_price': best_bid,
+            'best_bid_size': best_bid_size,
+            'best_ask_price': best_ask,
+            'best_ask_size': best_ask_size,
+            'spread': best_ask - best_bid,
+            'mid_price': (best_bid + best_ask) / 2
+        }
+
+    async def analyze_order_book_depth(
+        self, symbol: str, side: str, depth_limit: int = 50
+    ) -> dict:
+        """Analyze order book depth at specific side.
+
+        Args:
+            symbol: Trading pair (uses existing contract_id format)
+            side: 'buy' (check asks) or 'sell' (check bids)
+            depth_limit: Number of levels (10, 50, 100, 500)
+
+        Returns:
+            {
+                'top_price': Decimal,
+                'top_size': Decimal,
+                'cumulative_size': Decimal,
+                'price_levels': [
+                    {'price': Decimal, 'size': Decimal, 'cumulative': Decimal, 'position': int},
+                    ...
+                ]
+            }
+
+        Note: GRVT returns order book as dict with 'price', 'size', 'num_orders' keys
+        """
+        orderbook = await self.rest_client.fetch_order_book(symbol, limit=depth_limit)
+
+        # GRVT format: {'bids': [{'price': '...', 'size': '...', ...}], 'asks': [...]}
+        if side == 'buy':
+            levels = orderbook['asks']
+        else:
+            levels = orderbook['bids']
+
+        if not levels:
+            raise ValueError(f"No {side} order book data available")
+
+        price_levels = []
+        cumulative = Decimal('0')
+
+        for i, level in enumerate(levels):
+            # GRVT uses dict format: {'price': str, 'size': str, 'num_orders': int}
+            if isinstance(level, dict):
+                price = Decimal(level['price'])
+                size = Decimal(level['size'])
+            else:
+                raise ValueError(f"Unexpected order book format: {type(level)}")
+
+            cumulative += size
+            price_levels.append({
+                'price': price,
+                'size': size,
+                'cumulative': cumulative,
+                'position': i + 1
+            })
+
+        top = price_levels[0]
+
+        return {
+            'top_price': top['price'],
+            'top_size': top['size'],
+            'cumulative_size': top['cumulative'],
+            'price_levels': price_levels,
+            'total_levels_analyzed': len(price_levels)
+        }
+
+    async def find_hedge_price_with_liquidity(
+        self, symbol: str, side: str, target_quantity: Decimal, max_slippage_bps: int = 5, depth_limit: int = 50
+    ) -> tuple:
+        """Find optimal price for hedge order with sufficient liquidity.
+
+        Walks the order book to find price where cumulative size >= target.
+
+        Args:
+            symbol: Trading pair (uses existing contract_id format)
+            side: 'buy' (look at asks) or 'sell' (look at bids)
+            target_quantity: Size needed
+            max_slippage_bps: Maximum acceptable slippage (default: 5)
+            depth_limit: Order book levels to analyze
+
+        Returns:
+            (optimal_price, slippage_bps, levels_used)
+
+        Raises:
+            ValueError: If insufficient liquidity at max slippage
+        """
+        analysis = await self.analyze_order_book_depth(symbol, side, depth_limit)
+
+        top_price = analysis['top_price']
+        cumulative = analysis['top_size']
+        price_levels = analysis['price_levels']
+
+        # If top of book has enough liquidity, use it
+        if cumulative >= target_quantity:
+            return top_price, Decimal('0'), 1
+
+        # Walk the order book
+        worst_price = top_price
+        for level in price_levels:
+            worst_price = level['price']
+            cumulative = level['cumulative']
+            if cumulative >= target_quantity:
+                break
+
+        # Calculate slippage
+        slippage = abs(worst_price - top_price) / top_price * 10000  # Basis points
+
+        # Check against max slippage
+        if slippage > max_slippage_bps:
+            available = cumulative
+            raise ValueError(
+                f"Insufficient liquidity: need {target_quantity}, "
+                f"available {available} at {max_slippage_bps} bps slippage, "
+                f"worst price: {worst_price:.2f}, slippage: {slippage:.2f} bps"
+            )
+
+        return worst_price, slippage, analysis['total_levels_analyzed']
+
     async def place_post_only_order(
         self, contract_id: str, quantity: Decimal, price: Decimal, side: str
     ) -> OrderResult:
@@ -973,203 +1221,216 @@ class GrvtClient(BaseExchangeClient):
         target_quantity: Decimal,
         side: str,
         max_iterations: int = 20,
-        max_tick_offset: int = 10,
-        max_fill_duration: int = 30,
+        max_slippage_bps: int = 5,
+        tick_size: int = 10,
     ) -> dict:
-        """Place iterative market orders to fill target_quantity by consuming GRVT liquidity depth.
+        """Place iterative market orders with smart liquidity routing.
 
         Strategy:
-        1. Place market order for remaining quantity
-        2. If partial fill, retry at 1-tick worse price
-        3. Repeat until target_quantity filled or max_iterations/max_tick_offset reached
+        1. Fetch BBO at start
+        2. Place first chunk at BBO-1tick
+        3. Re-fetch BBO at each iteration for fresh data
+        4. Use cumulative depth to determine chunk sizes
+        5. Monitor slippage and stop when filled or max iterations
 
         Args:
-            contract_id: GRVT contract symbol
+            contract_id: Trading pair (used as-is, no format conversion)
             target_quantity: Total quantity to fill
             side: 'buy' or 'sell'
-            max_iterations: Maximum retry attempts (default: 20)
-            max_tick_offset: Maximum price degradation in ticks (default: 10)
-            max_fill_duration: Maximum time to complete fill in seconds (default: 30)
+            max_iterations: Maximum iterations (default: 20)
+            max_slippage_bps: Maximum acceptable slippage (default: 5 bps)
+            tick_size: GRVT tick size in cents (default: 10 for ETH = $0.10)
 
         Returns:
-            dict: {
-                'total_filled': Decimal,
-                'total_fees': Decimal,
-                'average_price': Decimal,
-                'iterations': int,
-                'success': bool,
-                'reason': str (if failed)
-            }
+            Standard order result dict
         """
-        import time
-
-        start_time = time.time()
-        total_filled = Decimal("0")
-        total_fees = Decimal("0")
-        iteration = 0
+        remaining = target_quantity
         tick_offset = 0
-        price_history = []
+        total_slippage_bps = Decimal('0')
 
-        self.logger.log(
-            f"[ITERATIVE] Starting {side.upper()} {target_quantity} ETH fill",
-            "INFO"
-        )
+        # Initial BBO analysis
+        try:
+            bbo = await self.fetch_bbo(contract_id)
 
-        while total_filled < target_quantity:
-            # Safety checks
-            iteration += 1
-
-            if iteration > max_iterations:
-                reason = f"Max iterations ({max_iterations}) exceeded"
-                self.logger.log(f"[ITERATIVE] {reason}", "ERROR")
-                return {
-                    'total_filled': total_filled,
-                    'total_fees': total_fees,
-                    'average_price': sum(price_history) / len(price_history) if price_history else None,
-                    'iterations': iteration,
-                    'success': False,
-                    'reason': reason
-                }
-
-            if tick_offset > max_tick_offset:
-                reason = f"Max tick offset ({max_tick_offset}) exceeded"
-                self.logger.log(f"[ITERATIVE] {reason}", "ERROR")
-                return {
-                    'total_filled': total_filled,
-                    'total_fees': total_fees,
-                    'average_price': sum(price_history) / len(price_history) if price_history else None,
-                    'iterations': iteration,
-                    'success': False,
-                    'reason': reason
-                }
-
-            if time.time() - start_time > max_fill_duration:
-                reason = f"Max fill duration ({max_fill_duration}s) exceeded"
-                self.logger.log(f"[ITERATIVE] {reason}", "ERROR")
-                return {
-                    'total_filled': total_filled,
-                    'total_fees': total_fees,
-                    'average_price': sum(price_history) / len(price_history) if price_history else None,
-                    'iterations': iteration,
-                    'success': False,
-                    'reason': reason
-                }
-
-            # Calculate remaining quantity
-            remaining = target_quantity - total_filled
-
-            # Get current BBO with tick offset
-            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
-
-            # Apply tick offset (worsen price for our side)
-            tick_size = Decimal("0.01")  # ETH_USDT_Perp tick size
-            if side == "buy":
-                # Buying: pay more (worse price)
-                base_price = best_ask
-                adjusted_price = base_price + (tick_offset * tick_size)
+            if side == 'buy':
+                start_price = bbo['best_ask_price'] - (Decimal(tick_size) * Decimal(tick_offset))
             else:
-                # Selling: receive less (worse price)
-                base_price = best_bid
-                adjusted_price = base_price - (tick_offset * tick_size)
+                start_price = bbo['best_bid_price'] + (Decimal(tick_size) * Decimal(tick_offset))
 
-            # Place market order
-            try:
-                # IMPORTANT: Remove the 0.2 ETH limit for iterative approach
-                # We handle this by iterating instead of rejecting
+            self.logger.info(
+                f"[SMART_ROUTING] Starting with {side} order at {start_price:.2f}, "
+                f"target: {target_quantity}, BBO spread: {bbo['spread']:.2f}"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"[SMART_ROUTING] BBO fetch failed, using direct market order: {e}"
+            )
+            # Use old method as fallback
+            import time
+            start_time = time.time()
+            total_filled = Decimal('0')
+            iteration = 0
+
+            while total_filled < target_quantity:
+                iteration += 1
+                if iteration > max_iterations:
+                    break
+
+                remaining = target_quantity - total_filled
+                best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+
+                tick_size = Decimal("0.01")
+                if side == "buy":
+                    base_price = best_ask
+                else:
+                    base_price = best_bid
+
+                adjusted_price = base_price + (tick_offset * tick_size) if side == "buy" else base_price - (tick_offset * tick_size)
+
                 order_result = await self._ws_rpc_submit_order(
                     symbol=contract_id,
                     order_type='market',
                     side=side,
                     amount=remaining,
+                    price=adjusted_price,
                     verify_with_rest=True
                 )
 
                 if not order_result:
-                    self.logger.log(
-                        f"[ITERATIVE] Order failed (iteration {iteration}): API returned {order_result} "
-                        f"(type: {type(order_result)}, remaining: {remaining}, side: {side})",
-                        "WARNING"
-                    )
                     tick_offset += 1
                     continue
 
-                # Extract order info
                 metadata = order_result.get("metadata", {})
                 client_order_id = metadata.get("client_order_id")
 
-                # Wait for order to process
                 await asyncio.sleep(0.5)
-
-                # Get order info to check fill
                 order_info = await self.get_order_info(client_order_id=client_order_id)
 
                 if order_info and order_info.status == "FILLED":
                     filled_quantity = order_info.filled_size
-                    fill_price = order_info.avg_fill_price
-
                     total_filled += filled_quantity
-                    price_history.append(float(fill_price))
 
-                    # Calculate fee (approximate 0.05% taker fee)
-                    fee = filled_quantity * fill_price * Decimal("0.0005")
-                    total_fees += fee
-
-                    self.logger.log(
-                        f"[ITERATIVE] Iteration {iteration}: Filled {filled_quantity} @ ${fill_price} "
-                        f"(offset: {tick_offset} ticks, total: {total_filled}/{target_quantity})"
-                    )
-
-                    # Check if we're done
                     if total_filled >= target_quantity:
-                        avg_price = sum(price_history) / len(price_history)
-                        self.logger.log(
-                            f"[ITERATIVE] SUCCESS: Filled {total_filled} ETH @ avg ${avg_price:.2f} "
-                            f"in {iteration} iterations"
-                        )
-
-                        # Update local position
-                        if side == "buy":
-                            self._local_position += total_filled
-                        else:
-                            self._local_position -= total_filled
-
+                        self.logger.info(f"[ITERATIVE] SUCCESS: Filled {total_filled} ETH in {iteration} iterations")
                         return {
                             'total_filled': total_filled,
-                            'total_fees': total_fees,
-                            'average_price': Decimal(str(avg_price)),
+                            'total_fees': Decimal('0'),
+                            'average_price': order_info.avg_fill_price if order_info.avg_fill_price else Decimal('0'),
                             'iterations': iteration,
                             'success': True
                         }
 
-                    # Partial fill: increment tick offset for next attempt
-                    if filled_quantity < remaining:
-                        tick_offset += 1
-                        self.logger.debug(
-                            f"[ITERATIVE] Partial fill: {filled_quantity}/{remaining}, "
-                            f"increasing tick offset to {tick_offset}"
-                        )
+                    tick_offset += 1
 
-                else:
-                    # Order not filled or failed
-                    self.logger.log(
-                        f"[ITERATIVE] Partial fill: {filled_quantity}/{remaining} ETH filled",
-                        "WARNING"
-                    )
+            return {
+                'total_filled': total_filled,
+                'total_fees': Decimal('0'),
+                'average_price': Decimal('0'),
+                'iterations': iteration,
+                'success': False,
+                'reason': 'Max iterations exceeded (fallback)'
+            }
 
+        for iteration in range(1, max_iterations + 1):
+            # Re-fetch BBO for fresh market data
+            try:
+                bbo = await self.fetch_bbo(contract_id)
             except Exception as e:
-                self.logger.log(f"[ITERATIVE] Exception in iteration {iteration}: {e}", "ERROR")
-                tick_offset += 1
-                await asyncio.sleep(1)  # Wait before retry
+                self.logger.warning(f"[SMART_ROUTING] BBO re-fetch failed: {e}")
 
-        # Should not reach here, but just in case
-        return {
-            'total_filled': total_filled,
-            'total_fees': total_fees,
-            'average_price': sum(price_history) / len(price_history) if price_history else None,
-            'iterations': iteration,
-            'success': False,
-            'reason': 'Exited loop without completion'
-        }
+            # Calculate current price with tick offset
+            if side == 'buy':
+                current_price = bbo['best_ask_price'] - (Decimal(tick_size) * Decimal(tick_offset))
+            else:
+                current_price = bbo['best_bid_price'] + (Decimal(tick_size) * Decimal(tick_offset))
+
+            # Get current level size from BBO
+            current_level_size = bbo['best_ask_size'] if side == 'buy' else bbo['best_bid_size']
+
+            # If current level has enough liquidity, use it directly
+            if current_level_size >= remaining:
+                self.logger.info(
+                    f"[SMART_ROUTING] Iteration {iteration}: Placing {remaining} at "
+                    f"{current_price:.2f} (BBO level {tick_offset})"
+                )
+
+                order_result = await self._ws_rpc_submit_order(
+                    symbol=contract_id,
+                    order_type='market',
+                    side=side,
+                    amount=remaining,
+                    price=current_price,
+                    verify_with_rest=True
+                )
+
+                if order_result.get('success'):
+                    filled = extract_filled_quantity(order_result)
+                    remaining -= filled
+
+                    if remaining <= Decimal('0'):
+                        self.logger.info(
+                            f"[SMART_ROUTING] ✅ Fully filled in {iteration} iterations"
+                        )
+                        return order_result
+
+                # If failed, increment tick offset and continue
+                tick_offset += 1
+                continue
+
+            # Otherwise, use incremental chunking based on current level size
+            chunk_size = current_level_size
+
+            self.logger.info(
+                f"[SMART_ROUTING] Iteration {iteration}: Placing chunk {chunk_size} at "
+                f"{current_price:.2f} (BBO level {tick_offset}), remaining: {remaining}"
+            )
+
+            order_result = await self._ws_rpc_submit_order(
+                symbol=contract_id,
+                order_type='market',
+                side=side,
+                amount=chunk_size,
+                price=current_price,
+                verify_with_rest=True
+            )
+
+            if not order_result.get('success'):
+                tick_offset += 1
+                if tick_offset > max_iterations:
+                    self.logger.error(
+                        f"[SMART_ROUTING] ❌ Failed after {iteration} iterations"
+                    )
+                    return order_result
+                continue
+
+            # Extract filled quantity
+            filled = extract_filled_quantity(order_result)
+            remaining -= filled
+
+            # Calculate slippage
+            if iteration == 1:
+                reference_price = bbo['best_ask_price'] if side == 'buy' else bbo['best_bid_price']
+                total_slippage_bps = calculate_slippage_bps(current_price, reference_price)
+
+            self.logger.debug(
+                f"[SMART_ROUTING] Filled {filled}, remaining: {remaining}, "
+                f"price: {current_price:.2f}, slippage: {total_slippage_bps:.2f} bps"
+            )
+
+            if remaining <= Decimal('0'):
+                self.logger.info(
+                    f"[SMART_ROUTING] ✅ Fully filled in {iteration} iterations, "
+                    f"total slippage: {total_slippage_bps:.2f} bps"
+                )
+                return order_result
+
+            # Increment tick offset and continue
+            tick_offset += 1
+
+        self.logger.error(
+            f"[SMART_ROUTING] ❌ Failed to fill {target_quantity} after {max_iterations} iterations"
+        )
+        return {'success': False, 'error': 'Max iterations reached'}
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with GRVT."""
