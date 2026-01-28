@@ -51,7 +51,7 @@ def extract_filled_quantity(order_result: dict) -> Decimal:
     """Extract filled quantity from order result.
 
     Handles various order result formats:
-    - dict with 'state/traded_size'
+    - dict with 'state/traded_size' (list or string format)
     - dict with 'size'
     - list/tuple format [price, size]
     - dict with 'metadata' (market orders return 0)
@@ -63,9 +63,14 @@ def extract_filled_quantity(order_result: dict) -> Decimal:
         Filled quantity as Decimal, or 0 if extraction fails
     """
     try:
-        # Try direct key access first
+        # Try direct key access first (WebSocket RPC raw_rest_response format)
         if 'state' in order_result and 'traded_size' in order_result['state']:
-            return Decimal(order_result['state']['traded_size'])
+            traded_size = order_result['state']['traded_size']
+            # Handle list format: ["0.5"]
+            if isinstance(traded_size, list):
+                return Decimal(traded_size[0]) if len(traded_size) > 0 else Decimal('0')
+            # Handle string format: "0.5"
+            return Decimal(traded_size)
 
         # Try metadata access (WebSocket format - market orders don't have metadata)
         if 'metadata' in order_result:
@@ -80,7 +85,11 @@ def extract_filled_quantity(order_result: dict) -> Decimal:
             if 'size' in order_result:
                 return Decimal(order_result['size'])
             if 'traded_size' in order_result:
-                return Decimal(order_result['traded_size'])
+                traded_size = order_result['traded_size']
+                # Handle list format at top level
+                if isinstance(traded_size, list):
+                    return Decimal(traded_size[0]) if len(traded_size) > 0 else Decimal('0')
+                return Decimal(traded_size)
 
         return Decimal('0')
 
@@ -771,7 +780,7 @@ class GrvtClient(BaseExchangeClient):
 
         Note: GRVT returns order book as dict with 'price', 'size', 'num_orders' keys
         """
-        orderbook = await self.rest_client.fetch_order_book(symbol, limit=depth_limit)
+        orderbook = self.rest_client.fetch_order_book(symbol, limit=depth_limit)
 
         # GRVT format: {'bids': [{'price': '...', 'size': '...', ...}], 'asks': [...]}
         if side == 'buy':
@@ -1367,7 +1376,18 @@ class GrvtClient(BaseExchangeClient):
                 )
 
                 if order_result.get('success'):
-                    filled = extract_filled_quantity(order_result)
+                    # Extract fill data from raw_rest_response (WebSocket RPC format)
+                    raw_rest = order_result.get('raw_rest_response', {})
+                    if raw_rest and 'state' in raw_rest:
+                        traded_size = raw_rest['state'].get('traded_size')
+                        if traded_size:
+                            # Handle list format: ["0.5"]
+                            filled = Decimal(traded_size[0]) if isinstance(traded_size, list) else Decimal(traded_size)
+                        else:
+                            filled = Decimal('0')
+                    else:
+                        filled = Decimal('0')
+
                     remaining -= filled
 
                     if remaining <= Decimal('0'):
