@@ -726,7 +726,7 @@ class GrvtClient(BaseExchangeClient):
                 'mid_price': Decimal
             }
         """
-        ticker = await self.rest_client.fetch_ticker(symbol)
+        ticker = self.rest_client.fetch_ticker(symbol)
 
         # Verify required keys exist
         required_keys = ['best_bid_price', 'best_bid_size', 'best_ask_price', 'best_ask_size']
@@ -1227,11 +1227,11 @@ class GrvtClient(BaseExchangeClient):
         """Place iterative market orders with smart liquidity routing.
 
         Strategy:
-        1. Fetch BBO at start
-        2. Place first chunk at BBO-1tick
-        3. Re-fetch BBO at each iteration for fresh data
-        4. Use cumulative depth to determine chunk sizes
-        5. Monitor slippage and stop when filled or max iterations
+        1. Analyze order book depth to get price_levels (BAO, BAO+1, BAO+2...)
+        2. Follow available liquidity levels instead of fixed tick increments
+        3. Try to fill ALL remaining quantity at each level
+        4. If not filled, move to next liquidity level
+        5. Re-fetch BBO at each iteration for fresh data
 
         Args:
             contract_id: Trading pair (used as-is, no format conversion)
@@ -1239,31 +1239,39 @@ class GrvtClient(BaseExchangeClient):
             side: 'buy' or 'sell'
             max_iterations: Maximum iterations (default: 20)
             max_slippage_bps: Maximum acceptable slippage (default: 5 bps)
-            tick_size: GRVT tick size in cents (default: 10 for ETH = $0.10)
+            tick_size: Price increment for BAO levels (unused, kept for compatibility)
 
         Returns:
             Standard order result dict
         """
         remaining = target_quantity
-        tick_offset = 0
+        level_index = 0
         total_slippage_bps = Decimal('0')
 
-        # Initial BBO analysis
+        # Initial order book depth analysis to get price levels
         try:
-            bbo = await self.fetch_bbo(contract_id)
+            analysis = await self.analyze_order_book_depth(
+                symbol=contract_id,
+                side=side,
+                depth_limit=50
+            )
+
+            price_levels = analysis['price_levels']
+            top_price = analysis['top_price']
+            top_size = analysis['top_size']
 
             if side == 'buy':
-                start_price = bbo['best_ask_price'] - (Decimal(tick_size) * Decimal(tick_offset))
+                start_price = top_price
             else:
-                start_price = bbo['best_bid_price'] + (Decimal(tick_size) * Decimal(tick_offset))
+                start_price = top_price
 
             self.logger.info(
                 f"[SMART_ROUTING] Starting with {side} order at {start_price:.2f}, "
-                f"target: {target_quantity}, BBO spread: {bbo['spread']:.2f}"
+                f"target: {target_quantity}, available liquidity at BAO: {top_size}"
             )
         except Exception as e:
             self.logger.warning(
-                f"[SMART_ROUTING] BBO fetch failed, using direct market order: {e}"
+                f"[SMART_ROUTING] Order book analysis failed, using direct market order: {e}"
             )
             # Use old method as fallback
             import time
@@ -1335,23 +1343,25 @@ class GrvtClient(BaseExchangeClient):
             # Re-fetch BBO for fresh market data
             try:
                 bbo = await self.fetch_bbo(contract_id)
+                analysis = await self.analyze_order_book_depth(
+                    symbol=contract_id,
+                    side=side,
+                    depth_limit=50
+                )
+                price_levels = analysis['price_levels']
+                current_level_size = price_levels[level_index]['size']
+                current_price = price_levels[level_index]['price']
             except Exception as e:
-                self.logger.warning(f"[SMART_ROUTING] BBO re-fetch failed: {e}")
+                self.logger.warning(f"[SMART_ROUTING] Market data refresh failed: {e}")
+                # Continue with last known data if refresh fails
+                current_level_size = price_levels[level_index]['size']
+                current_price = price_levels[level_index]['price']
 
-            # Calculate current price with tick offset
-            if side == 'buy':
-                current_price = bbo['best_ask_price'] - (Decimal(tick_size) * Decimal(tick_offset))
-            else:
-                current_price = bbo['best_bid_price'] + (Decimal(tick_size) * Decimal(tick_offset))
-
-            # Get current level size from BBO
-            current_level_size = bbo['best_ask_size'] if side == 'buy' else bbo['best_bid_size']
-
-            # If current level has enough liquidity, use it directly
+            # Try to fill ALL remaining quantity at current level
             if current_level_size >= remaining:
                 self.logger.info(
                     f"[SMART_ROUTING] Iteration {iteration}: Placing {remaining} at "
-                    f"{current_price:.2f} (BBO level {tick_offset})"
+                    f"{current_price:.2f} (BBO level {level_index})"
                 )
 
                 order_result = await self._ws_rpc_submit_order(
@@ -1372,60 +1382,50 @@ class GrvtClient(BaseExchangeClient):
                             f"[SMART_ROUTING] ✅ Fully filled in {iteration} iterations"
                         )
                         return order_result
-
-                # If failed, increment tick offset and continue
-                tick_offset += 1
-                continue
-
-            # Otherwise, use incremental chunking based on current level size
-            chunk_size = current_level_size
-
-            self.logger.info(
-                f"[SMART_ROUTING] Iteration {iteration}: Placing chunk {chunk_size} at "
-                f"{current_price:.2f} (BBO level {tick_offset}), remaining: {remaining}"
-            )
-
-            order_result = await self._ws_rpc_submit_order(
-                symbol=contract_id,
-                order_type='market',
-                side=side,
-                amount=chunk_size,
-                price=current_price,
-                verify_with_rest=True
-            )
-
-            if not order_result.get('success'):
-                tick_offset += 1
-                if tick_offset > max_iterations:
-                    self.logger.error(
-                        f"[SMART_ROUTING] ❌ Failed after {iteration} iterations"
+                    else:
+                        # Partial fill - move to next level and try again
+                        self.logger.info(
+                            f"[SMART_ROUTING] Partial fill: {filled}/{remaining} at level {level_index}, "
+                            f"moving to next level"
+                        )
+                        level_index += 1
+                        continue
+                else:
+                    # Order failed - move to next level and try again
+                    self.logger.warning(
+                        f"[SMART_ROUTING] Order failed at level {level_index}, moving to next level"
                     )
-                    return order_result
-                continue
+                    level_index += 1
+                    continue
 
-            # Extract filled quantity
-            filled = extract_filled_quantity(order_result)
-            remaining -= filled
-
-            # Calculate slippage
-            if iteration == 1:
-                reference_price = bbo['best_ask_price'] if side == 'buy' else bbo['best_bid_price']
-                total_slippage_bps = calculate_slippage_bps(current_price, reference_price)
-
-            self.logger.debug(
-                f"[SMART_ROUTING] Filled {filled}, remaining: {remaining}, "
-                f"price: {current_price:.2f}, slippage: {total_slippage_bps:.2f} bps"
+            # Current level has insufficient liquidity
+            self.logger.info(
+                f"[SMART_ROUTING] Iteration {iteration}: Moving to BAO level {level_index}, "
+                f"price: {current_price:.2f}, size: {current_level_size}, remaining: {remaining}"
             )
 
-            if remaining <= Decimal('0'):
-                self.logger.info(
-                    f"[SMART_ROUTING] ✅ Fully filled in {iteration} iterations, "
-                    f"total slippage: {total_slippage_bps:.2f} bps"
-                )
-                return order_result
+            # Move to next level and try again
+            level_index += 1
 
-            # Increment tick offset and continue
-            tick_offset += 1
+            if level_index >= len(price_levels):
+                self.logger.error(
+                    f"[SMART_ROUTING] ❌ Insufficient liquidity - reached max levels {len(price_levels)}"
+                )
+                return {'success': False, 'error': 'Insufficient liquidity'}
+
+            # Recalculate with new level
+            try:
+                bbo = await self.fetch_bbo(contract_id)
+                analysis = await self.analyze_order_book_depth(
+                    symbol=contract_id,
+                    side=side,
+                    depth_limit=50
+                )
+                price_levels = analysis['price_levels']
+                current_level_size = price_levels[level_index]['size']
+                current_price = price_levels[level_index]['price']
+            except Exception as e:
+                self.logger.warning(f"[SMART_ROUTING] Market data refresh failed: {e}")
 
         self.logger.error(
             f"[SMART_ROUTING] ❌ Failed to fill {target_quantity} after {max_iterations} iterations"
