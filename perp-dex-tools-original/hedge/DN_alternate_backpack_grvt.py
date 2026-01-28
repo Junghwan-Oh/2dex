@@ -24,7 +24,7 @@ import pytz
 
 # Import exchanges modules (like Mean Reversion bot)
 from exchanges.backpack import BackpackClient
-from exchanges.grvt import GrvtClient
+from exchanges.grvt import GrvtClient, extract_filled_quantity, calculate_timeout
 # Paradex removed - replaced by Backpack
 
 
@@ -310,6 +310,57 @@ class DNHedgeBot:
             f"  CUMULATIVE: {self.completed_cycles} cycles | PnL: ${self.total_gross_pnl:.4f} | Avg: {avg_pnl_bps:+.2f} bps\n"
             f"{'-' * 55}"
         )
+
+    async def check_grvt_liquidity(
+        self,
+        client,
+        target_quantity: Decimal,
+        side: str
+    ) -> dict:
+        """Check if GRVT has sufficient liquidity at BBO.
+
+        Returns:
+            dict with format:
+            {
+                'sufficient_at_bbo': bool,
+                'available_size': Decimal,
+                'depth_levels_used': int,
+                'fallback_needed': bool
+            }
+        """
+        try:
+            if not hasattr(client, 'analyze_order_book_depth'):
+                self.logger.warning("[LIQUIDITY_CHECK] Client missing analyze_order_book_depth method")
+                return {
+                    'sufficient_at_bbo': False,
+                    'available_size': Decimal('0'),
+                    'depth_levels_used': 0,
+                    'fallback_needed': True
+                }
+
+            analysis = await client.analyze_order_book_depth(
+                symbol=client.config.contract_id,
+                side=side,
+                depth_limit=50
+            )
+
+            bbo_size = analysis['top_size']
+            cumulative = analysis['cumulative']
+
+            return {
+                'sufficient_at_bbo': bbo_size >= target_quantity,
+                'available_size': cumulative,
+                'depth_levels_used': analysis['total_levels_analyzed'],
+                'fallback_needed': cumulative < target_quantity
+            }
+        except Exception as e:
+            self.logger.warning(f"[LIQUIDITY_CHECK] Failed: {e}")
+            return {
+                'sufficient_at_bbo': False,
+                'available_size': Decimal('0'),
+                'depth_levels_used': 0,
+                'fallback_needed': True
+            }
 
     async def cleanup_connections(self):
         if self.hedge_client:
@@ -854,30 +905,35 @@ class DNHedgeBot:
                             contract_id=self.hedge_contract_id,
                             target_quantity=quantity,
                             side=order_side,
-                            max_iterations=10,   # Increased from 3 - fixes cold start failures
-                            max_tick_offset=2,    # Sufficient for liquidity depth
-                            max_fill_duration=30  # Increased from 1 - removes timeout constraint
+                            max_iterations=10,
+                            tick_size=10  # INT: 10 cents = $0.10 - FIXED V4 SIGNATURE
                         )
 
-                        if result['success']:
+                        if result.get('success', True):  # FIXED: Use .get() for safety
+                            filled = extract_filled_quantity(result)
+                            avg_price = result.get('average_price', None) or result.get('traded_size', result.get('size', {}))
+
                             self.logger.info(
-                                f"[CLOSE] [ITERATIVE] Filled {result['total_filled']} @ ${result['average_price']:.2f} "
-                                f"({result['iterations']} iterations)"
+                                f"[CLOSE] [GRVT] [ITERATIVE_FILL]: "
+                                f"{filled} @ ~{avg_price}"
                             )
+
                             self.log_trade_to_csv(
                                 exchange=self.hedge_exchange.upper(),
                                 side=side,
-                                price=str(result['average_price']),
-                                quantity=str(result['total_filled']),
+                                price=str(avg_price) if avg_price else "N/A",
+                                quantity=str(filled),
                                 order_type="hedge_close_iterative",
-                                mode="iterative_market"
+                                mode="iterative_routing"
                             )
+
                             self.hedge_order_filled = True
                             self.order_execution_complete = True
-                            self.last_hedge_fill_price = result['average_price']
+                            self.last_hedge_fill_price = avg_price
                             return True
                         else:
-                            self.logger.error(f"[CLOSE] Iterative failed: {result.get('reason', 'unknown')}")
+                            error_msg = result.get('error', 'unknown') or result.get('reason', 'unknown')
+                            self.logger.error(f"[CLOSE] Iterative failed: {error_msg}")
                             self.hedge_order_filled = False
                             self.order_execution_complete = False
                             return False
@@ -1049,30 +1105,35 @@ class DNHedgeBot:
                             contract_id=self.hedge_contract_id,
                             target_quantity=quantity,
                             side=order_side,
-                            max_iterations=10,   # Increased from 3 - fixes cold start failures
-                            max_tick_offset=2,    # Sufficient for liquidity depth
-                            max_fill_duration=30  # Increased from 1 - removes timeout constraint
+                            max_iterations=10,
+                            tick_size=10  # INT: 10 cents = $0.10 - FIXED V4 SIGNATURE
                         )
 
-                        if result['success']:
+                        if result.get('success', True):  # FIXED: Use .get() for safety
+                            filled = extract_filled_quantity(result)
+                            avg_price = result.get('average_price', None) or result.get('traded_size', result.get('size', {}))
+
                             self.logger.info(
-                                f"[OPEN] [ITERATIVE] Filled {result['total_filled']} @ ${result['average_price']:.2f} "
-                                f"({result['iterations']} iterations)"
+                                f"[OPEN] [GRVT] [ITERATIVE_FILL]: "
+                                f"{filled} @ ~{avg_price}"
                             )
+
                             self.log_trade_to_csv(
                                 exchange=self.hedge_exchange.upper(),
                                 side=side,
-                                price=str(result['average_price']),
-                                quantity=str(result['total_filled']),
+                                price=str(avg_price) if avg_price else "N/A",
+                                quantity=str(filled),
                                 order_type="hedge_open_iterative",
-                                mode="iterative_market"
+                                mode="iterative_routing"
                             )
+
                             self.hedge_order_filled = True
                             self.order_execution_complete = True
-                            self.last_hedge_fill_price = result['average_price']
+                            self.last_hedge_fill_price = avg_price
                             return True
                         else:
-                            self.logger.error(f"[OPEN] Iterative failed: {result.get('reason', 'unknown')}")
+                            error_msg = result.get('error', 'unknown') or result.get('reason', 'unknown')
+                            self.logger.error(f"[OPEN] Iterative failed: {error_msg}")
                             self.hedge_order_filled = False
                             self.order_execution_complete = False
                             return False
