@@ -1,0 +1,88 @@
+#!/usr/bin/env python
+"""Test script for BBO routing fix."""
+import asyncio
+import sys
+from decimal import Decimal
+
+# Add parent directory to path
+import os
+parent_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, parent_dir)
+
+from exchanges.grvt import GrvtClient, extract_filled_quantity
+
+
+async def test_iterative_market_order():
+    """Test the fixed place_iterative_market_order method."""
+    print("=" * 80)
+    print("BBO Routing Fix Test")
+    print("=" * 80)
+    print()
+
+    # Initialize GRVT client
+    print("1. Initializing GRVT client...")
+    try:
+        # This will use environment variables for config
+        config = {}
+        client = GrvtClient(config)
+
+        # Analyze order book depth to understand the fix
+        print("2. Analyzing order book depth...")
+        analysis = await client.analyze_order_book_depth(
+            symbol='ETH-PERP',
+            side='buy',
+            depth_limit=50
+        )
+
+        print(f"   Top price (BAO): {analysis['top_price']:.2f}")
+        print(f"   Top size: {analysis['top_size']:.2f}")
+        print(f"   Total levels analyzed: {analysis['total_levels_analyzed']}")
+        print()
+
+        # Show price levels
+        print("   First 5 price levels:")
+        for i, level in enumerate(analysis['price_levels'][:5]):
+            print(f"      Level {i}: price={level['price']:.2f}, size={level['size']:.2f}, cumulative={level['cumulative']:.2f}")
+        print()
+
+        # Test the fix
+        print("3. Testing place_iterative_market_order...")
+        print(f"   Target: 0.5 ETH (buy)")
+        print()
+
+        result = await client.place_iterative_market_order(
+            contract_id='ETH-PERP',
+            target_quantity=Decimal('0.5'),
+            side='buy',
+            max_iterations=10,
+            tick_size=10  # Keep for compatibility
+        )
+
+        print()
+        print("=" * 80)
+        print("Result:")
+        print("=" * 80)
+        print(f"Success: {result.get('success')}")
+        print(f"Total filled: {result.get('total_filled')}")
+        print(f"Average price: {result.get('average_price')}")
+        print(f"Iterations: {result.get('iterations')}")
+
+        if result.get('success'):
+            print()
+            print("✅ BBO routing fix is working correctly!")
+            print("   - Uses analyze_order_book_depth for liquidity following")
+            print("   - Follows BAO, BAO+1, BAO+2... pricing")
+            print("   - Tries to fill ALL remaining quantity each iteration")
+        else:
+            print()
+            print("❌ Failed to fill target quantity")
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(test_iterative_market_order())

@@ -1,0 +1,12 @@
+{
+  "active": true,
+  "mode": "ralplan",
+  "iteration": 0,
+  "max_iterations": 5,
+  "current_phase": "complete",
+  "started_at": "2026-01-28T14:45:00Z",
+  "task_description": "비동기 버그 상세 리서치 후 한방에 해결할 수 있는 계획",
+  "completed_at": "2026-01-28T14:50:00Z",
+  "plan_path": ".omc/plans/async-bug-fix-plan.md",
+  "critic_verdict": "OKAY"
+}

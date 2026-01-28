@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm:*)",
+      "Bash(f:/Dropbox/dexbot/perpdex/venv/Scripts/python.exe:*)",
+      "Bash(cat:*)",
+      "Bash(git checkout:*)",
+      "Bash(git gc:*)",
+      "Bash(git add:*)",
+      "Bash(git check-ignore:*)"
+    ]
+  }
+}

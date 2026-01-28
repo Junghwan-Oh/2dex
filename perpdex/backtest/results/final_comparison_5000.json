@@ -1,0 +1,71 @@
+[
+  {
+    "strategy": "Cross-DEX MM",
+    "capital": 5000.0,
+    "return": -4.461501520959354,
+    "sharpe": -0.006602370740483097,
+    "winRate": 51.72231054583995,
+    "totalTrades": 3774,
+    "tradesPerDay": 629.0,
+    "maxDrawdown": 9.502808239657544,
+    "totalPnl": -223.0750760479795,
+    "finalEquity": 4776.924923952032,
+    "monthlyVolume": 92033429.46125595,
+    "monthlyTrades": 18870.0,
+    "feeBreakdown": {
+      "apexFees": 3681.3371784502383,
+      "paradexFees": 0.0,
+      "netFees": 3681.3371784502383,
+      "feeRate": 0.0001
+    },
+    "targetAchieved": false,
+    "monthlyVolumeTarget": 1000000,
+    "volumeTargetMet": true
+  },
+  {
+    "strategy": "Cross-DEX MM (Grid)",
+    "capital": 5000.0,
+    "return": -4.461501520959354,
+    "sharpe": -0.006602370740483097,
+    "winRate": 51.72231054583995,
+    "totalTrades": 3774,
+    "tradesPerDay": 629.0,
+    "maxDrawdown": 9.502808239657544,
+    "totalPnl": -223.0750760479795,
+    "finalEquity": 4776.924923952032,
+    "monthlyVolume": 92033429.46125595,
+    "monthlyTrades": 18870.0,
+    "feeBreakdown": {
+      "apexFees": 3681.3371784502383,
+      "paradexFees": 0.0,
+      "netFees": 3681.3371784502383,
+      "feeRate": 0.0001
+    },
+    "targetAchieved": false,
+    "monthlyVolumeTarget": 1000000,
+    "volumeTargetMet": true
+  },
+  {
+    "strategy": "Avellaneda MM",
+    "capital": 5000.0,
+    "return": 0.19772653176578386,
+    "sharpe": 0.0010876399277466667,
+    "winRate": 49.879692011549565,
+    "totalTrades": 4156,
+    "tradesPerDay": 692.6666666666666,
+    "maxDrawdown": 10.954852831715971,
+    "totalPnl": 9.886326588308567,
+    "finalEquity": 5009.886326588289,
+    "monthlyVolume": 100876023.43161103,
+    "monthlyTrades": 20780.0,
+    "feeBreakdown": {
+      "apexFees": 4035.0409372644417,
+      "paradexFees": 0.0,
+      "netFees": 4035.0409372644417,
+      "effectiveFeeRate": 0.0001
+    },
+    "targetAchieved": true,
+    "monthlyVolumeTarget": 1000000,
+    "volumeTargetMet": true
+  }
+]

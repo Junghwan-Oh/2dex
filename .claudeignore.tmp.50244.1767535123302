@@ -1,0 +1,44 @@
+# C 드라이브 전체 차단
+C:\Users\crypto quant\.claude\**
+
+# ================================================
+# SuperClaude Framework 완전 제거
+# ================================================
+
+# Core Framework
+.claude/BUSINESS_*.md
+.claude/FLAGS.md
+.claude/RESEARCH_CONFIG.md
+.claude/RULES.md
+.claude/PRINCIPLES.md
+
+# Behavioral Modes (전체)
+.claude/MODE_*.md
+
+# MCP Documentation (SuperClaude 것만)
+.claude/MCP_Magic.md
+.claude/MCP_Morphllm.md
+.claude/MCP_Context7.md
+.claude/MCP_Playwright.md
+.claude/MCP_Tavily.md
+
+# E2E 테스트 가이드 (현재 작업과 무관)
+.claude/CLAUDE.md
+
+# ================================================
+# MoAI 시스템 유지 (제거하지 않음)
+# ================================================
+# CLAUDE.md (프로젝트 루트) - Alfred 가이드
+# .claude/agents/moai/
+# .claude/commands/moai/
+# .claude/hooks/moai/
+# .claude/skills/moai-*
+# .claude/MCP_Serena.md - 실제 MCP 서버 문서
+# .claude/MCP_Sequential.md - 실제 MCP 서버 문서
+
+# 유지할 파일 (명시)
+# CLAUDE.md (프로젝트 루트) - Alfred 가이드
+# .claude/RULES.md
+# .claude/PRINCIPLES.md
+# .claude/MODE_Task_Management.md
+# .claude/MCP_Serena.md

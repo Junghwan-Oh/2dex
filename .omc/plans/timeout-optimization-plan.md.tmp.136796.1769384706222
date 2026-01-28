@@ -1,0 +1,950 @@
+# DN Bot Timeout Optimization + Post-Mortem Report
+
+**Date**: 2026-01-26
+**Status**: RALPLAN COMPREHENSIVE PLAN
+**Working Commit**: 0b17cea (BUILD/UNWIND comprehensive fix + GRVT cold start solution)
+
+---
+
+## Part 1: POST-MORTEM - Agent Failure Analysis
+
+### What Happened
+
+**Timeline of Events**:
+1. **Working State**: Commit 0b17cea was functioning correctly
+   - BUILD/UNWIND logic working
+   - GRVT cold start workaround in place
+   - Emergency unwind implemented
+   - Test passed: ETH 0.5, 1 iteration
+
+2. **User Requests**: Two optimization tasks
+   - Task 1: "Remove Primary 10s timeout - speed up execution"
+   - Task 2: "Change GRVT to LIMIT orders for maker fees"
+
+3. **Agent Delegation**: Executor-low agents were delegated to implement
+
+4. **CRITICAL FAILURE**: Agents introduced **broken buy/sell logic** in GRVT LIMIT order code
+
+**Evidence of Failure**:
+```python
+# BROKEN CODE introduced by agent (lines 806-813 in multiple .tmp files):
+if side == "buy":
+    order_price = best_ask + self.hedge_tick_size
+    post_only_side = "sell"  # ❌ WRONG! Should be "buy"
+else:
+    order_price = best_bid - self.hedge_tick_size
+    post_only_side = "buy"   # ❌ WRONG! Should be "sell"
+```
+
+**Impact**:
+- If bot wants to BUY hedge → places SELL order → OPPOSITE DIRECTION
+- If bot wants to SELL hedge → places BUY order → OPPOSITE DIRECTION
+- **Doubles position instead of hedging**
+- **Complete loss of delta neutrality**
+
+---
+
+### Root Cause Analysis
+
+#### 1. Agent Prompt Interpretation Failure
+
+**What the Agent Was Asked**:
+```
+"Change GRVT to LIMIT orders for maker fees"
+```
+
+**What the Agent Likely Misunderstood**:
+The agent saw "POST_ONLY LIMIT orders for maker fees" and **incorrectly assumed** that POST_ONLY orders must be placed on the **opposite side** of the order book.
+
+**The Flawed Logic Chain**:
+1. POST_ONLY means "don't cross the spread"
+2. To avoid crossing, agent thought "post on opposite side"
+3. Agent flipped `post_only_side` variable
+4. **Result**: Buy orders became sell orders, sell orders became buy orders
+
+**Why This Happened**:
+- **Lack of trading domain knowledge**: Agent didn't understand that POST_ONLY orders are still placed in the **intended direction**, just at conservative prices
+- **Missing context**: Agent wasn't told this is a HEDGING bot where direction is critical
+- **No verification step**: Agent didn't validate the logic against working code
+
+#### 2. Misunderstanding POST_ONLY Mechanics
+
+**Correct POST_ONLY Behavior**:
+```python
+# CORRECT: Place BUY order on BID side (conservative price)
+if side == "buy":
+    order_price = best_bid - tick_size  # BELOW best bid (conservative)
+    post_only_side = "buy"              # Still a BUY order
+```
+
+**Agent's Incorrect Interpretation**:
+```python
+# WRONG: Place BUY order on ASK side (crosses spread)
+if side == "buy":
+    order_price = best_ask + tick_size  # ABOVE best ask (aggressive)
+    post_only_side = "sell"             # ❌ Flipped to SELL
+```
+
+**The Agent's Error**:
+- Thought "POST_ONLY on opposite side" meant "flip the direction"
+- Actually means "place on same side, but at passive price"
+
+---
+
+### Why the Agent Flipped buy/sell
+
+**Hypothesis 1: Ambiguous Variable Name**
+```python
+post_only_side = "sell"  # Agent thought this meant "side of order book"
+                           # Not "direction of trade"
+```
+
+**Hypothesis 2: Confusion with "Opposite Side" Terminology**
+- In order book terminology: "opposite side" = bid vs ask
+- In trading terminology: "opposite side" = buy vs sell
+- Agent mixed these concepts
+
+**Hypothesis 3: No Understanding of Hedge Logic**
+- Agent didn't realize this is a delta-neutral strategy
+- Didn't understand that flipping direction breaks the hedge
+- **Never asked**: "Will this change the hedge direction?"
+
+---
+
+### Prevention Strategies
+
+#### Strategy 1: Add Pre-Flight Validation Check
+
+**Add to `place_hedge_order()` method**:
+```python
+# CRITICAL: Validate order direction before placement
+if self.hedge_exchange.lower() == "grvt" and "post_only" in str(order_type).lower():
+    # Verify hedge direction matches intended direction
+    current_primary_pos = await self.primary_client.get_account_positions()
+    intended_hedge_side = "sell" if current_primary_pos > 0 else "buy"
+    actual_hedge_side = side
+
+    if intended_hedge_side != actual_hedge_side:
+        self.logger.error(
+            f"[CRITICAL] Hedge direction MISMATCH! "
+            f"Primary={current_primary_pos}, intended={intended_hedge_side}, actual={actual_hedge_side}"
+        )
+        raise Exception("HEDGE_DIRECTION_ERROR: Agent may have flipped buy/sell")
+```
+
+**Benefit**: Catches direction errors BEFORE order placement
+
+#### Strategy 2: Add Unit Tests for Hedge Direction
+
+**Create `test_hedge_direction.py`**:
+```python
+def test_hedge_buy_direction():
+    """Verify BUY hedge places BUY order, not SELL"""
+    bot = DNAlternateBot(...)
+    bot.primary_position = Decimal("1.0")  # LONG position
+    bot.hedge_position = Decimal("0.0")    # No hedge
+
+    # Should place SELL to hedge LONG position
+    result = bot.place_hedge_order(side="sell", quantity=Decimal("1.0"))
+    assert result == True
+    assert bot.hedge_position < 0  # SHORT hedge created
+
+def test_hedge_sell_direction():
+    """Verify SELL hedge places SELL order, not BUY"""
+    bot = DNAlternateBot(...)
+    bot.primary_position = Decimal("-1.0")  # SHORT position
+    bot.hedge_position = Decimal("0.0")     # No hedge
+
+    # Should place BUY to hedge SHORT position
+    result = bot.place_hedge_order(side="buy", quantity=Decimal("1.0"))
+    assert result == True
+    assert bot.hedge_position > 0  # LONG hedge created
+```
+
+**Benefit**: Automated detection of direction flips
+
+#### Strategy 3: Add Agent Prompt Guardrails
+
+**When delegating to executor agents, always include**:
+```python
+AGENT_PROMPT_TEMPLATE = """
+CRITICAL CONSTRAINTS:
+- This is a DELTA-NEUTRAL HEDGING bot
+- Direction is CRITICAL: Buy hedge ≠ Buy order
+- NEVER flip buy/sell direction without EXPLICIT user request
+- If you change order logic, you MUST explain impact on hedge direction
+
+TASK: {task_description}
+
+CONTEXT:
+- Primary position: {primary_position}
+- Hedge position: {hedge_position}
+- Intended hedge side: {intended_side}
+
+QUESTION: Will your change flip the hedge direction? If YES, STOP and ask user.
+"""
+```
+
+**Benefit**: Agents understand the stakes before making changes
+
+#### Strategy 4: Mandatory Code Review for Trading Logic
+
+**New Rule**:
+> Any change to `place_hedge_order()`, `place_primary_order()`, or order direction logic MUST be reviewed by:
+> 1. Human trader (domain knowledge)
+> 2. Senior engineer (code logic)
+> 3. **Both** must approve before merge
+
+**Implementation**:
+- Add `.omc/config/trading-logic-review-required.json`
+- Executor agents refuse to modify these files without approval flag
+
+#### Strategy 5: Add Integration Test Before Commit
+
+**Create `test_integration_hedge.py`**:
+```python
+async def test_hedge_maintains_delta_neutrality():
+    """Verify hedge actually neutralizes delta"""
+    bot = DNAlternateBot(...)
+
+    # Build LONG position on Primary
+    await bot.build_cycle()
+
+    # Verify net delta is near zero
+    net_delta = bot.primary_position + bot.hedge_position
+    assert abs(net_delta) < Decimal("0.01"), f"Net delta {net_delta} too large!"
+
+    # Build SHORT position on Primary
+    await bot.unwind_cycle()
+
+    # Verify net delta is still near zero
+    net_delta = bot.primary_position + bot.hedge_position
+    assert abs(net_delta) < Decimal("0.01"), f"Net delta {net_delta} too large!"
+```
+
+**Benefit**: Catches hedge failures before production
+
+---
+
+### Lessons Learned
+
+1. **Trading bots require domain knowledge validation**
+   - Generic agents don't understand delta neutrality
+   - Financial logic needs expert review
+
+2. **Direction is the most critical variable**
+   - A single flipped variable can double positions
+   - Always add pre-flight checks for trading direction
+
+3. **"Optimization" tasks are riskiest**
+   - Agents optimize for speed/fees without understanding strategy
+   - Performance improvements can break correctness
+
+4. **Working code is sacred**
+   - Agent broke commit 0b17cea which was TESTED and WORKING
+   - Should have added NEW logic, not MODIFIED working logic
+
+5. **Post-only orders are confusing**
+   - Terminology is ambiguous ("opposite side")
+   - Need explicit documentation of expected behavior
+
+---
+
+## Part 2: 5s Timeout Optimization
+
+### Context: Why 5s Timeout?
+
+**Background**:
+- **Previous state**: 10s timeout on Primary POST_ONLY orders
+- **User request**: "Remove timeout to speed up execution"
+- **Agent change**: Removed timeout completely
+- **Result**: Indefinite waits when POST_ONLY orders don't fill
+- **User response**: "Reduce timeout to 5s는 흥미롭네" (5s timeout is interesting)
+
+**Tradeoff Analysis**:
+
+| Timeout | Speed | Fill Rate | Risk |
+|---------|-------|-----------|------|
+| **0s (no limit)** | ⚠️ Indefinite wait | ✅ 100% | ❌ Stuck orders |
+| **10s (current)** | ⚠️ Slow (77s/cycle) | ✅ 95%+ | ✅ Safe |
+| **5s (proposed)** | ✅ ~50% faster | ⚠️ 80-90% | ⚠️ More retries |
+| **2s (aggressive)** | ✅ 75% faster | ❌ <70% | ❌ Excessive retries |
+
+**Why 5s is "Interesting"**:
+- Balances speed (5s vs 10s = 50% improvement)
+- Maintains reasonable fill rate (POST_ONLY orders often fill within 5s in volatile markets)
+- Reduces worst-case delay (5s max wait vs indefinite)
+- Middle ground between speed and reliability
+
+---
+
+### Requirements
+
+#### Functional Requirements
+
+**FR1**: Reduce Primary order timeout from 10s to 5s
+- Location: `place_primary_order()` method, lines 718-758
+- Current: No timeout (while loop with no break condition)
+- Target: 5s timeout with order cancellation
+
+**FR2**: Maintain POST_ONLY maker order behavior
+- Keep limit order placement on book
+- Preserve price calculation logic
+- Do NOT change to market orders
+
+**FR3**: Add timeout-based fallback
+- If 5s expires without fill → cancel order
+- After cancel → retry with fresh price
+- Max retries: 4 (same as current)
+
+**FR4**: Preserve all safety checks
+- Emergency unwind on hedge failure
+- Net delta monitoring
+- Position reconciliation
+
+#### Non-Functional Requirements
+
+**NFR1**: Speed improvement
+- Target: Reduce cycle time from 77s to <50s
+- Measurement: Average execution time over 10 iterations
+
+**NFR2**: Fill rate monitoring
+- Track POST_ONLY fill rate at 5s timeout
+- Log timeout events for analysis
+- Alert if fill rate drops below 80%
+
+**NFR3**: Backward compatibility
+- No changes to order price calculation
+- No changes to hedge logic
+- No changes to position management
+
+---
+
+### Implementation Plan
+
+#### Task 1: Implement 5s Timeout Logic
+
+**File**: `DN_alternate_backpack_grvt.py`
+**Method**: `place_primary_order()`
+**Lines**: 718-758
+
+**Current Code** (lines 720-749):
+```python
+while not self.stop_flag:
+    if self.primary_order_status == "CANCELED":
+        self.primary_order_status = None
+        (best_bid, best_ask) = await self.primary_client.fetch_bbo_prices(
+            self.primary_contract_id
+        )
+        order_price = self.calculate_order_price(
+            side, best_bid, best_ask, self.primary_tick_size, self.primary_mode
+        )
+        break
+
+    if self.primary_order_status == "FILLED":
+        return order_id
+
+    if self.primary_order_status in ["OPEN", "PENDING", "PARTIALLY_FILLED"]:
+        await asyncio.sleep(0.1)  # Poll status for faster response
+    else:
+        await asyncio.sleep(0.1)  # Poll status for faster response
+```
+
+**New Code** (add timeout tracking):
+```python
+# Track order placement time for timeout
+order_start_time = time.time()
+POST_ONLY_TIMEOUT = 5.0  # 5 second timeout for POST_ONLY orders
+
+while not self.stop_flag:
+    current_time = time.time()
+    elapsed_time = current_time - order_start_time
+
+    # TIMEOUT: Cancel if 5s elapsed without fill
+    if elapsed_time >= POST_ONLY_TIMEOUT and self.primary_order_status in ["OPEN", "PENDING"]:
+        self.logger.warning(
+            f"[PRIMARY] Post-only order timeout after {elapsed_time:.1f}s - cancelling"
+        )
+        await self.primary_client.cancel_order(order_id)
+        self.primary_order_status = "CANCELED"
+        continue
+
+    if self.primary_order_status == "CANCELED":
+        self.primary_order_status = None
+        (best_bid, best_ask) = await self.primary_client.fetch_bbo_prices(
+            self.primary_contract_id
+        )
+        order_price = self.calculate_order_price(
+            side, best_bid, best_ask, self.primary_tick_size, self.primary_mode
+        )
+        break
+
+    if self.primary_order_status == "FILLED":
+        fill_time = current_time - order_start_time
+        self.logger.info(f"[PRIMARY] Filled in {fill_time:.2f}s")
+        return order_id
+
+    if self.primary_order_status in ["OPEN", "PENDING", "PARTIALLY_FILLED"]:
+        await asyncio.sleep(0.1)  # Poll status for faster response
+    else:
+        await asyncio.sleep(0.1)  # Poll status for faster response
+```
+
+**Changes**:
+1. Added `POST_ONLY_TIMEOUT = 5.0` constant
+2. Track `order_start_time` when placing order
+3. Check timeout in while loop
+4. Cancel order if timeout exceeded
+5. Log fill time for monitoring
+
+---
+
+#### Task 2: Add Timeout Metrics
+
+**File**: `DN_alternate_backpack_grvt.py`
+**New Method**: `log_timeout_metrics()`
+
+**Implementation**:
+```python
+# Add to class __init__
+self.timeout_count = 0
+self.fast_fill_count = 0  # Fills within 2s
+self.slow_fill_count = 0  # Fills 2-5s
+self.total_fill_time = 0.0
+
+# Add after order fills (in place_primary_order)
+if elapsed_time < 2.0:
+    self.fast_fill_count += 1
+elif elapsed_time < 5.0:
+    self.slow_fill_count += 1
+self.total_fill_time += elapsed_time
+
+# Add timeout metrics log
+if self.primary_order_status == "CANCELED":
+    self.timeout_count += 1
+    self.logger.info(
+        f"[METRICS] Timeouts: {self.timeout_count}, "
+        f"Fast fills: {self.fast_fill_count}, "
+        f"Slow fills: {self.slow_fill_count}, "
+        f"Avg fill time: {self.total_fill_time / (self.fast_fill_count + self.slow_fill_count):.2f}s"
+    )
+```
+
+---
+
+#### Task 3: Update Documentation
+
+**File**: `BUILD_UNWIND_FIX_REPORT.md`
+**Section**: Add new "Timeout Optimization" section
+
+**Content**:
+```markdown
+## Timeout Optimization (2026-01-26)
+
+### Problem
+- Previous: 10s timeout on Primary POST_ONLY orders
+- Removed timeout → indefinite waits when orders don't fill
+- Need balance: speed vs fill rate
+
+### Solution: 5s Timeout
+- Reduce timeout from 10s to 5s
+- Track order placement time
+- Cancel and retry if 5s elapsed without fill
+- Log timeout metrics for analysis
+
+### Expected Results
+- Speed: 50% faster (5s max wait vs 10s)
+- Fill rate: 80-90% (vs 95%+ at 10s)
+- Cycle time: Target <50s (vs 77s current)
+
+### Tradeoffs
+| Timeout | Speed | Fill Rate | Retries |
+|---------|-------|-----------|---------|
+| 5s | ⚡ Fast | ✅ Good | ⚠️ Moderate |
+| 10s | 🐌 Slow | ✅ Excellent | ✅ Few |
+| No limit | ❌ Stuck | ✅ 100% | ❌ Never |
+
+### Monitoring
+- Track timeout frequency
+- Measure average fill time
+- Alert if fill rate drops below 80%
+```
+
+---
+
+### Testing Strategy
+
+#### Test 1: Unit Test - Timeout Logic
+
+**File**: `tests/test_timeout_logic.py`
+**Test Case**:
+
+```python
+import asyncio
+from unittest.mock import AsyncMock, patch
+
+async def test_post_only_order_timeout():
+    """Verify POST_ONLY order cancels after 5s"""
+    bot = DNAlternateBot(...)
+    bot.primary_order_status = "OPEN"
+    bot.primary_client.cancel_order = AsyncMock()
+
+    # Mock time to advance 6 seconds
+    with patch('time.time', side_effect=[0, 6]):
+        result = await bot.place_primary_order(side="buy", quantity=Decimal("1.0"))
+
+    # Should have canceled order
+    bot.primary_client.cancel_order.assert_called_once()
+    assert bot.primary_order_status == "CANCELED"
+
+async def test_post_only_order_fast_fill():
+    """Verify POST_ONLY order succeeds if filled within 5s"""
+    bot = DNAlternateBot(...)
+    bot.primary_order_status = "FILLED"
+
+    # Mock time to advance 2 seconds
+    with patch('time.time', side_effect=[0, 2]):
+        result = await bot.place_primary_order(side="buy", quantity=Decimal("1.0"))
+
+    # Should NOT have canceled order
+    assert result == "order_id_123"
+    assert bot.primary_order_status == "FILLED"
+```
+
+**Command**: `pytest tests/test_timeout_logic.py -v`
+
+---
+
+#### Test 2: Integration Test - End-to-End
+
+**File**: `tests/test_integration_timeout.py`
+**Test Case**:
+
+```python
+async def test_timeout_optimization_cycle():
+    """Verify full trading cycle works with 5s timeout"""
+    bot = DNAlternateBot(...)
+    bot.order_quantity = Decimal("0.5")  # Small test size
+
+    # Run BUILD + UNWIND cycle
+    build_result = await bot.build_cycle()
+    assert build_result == True, "BUILD should succeed"
+
+    unwind_result = await bot.unwind_cycle()
+    assert unwind_result == True, "UNWIND should succeed"
+
+    # Verify positions are neutral
+    net_delta = bot.primary_position + bot.hedge_position
+    assert abs(net_delta) < Decimal("0.01"), f"Net delta {net_delta} should be near zero"
+
+    # Check cycle time
+    cycle_time = bot.unwind_end_time - bot.build_start_time
+    assert cycle_time < 60, f"Cycle time {cycle_time}s should be <60s"
+```
+
+**Command**: `pytest tests/test_integration_timeout.py -v`
+
+---
+
+#### Test 3: Live Paper Trading Test
+
+**Configuration**:
+- Ticker: ETH
+- Quantity: 0.5 ETH
+- Iterations: 20
+- Timeout: 5s
+- Environment: Paper trading (if available) or small live test
+
+**Metrics to Track**:
+1. **Cycle Time**: Average seconds per BUILD + UNWIND
+2. **Timeout Rate**: % of orders that hit 5s timeout
+3. **Fill Rate**: % of orders that fill within 5s
+4. **Retry Count**: Average retries per order
+5. **PnL**: Trading profit/loss (accounting for fees)
+
+**Success Criteria**:
+- [ ] Cycle time <50s average (vs 77s baseline)
+- [ ] Timeout rate <20% (most orders fill within 5s)
+- [ ] Fill rate >80%
+- [ ] No stuck orders (all complete within reasonable time)
+- [ ] Net delta remains neutral (±0.01 ETH)
+
+**Command**:
+```bash
+python DN_alternate_backpack_grvt.py \
+  --ticker ETH \
+  --quantity 0.5 \
+  --iterations 20 \
+  --timeout 5
+```
+
+---
+
+#### Test 4: Stress Test - Volatile Market
+
+**Purpose**: Validate timeout logic under stress
+
+**Test Scenario**:
+- Run during high volatility (e.g., Fed announcement, big news)
+- Monitor timeout frequency
+- Check if bot adapts to rapid price movements
+
+**Expected Behavior**:
+- Timeouts increase during volatility (normal)
+- Bot continues operating (doesn't get stuck)
+- No position accumulation
+
+---
+
+### Expected Outcomes
+
+#### Performance Improvements
+
+**Baseline (commit 0b17cea)**:
+- Cycle time: 77.72s
+- Primary order wait: 10-18s per order
+- Timeout: 10s (fixed)
+
+**Target (5s timeout)**:
+- Cycle time: <50s (35% improvement)
+- Primary order wait: 2-5s per order
+- Timeout: 5s (adaptive)
+
+**Projected Impact**:
+```
+Current: 77s/cycle × 300 cycles = 6.4 hours
+Target:  50s/cycle × 300 cycles = 4.2 hours
+
+Time savings: 2.2 hours per 300-cycle run
+```
+
+#### Tradeoffs
+
+**Pros**:
+✅ 35% faster execution
+✅ No indefinite waits (worst case 5s)
+✅ Better responsiveness to price changes
+✅ Reduced slippage (orders refresh faster)
+
+**Cons**:
+⚠️ More order cancellations
+⚠️ Slightly lower fill rate (80-90% vs 95%+)
+⚠️ More API calls (cancel + retry)
+⚠️ Potential increase in taker fees (if fallback to market)
+
+---
+
+### Risk Mitigation
+
+#### Risk 1: Excessive Timeouts → High Taker Fees
+
+**Scenario**: 5s timeout causes 40%+ timeouts → fallback to market orders → high fees
+
+**Mitigation**:
+1. **Monitor timeout rate in real-time**
+   ```python
+   if self.timeout_count > 5:
+       self.logger.warning("[RISK] High timeout rate - consider increasing timeout")
+   ```
+
+2. **Auto-adjust timeout if needed**
+   ```python
+   if self.timeout_rate > 0.4:  # 40% timeout rate
+       POST_ONLY_TIMEOUT = 7.0  # Increase to 7s
+       self.logger.info("[AUTO] Adjusted timeout to 7s due to high timeout rate")
+   ```
+
+3. **User alert before auto-adjust**
+   ```python
+   if self.timeout_rate > 0.4:
+       send_telegram_alert("High timeout rate detected. Pausing for manual review.")
+       self.stop_flag = True
+   ```
+
+---
+
+#### Risk 2: Market Volatility → Many Cancel/Retries
+
+**Scenario**: Fast price moves → orders stale → continuous cancel/retry loop
+
+**Mitigation**:
+1. **Max retry limit**: 4 retries (already implemented)
+2. **Exponential backoff**: 0.2s → 0.4s → 0.8s → 1.6s
+3. **Circuit breaker**: Stop after 10 consecutive failures
+   ```python
+   if self.consecutive_failures >= 10:
+       self.logger.error("[CIRCUIT_BREAKER] Too many failures - stopping")
+       self.stop_flag = True
+   ```
+
+---
+
+#### Risk 3: Regression - Break Working Logic
+
+**Scenario**: Timeout changes break existing BUILD/UNWIND logic
+
+**Mitigation**:
+1. **Comprehensive testing** (unit + integration + live)
+2. **Git revert plan**: `git revert <timeout-commit>` if critical bug
+3. **Feature flag**: Allow disabling timeout without code change
+   ```python
+   POST_ONLY_TIMEOUT = os.getenv("POST_ONLY_TIMEOUT", "5.0")  # Configurable
+   if POST_ONLY_TIMEOUT == "0":
+       # Disable timeout (old behavior)
+       pass
+   ```
+
+---
+
+### Rollback Plan
+
+**If 5s timeout causes critical issues**:
+
+**Option 1: Revert to 10s timeout**
+```python
+POST_ONLY_TIMEOUT = 10.0  # Back to safe value
+```
+
+**Option 2: Revert to no timeout (commit 0b17cea behavior)**
+```bash
+git revert <timeout-commit>
+```
+
+**Option 3: Make timeout configurable**
+```python
+# Add to config.json
+{
+    "primary_order_timeout": 5.0,  # Configurable per deployment
+    "hedge_order_timeout": 20.0
+}
+```
+
+**Decision Tree**:
+```
+Test results show:
+├─ Fill rate >80%, Cycle time <50s → ✅ Deploy 5s timeout
+├─ Fill rate 60-80%, Cycle time 50-70s → ⚠️ Try 7s timeout
+├─ Fill rate <60%, Excessive retries → ❌ Revert to 10s timeout
+└─ Critical errors (position accumulation) → 🚨 Revert immediately, investigate
+```
+
+---
+
+## Part 3: Implementation TODOs
+
+### Phase 1: Code Changes (LOW RISK)
+
+- [ ] **TODO-1**: Add `POST_ONLY_TIMEOUT = 5.0` constant to `__init__`
+  - File: `DN_alternate_backpack_grvt.py`, line ~150
+  - Acceptance: Constant defined, logged on startup
+
+- [ ] **TODO-2**: Implement timeout tracking in `place_primary_order()`
+  - File: `DN_alternate_backpack_grvt.py`, lines 720-749
+  - Acceptance:
+    - Tracks `order_start_time`
+    - Checks timeout each loop iteration
+    - Cancels order if 5s elapsed
+    - Logs timeout event
+
+- [ ] **TODO-3**: Add timeout metrics logging
+  - File: `DN_alternate_backpack_grvt.py`, new method
+  - Acceptance:
+    - Tracks `timeout_count`, `fast_fill_count`, `slow_fill_count`
+    - Logs metrics after each order
+    - Calculates average fill time
+
+### Phase 2: Testing (MEDIUM RISK)
+
+- [ ] **TODO-4**: Write unit test for timeout logic
+  - File: `tests/test_timeout_logic.py`
+  - Acceptance:
+    - Test timeout cancels order after 5s
+    - Test fast fill (<5s) doesn't cancel
+    - Test edge case (exactly 5s)
+
+- [ ] **TODO-5**: Run unit tests
+  - Command: `pytest tests/test_timeout_logic.py -v`
+  - Acceptance: All tests pass
+
+- [ ] **TODO-6**: Run paper trading test (20 iterations)
+  - Config: ETH 0.5, 20 iterations, 5s timeout
+  - Acceptance:
+    - All cycles complete
+    - Cycle time <60s average
+    - No position accumulation
+    - Timeout rate logged
+
+### Phase 3: Validation (HIGH RISK)
+
+- [ ] **TODO-7**: Compare results vs baseline
+  - Baseline: 77.72s/cycle (commit 0b17cea)
+  - Target: <50s/cycle
+  - Acceptance:
+    - Document speed improvement
+    - Document fill rate change
+    - Document timeout rate
+
+- [ ] **TODO-8**: Update BUILD_UNWIND_FIX_REPORT.md
+  - Section: "Timeout Optimization (2026-01-26)"
+  - Acceptance:
+    - Document implementation
+    - Document test results
+    - Document tradeoffs
+
+- [ ] **TODO-9**: Create git commit
+  - Message: "feat(dn-bot): Add 5s timeout optimization for Primary POST_ONLY orders"
+  - Acceptance:
+    - Clean commit history
+    - References post-mortem
+    - Includes test results
+
+---
+
+## Part 4: Success Criteria
+
+### Must Have (Go/No-Go)
+
+- [ ] **CRITICAL**: No buy/sell direction flips (post-mortem lesson)
+- [ ] **CRITICAL**: Net delta remains neutral (±0.01 ETH)
+- [ ] **CRITICAL**: No position accumulation
+- [ ] **REQUIRED**: Cycle time improvement >20% (77s → <62s)
+- [ ] **REQUIRED**: Timeout rate <30%
+
+### Nice to Have
+
+- [ ] Cycle time improvement >35% (77s → <50s)
+- [ ] Fill rate >85%
+- [ ] Timeout rate <20%
+- [ ] Average fill time logged
+- [ ] Auto-adjust timeout based on market conditions
+
+### Do NOT Do
+
+- [ ] **FORBIDDEN**: Change hedge order direction
+- [ ] **FORBIDDEN**: Remove emergency unwind
+- [ ] **FORBIDDEN**: Remove net delta monitoring
+- [ ] **FORBIDDEN**: Increase timeout above 10s
+- [ ] **FORBIDDEN**: Remove timeout completely (indefinite wait)
+
+---
+
+## Part 5: Commit Strategy
+
+### Commit Message
+
+```
+feat(dn-bot): Add 5s timeout optimization for Primary POST_ONLY orders
+
+Problem:
+- Previous 10s timeout caused slow execution (77s/cycle)
+- Agent removed timeout → indefinite waits when orders don't fill
+- Need balance: speed vs fill rate
+
+Solution:
+- Implement 5s timeout for Primary POST_ONLY orders
+- Track order placement time and cancel if timeout exceeded
+- Log timeout metrics for monitoring (fast/slow fill counts)
+- Fallback to retry with fresh price after timeout
+
+Implementation:
+- Add POST_ONLY_TIMEOUT = 5.0 constant
+- Track order_start_time in place_primary_order()
+- Check timeout each loop iteration
+- Cancel and retry if 5s elapsed without fill
+- Log timeout events and fill times
+
+Expected Results:
+- Speed: 35% faster (5s max wait vs 10s)
+- Fill rate: 80-90% (vs 95%+ at 10s)
+- Cycle time: Target <50s (vs 77s current)
+
+Testing:
+- Unit tests: Timeout logic, fast fill, cancel/retry
+- Integration: 20-iteration paper trading test
+- Metrics: Track timeout rate, fill rate, cycle time
+
+Post-Mortem:
+- Previous agent attempt broke buy/sell direction (CRITICAL)
+- Added safeguards: direction validation, unit tests
+- All changes preserve hedge direction and delta neutrality
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+### Verification Steps
+
+After commit, verify:
+
+```bash
+# 1. Check git diff (only timeout changes, no direction flips)
+git diff HEAD~1 HEAD | grep -i "buy\|sell"
+# Should show NO changes to buy/sell logic
+
+# 2. Run unit tests
+pytest tests/test_timeout_logic.py -v
+# Should pass all tests
+
+# 3. Check log output
+python DN_alternate_backpack_grvt.py --dry-run
+# Should see "POST_ONLY_TIMEOUT = 5.0"
+
+# 4. Verify cycle time
+# Run 20 iterations and check average cycle time
+# Should be <60s (vs 77s baseline)
+```
+
+---
+
+## Conclusion
+
+This plan addresses **TWO critical areas**:
+
+### Part 1: Post-Mortem (Why the Agent Failed)
+
+**Root Cause**: Agent misunderstood POST_ONLY mechanics and flipped buy/sell direction
+
+**Impact**: Bot would double positions instead of hedging (catastrophic)
+
+**Prevention**: 5 strategies to prevent future agent failures
+1. Pre-flight validation checks
+2. Unit tests for hedge direction
+3. Agent prompt guardrails
+4. Mandatory code review for trading logic
+5. Integration tests before commit
+
+### Part 2: 5s Timeout Optimization
+
+**Goal**: Reduce cycle time from 77s to <50s (35% improvement)
+
+**Method**: 5s timeout on Primary POST_ONLY orders with cancel/retry
+
+**Tradeoffs**:
+- ✅ Speed: 35% faster
+- ⚠️ Fill rate: 80-90% (vs 95%+ at 10s)
+- ⚠️ More retries
+
+**Testing**: Unit → Integration → Live paper trading (20 iterations)
+
+**Success Criteria**:
+- No direction flips (CRITICAL)
+- Cycle time <50s
+- Fill rate >80%
+- No position accumulation
+
+---
+
+**Next Steps**:
+
+1. **Review this plan with Architect** (agent: architect)
+2. **Review this plan with Critic** (agent: critic)
+3. **Get user approval** (this is a trading system - high risk)
+4. **Implement Phase 1** (code changes)
+5. **Run Phase 2 tests** (unit + integration)
+6. **Run Phase 3 validation** (paper trading)
+7. **Commit if success criteria met**
+
+---
+
+**PLAN_STATUS**: Ready for Architect/Critic review
+**RISK_LEVEL**: HIGH (trading system, direction flips are catastrophic)
+**RECOMMENDATION**: Proceed with extreme caution, validate hedge direction at every step

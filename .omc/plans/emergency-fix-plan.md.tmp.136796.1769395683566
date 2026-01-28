@@ -1,0 +1,501 @@
+# Emergency Bug Fix + GRVT API Stability Plan
+
+**Created:** 2026-01-26
+**Priority:** CRITICAL (Emergency Unwind) + URGENT (GRVT API)
+**Status:** READY FOR IMPLEMENTATION
+
+---
+
+## Executive Summary
+
+This plan addresses three critical issues discovered during ETH 0.1 x 20 iteration test:
+1. **Emergency Unwind Bug** - Bot crashes when trying to unwind Primary position after Hedge fails
+2. **GRVT API Empty Dict** - GRVT API returns empty dict after ~9 successful cycles
+3. **API Stability** - Need improvements to achieve 20 consecutive iterations
+
+---
+
+## Part 1: Emergency Unwind Bug (CRITICAL)
+
+### Root Cause Analysis
+
+**Location:** `F:/Dropbox/dexbot/perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py` lines 1679-1683
+
+**Broken Code:**
+```python
+await self.primary_client.place_market_order(
+    contract_id=self.primary_contract_id,
+    quantity=unwind_qty,
+    side=unwind_side  # ❌ WRONG PARAMETER NAME
+)
+```
+
+**Error Message:**
+```
+ERROR: [EMERGENCY_UNWIND] Failed to unwind Primary:
+BackpackClient.place_market_order() got an unexpected keyword argument 'side'
+```
+
+**Expected API Signature** (from `exchanges/backpack.py` lines 433-435):
+```python
+async def place_market_order(
+    self, contract_id: str, quantity: Decimal, direction: str
+) -> OrderResult:
+```
+
+**The Bug:** Code uses `side=unwind_side` but Backpack API expects `direction` parameter.
+
+### Impact Assessment
+
+| Impact | Severity | Details |
+|--------|----------|---------|
+| Bot Crash | CRITICAL | When hedge fails, emergency unwind crashes instead of closing position |
+| Delta Exposure | HIGH | Bot stuck with unmatched Primary position (0.2304 ETH in test) |
+| Financial Risk | HIGH | Unhedged position exposed to market moves |
+| Test Failures | HIGH | Cannot complete 20-iteration tests due to crashes |
+
+### Fix Required
+
+**File:** `F:/Dropbox/dexbot/perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+**Method:** `_emergency_unwind_primary_position()` (lines 1649-1692)
+**Change:** Line 1682 - Rename `side=unwind_side` to `direction=unwind_side`
+
+```python
+# BEFORE (BROKEN):
+await self.primary_client.place_market_order(
+    contract_id=self.primary_contract_id,
+    quantity=unwind_qty,
+    side=unwind_side  # ❌ Wrong parameter
+)
+
+# AFTER (FIXED):
+await self.primary_client.place_market_order(
+    contract_id=self.primary_contract_id,
+    quantity=unwind_qty,
+    direction=unwind_side  # ✅ Correct parameter
+)
+```
+
+### Testing Strategy
+
+1. **Unit Test:** Mock BackpackClient and verify correct parameter passing
+2. **Integration Test:** Run 5-iteration test with deliberate hedge failure to verify emergency unwind works
+3. **Log Verification:** Confirm no "unexpected keyword argument 'side'" errors
+4. **Position Verification:** Confirm Primary position is 0 after emergency unwind
+
+---
+
+## Part 2: GRVT API Empty Dict Investigation
+
+### Log Analysis Findings
+
+**Test File:** `test_eth_0.1_x20_5s_timeout.log`
+**Failure Point:** Cycle 9/20 (45% completion)
+**Error Pattern:**
+
+```
+Line 313: ERROR - [GRVT_ETH] [MARKET] API returned falsy result: {} (type: <class 'dict'>)
+Line 314: ERROR: Error placing HEDGE order (attempt 1/4): [MARKET] Error placing order
+Line 318: ERROR - [GRVT_ETH] [MARKET] API returned falsy result: {} (type: <class 'dict'>)
+Line 319: ERROR: Error placing HEDGE order (attempt 2/4): [MARKET] Error placing order
+Line 323: ERROR - [GRVT_ETH] [MARKET] API returned falsy result: {} (type: <class 'dict'>)
+Line 324: ERROR: Error placing HEDGE order (attempt 3/4): [MARKET] Error placing order
+Line 328: ERROR - [GRVT_ETH] [MARKET] API returned falsy result: {} (type: <class 'dict'>)
+Line 329: ERROR: Error placing HEDGE order (attempt 4/4): [MARKET] Error placing order
+```
+
+**Timeline Analysis:**
+- Cycles 1-8: Successful (avg ~12s/cycle, PnL +$0.163)
+- Cycle 9: Started successfully (Primary filled 0.1 @ $2877.47)
+- **Then ALL 4 hedge retries failed with empty dict response**
+- Result: Bot stuck with Primary position 0.2304, Hedge position -0.1
+
+**Code Location:** `exchanges/grvt.py` lines 415-424
+
+```python
+# Line 415-417: API call
+order_result = self.rest_client.create_order(
+    symbol=contract_id, order_type="market", side=side, amount=quantity
+)
+
+# Line 418-424: Error detection
+if not order_result:
+    # Log the actual result for debugging
+    self.logger.log(
+        f"[MARKET] API returned falsy result: {order_result} (type: {type(order_result)})",
+        "ERROR"
+    )
+    raise Exception(f"[MARKET] Error placing order")
+```
+
+### Root Cause Investigation
+
+The empty dict `{}` response from GRVT API could indicate:
+
+| Possible Cause | Evidence | Likelihood |
+|----------------|----------|------------|
+| **Rate Limiting** | 9 cycles with ~12s each = 108s = 9 orders. Possible rate limit hit. | HIGH |
+| **Session Expiry** | GRVT SDK sessions may expire after time/activity limit. | MEDIUM |
+| **API Temp Failure** | Transient server-side issue. Note: Force close (line 392-398) worked same session. | MEDIUM |
+| **Order Size Issue** | Test was 0.1 ETH, well below 0.2 ETH limit. | LOW |
+| **Network Issue** | Would affect both exchanges, but Primary (Backpack) worked fine. | LOW |
+
+**Key Evidence:** Force close order at line 392-398 succeeded with same API:
+```
+WARNING: [FORCE_CLOSE] HEDGE BUY 0.1 @ market (crossing spread)
+2026-01-26 10:33:14.165 - INFO - [GRVT_ETH] [MARKET] Order placed: BUY 0.1 @ ~2878.13
+```
+This suggests **rate limiting with cooldown** or **session state issue**.
+
+### Proposed Fix
+
+**Option A: Enhanced Retry with Backoff** (RECOMMENDED)
+- Increase retry attempts: 4 → 6
+- Add exponential backoff: 1s → 2s → 4s → 8s → 16s → 32s
+- Add rate limit detection from API response headers
+- Log detailed API response for debugging
+
+**Option B: Session Refresh**
+- Detect empty dict response
+- Refresh GRVT SDK session
+- Retry with new session
+
+**Option C: Combined Approach** (BEST)
+- Implement Option A (enhanced retry)
+- Add Option B (session refresh) after 2 consecutive failures
+- Add circuit breaker: pause trading after 3 consecutive failures
+
+---
+
+## Part 3: API Stability Improvements
+
+### Current Limitations
+
+| Issue | Current Behavior | Impact |
+|-------|------------------|--------|
+| **Retry Logic** | Fixed 1s delay, 4 attempts (line 802-1119 in DN_alternate_backpack_grvt.py) | Insufficient for rate limiting |
+| **Session Management** | No explicit session refresh | Stale sessions cause failures |
+| **Error Context** | Logs empty dict only | Hard to diagnose root cause |
+| **Circuit Breaker** | None | Continues failing, wastes API calls |
+
+**IMPORTANT:** The retry loop ALREADY EXISTS in `DN_alternate_backpack_grvt.py` at lines 803-1119. We will MODIFY this existing code, NOT create a new loop in grvt.py (which would cause double retries).
+
+### Proposed Improvements
+
+#### 1. Enhanced Retry Logic (Priority: HIGH)
+
+**File:** `F:/Dropbox/dexbot/perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+**Method:** `place_hedge_order()` (lines 756-1119)
+**Changes:**
+
+1. **Increase max_retries** (line 802):
+```python
+# BEFORE:
+max_retries = 4
+
+# AFTER:
+max_retries = 6
+```
+
+2. **Add exponential backoff** (line 1110):
+```python
+# BEFORE (line 1108-1110):
+if attempt < max_retries:
+    self.logger.info(f"Retrying hedge order in 1 second...")
+    await asyncio.sleep(1)
+
+# AFTER:
+if attempt < max_retries:
+    backoff_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, 16s, 32s
+    self.logger.info(f"Retrying hedge order in {backoff_delay} seconds...")
+    await asyncio.sleep(backoff_delay)
+```
+
+**This approach modifies the EXISTING retry loop that handles ALL hedge orders, not just market orders from grvt.py.**
+
+#### 2. Session Refresh Method (Priority: MEDIUM)
+
+**STATUS: NOT FEASIBLE WITH CURRENT SDK**
+
+After reviewing the actual GRVT SDK code (`exchanges/grvt.py`), the following issues were identified:
+
+1. **`__aexit__()` signature issue** (line 133):
+```python
+async def disconnect(self) -> None:
+    if self._ws_client:
+        await self._ws_client.__aexit__()  # ❌ Requires 3 args: exc_type, exc_val, exc_tb
+```
+
+2. **No proper disconnect method exists** in current SDK
+
+3. **`_initialize_grvt_clients()` doesn't update `_ws_client`** - only initializes `rest_client`
+
+4. **`connect()` method** (line 87) exists but would need testing for session refresh scenario
+
+**DECISION:** DEFER session refresh implementation until:
+- GRVT SDK documentation is reviewed for proper session lifecycle management
+- OR we can test session refresh without crashing the bot
+- Current enhanced retry with exponential backoff should handle rate limiting
+
+**Alternative approach:** If empty dict persists after 6 retries, consider implementing a "pause and retry" at the main trading loop level (circuit breaker pattern, see Part 3.3).
+
+#### 3. Circuit Breaker (Priority: MEDIUM)
+
+**File:** `DN_alternate_backpack_grvt.py` - Add to main trading loop
+
+```python
+# Track consecutive failures
+self.consecutive_hedge_failures = 0
+self.MAX_CONSECUTIVE_FAILURES = 3
+
+# In hedge order placement:
+if hedge_success:
+    self.consecutive_hedge_failures = 0
+else:
+    self.consecutive_hedge_failures += 1
+    if self.consecutive_hedge_failures >= self.MAX_CONSECUTIVE_FAILURES:
+        self.logger.error(
+            f"[CIRCUIT_BREAKER] {self.MAX_CONSECUTIVE_FAILURES} consecutive failures. "
+            "Pausing trading for 60 seconds..."
+        )
+        await asyncio.sleep(60)
+        self.consecutive_hedge_failures = 0
+```
+
+#### 4. Enhanced Logging (Priority: LOW)
+
+**File:** `exchanges/grvt.py` - Log full API response
+
+```python
+if not order_result:
+    self.logger.log(
+        f"[MARKET] API returned falsy result: {order_result} "
+        f"(type: {type(order_result)}, keys: {order_result.keys() if isinstance(order_result, dict) else 'N/A'})",
+        "ERROR"
+    )
+```
+
+### Implementation Plan
+
+| Priority | Task | Estimated Time | Dependency |
+|----------|------|----------------|------------|
+| **P0 (CRITICAL)** | Fix emergency unwind bug (side → direction) | 5 min | None |
+| **P1 (URGENT)** | Modify existing retry logic: add exponential backoff + increase retries | 15 min | None |
+| **P2 (HIGH)** | Add circuit breaker to main loop | 20 min | P1 |
+| **P3 (DEFERRED)** | Research GRVT SDK session management | 60 min | None |
+| **P4 (LOW)** | Enhanced logging for debugging | 15 min | None |
+
+---
+
+## Part 4: Testing Strategy
+
+### Phase 1: Emergency Unwind Fix Validation
+1. **Smoke Test:** 3 iterations with normal operation
+2. **Failure Test:** Inject hedge failure to trigger emergency unwind
+3. **Log Check:** Verify no "unexpected keyword argument" errors
+4. **Position Check:** Confirm Primary position = 0 after unwind
+
+**Test Command:**
+```bash
+cd F:/Dropbox/dexbot/perp-dex-tools-original/hedge
+python DN_alternate_backpack_grvt.py --ticker ETH --quantity 0.1 --iterations 3
+```
+
+**Verify:**
+```bash
+# Check for emergency unwind errors
+grep -i "unexpected keyword argument" logs/*.log
+
+# Check final positions
+grep "Final positions" logs/*.log
+```
+
+### Phase 2: Enhanced Retry Logic Test
+1. **Baseline:** Run 10-iteration test, measure failure rate
+2. **Enhanced Retry:** Run 20-iteration test with improved retry logic
+3. **Monitor:** Check if exponential backoff triggers (look for "Retrying in X seconds" logs)
+4. **Long Duration:** Run 50-iteration test to validate stability
+
+**Test Command:**
+```bash
+cd F:/Dropbox/dexbot/perp-dex-tools-original/hedge
+python DN_alternate_backpack_grvt.py --ticker ETH --quantity 0.1 --iterations 20 --test-name enhanced_retry_test
+```
+
+**Verify:**
+```bash
+# Check for retry patterns
+grep -E "Retrying hedge order in [0-9]+ seconds" logs/enhanced_retry_test.log
+
+# Check for empty dict failures
+grep -c "API returned falsy result" logs/enhanced_retry_test.log
+
+# Verify exponential backoff (should see increasing delays)
+grep -A1 "Error placing HEDGE order" logs/enhanced_retry_test.log | grep "Retrying"
+```
+
+### Phase 3: Full Integration Test
+1. **Full Test Run:** 100 iterations with all fixes
+2. **Stress Test:** Simulate network issues (optional)
+3. **Metrics Collection:** Track success rate, avg cycle time, PnL
+
+**Test Command:**
+```bash
+cd F:/Dropbox/dexbot/perp-dex-tools-original/hedge
+python DN_alternate_backpack_grvt.py --ticker ETH --quantity 0.1 --iterations 100 --test-name full_integration_test
+```
+
+**Verify:**
+```bash
+# Check completion rate
+grep "CUMULATIVE:" logs/full_integration_test.log | tail -1
+
+# Check for crashes
+grep -i "traceback\|exception" logs/full_integration_test.log | wc -l
+
+# Check final positions
+tail -20 logs/full_integration_test.log | grep -E "PRIMARY|HEDGE"
+```
+
+---
+
+## Part 5: Success Criteria
+
+| Criteria | Target | Measurement |
+|----------|--------|-------------|
+| Emergency Unwind Works | 100% | No crashes when hedge fails |
+| GRVT Empty Dict Fixed | <5% | Failure rate < 5% of orders |
+| 20-Iteration Test | 100% | Complete full test without stop |
+| Position Accuracy | ±0.001 | Final positions within rounding error |
+| No Net Delta Exposure | 0 | Net delta = 0 at shutdown |
+
+---
+
+## Part 6: Rollback Plan
+
+If issues arise after implementation:
+
+| Scenario | Rollback Action |
+|----------|-----------------|
+| Emergency unwind fails to fix | Revert to pre-fix code, add manual unwind script |
+| Enhanced retry causes delays | Reduce max_retries to 4, disable backoff |
+| Session refresh breaks connection | Comment out session refresh call |
+| Circuit breaker too aggressive | Increase MAX_CONSECUTIVE_FAILURES to 10 |
+
+---
+
+## Part 7: Dependencies
+
+### Required Files
+- `F:/Dropbox/dexbot/perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+- `F:/Dropbox/dexbot/perp-dex-tools-original/hedge/exchanges/grvt.py`
+- `F:/Dropbox/dexbot/perp-dex-tools-original/hedge/exchanges/backpack.py`
+
+### External Dependencies
+- GRVT SDK (pysdk)
+- Backpack SDK (bpx)
+
+---
+
+## Appendix A: Emergency Unwind Call Stack
+
+```
+DN_alternate_backpack_grvt.py:
+  build_cycle_position() [line 1614]
+    → _emergency_unwind_primary_position() [line 1649]
+      → self.primary_client.place_market_order() [line 1679]
+        → BackpackClient.place_market_order() [backpack.py:433]
+          ❌ FAILS: unexpected keyword argument 'side'
+```
+
+## Appendix B: GRVT API Error Timeline
+
+| Time | Event | Details |
+|------|-------|---------|
+| 10:32:58 | Primary order partially filled | 0.0652/0.1 filled @ $2877.47 |
+| 10:32:58 | Hedge retry 1 | Empty dict response |
+| 10:32:59 | Hedge retry 2 | Empty dict response |
+| 10:33:00 | Hedge retry 3 | Empty dict response |
+| 10:33:01 | Hedge retry 4 | Empty dict response |
+| 10:33:01 | Emergency close attempts | All 3 attempts failed |
+| 10:33:14 | Force close succeeded | Same API worked after ~16s cooldown |
+
+**Conclusion:** Empty dict response appears to be **rate limiting with automatic cooldown** (~16 seconds).
+
+---
+
+## Appendix C: Metis Gap Analysis (Post-Plan Review)
+
+### Gap 1: Parameter Consistency - RESOLVED ✓
+**Question:** Are there other places using `side=` with `place_market_order`?
+
+**Finding:** Grepped entire codebase - no other instances of `side=` parameter misuse found.
+
+**Status:** Emergency unwind bug is isolated incident. Fix is complete.
+
+### Gap 2: GRVT API Root Cause - ACKNOWLEDGED
+**Status:** Root cause is uncertain without GRVT API documentation access
+
+**Hypothesis based on evidence:**
+- Empty dict `{}` response appears after ~9 successful cycles (~108 seconds of activity)
+- Pattern suggests **rate limiting with automatic cooldown** (~16 seconds)
+- Force close order succeeded after cooldown, confirming API was functional again
+
+**Uncertainties:**
+- Empty dict `{}` is NOT a documented error response (based on available code)
+- Could be rate limiting, session expiry, or transient server issue
+- No access to GRVT API error codes or response format documentation
+
+**Recommendation:**
+- Proceed with enhanced retry + exponential backoff as pragmatic fix
+- If issue persists after implementation, research GRVT SDK documentation
+- Consider reaching out to GRVT support about empty dict responses
+
+**Priority:** LOW - Enhanced retry should handle the symptom; root cause research is nice-to-have
+
+### Gap 3: Dual Exchange Failure - ACKNOWLEDGED
+**Scenario:** What if Backpack API also returns empty dict?
+
+**Current Status:**
+- Backpack API appears stable (no errors in logs)
+- Current fix focuses on GRVT (source of observed failures)
+
+**Future Consideration:** If Backpack exhibits similar issues, apply same retry logic pattern.
+
+### Gap 4: Post-Unwind Position Verification - VALID CONCERN
+**Issue:** If emergency unwind fails, bot sets `stop_flag=True` but partial fill may occur.
+
+**Recommendation:** Add position reconciliation after failed unwind:
+```python
+except Exception as e:
+    self.logger.error(f"[EMERGENCY_UNWIND] Failed to unwind Primary: {e}")
+    # Verify actual position in case of partial fill
+    final_position = await self.primary_client.get_account_positions()
+    self.logger.error(f"[EMERGENCY_UNWIND] Final position: {final_position}")
+    self.stop_flag = True
+```
+
+**Priority:** LOW - Current fix prevents crash; this is enhancement
+
+### Gap 5: Test Coverage - ADDITIONAL SCENARIOS
+**Missing Test Scenarios:**
+1. Multiple consecutive failures (covered by circuit breaker test)
+2. Session refresh during active trading
+3. Network issues with partial recovery
+4. Both exchanges failing simultaneously
+
+**Recommendation:** Add stress test scenarios after initial fixes validated
+
+**Priority:** LOW - Core functionality test is sufficient for now
+
+---
+
+**END OF PLAN**
+
+**Metis Verdict:** Plan is comprehensive. Gaps identified are low priority or future considerations. Core fixes are solid.
+
+**Next Steps:**
+1. Fix emergency unwind bug (P0) - 5 min
+2. Modify existing retry logic: add exponential backoff + increase max_retries to 6 (P1) - 15 min
+3. Run 20-iteration test with concrete test commands from Part 4
+4. Evaluate if additional improvements needed

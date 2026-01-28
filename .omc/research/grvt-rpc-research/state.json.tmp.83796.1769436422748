@@ -1,0 +1,1 @@
+{"active":true,"mode":"research","iteration":1,"max_iterations":10,"current_phase":"decomposition","started_at":"2026-01-26T22:15:00Z","task_description":"Research GRVT SDK order submission behavior for V4 plan. Critical: Does rpc_create_order() return order result or just request_id? How to verify order execution? What happens on timeout?"}

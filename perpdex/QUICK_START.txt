@@ -1,0 +1,23 @@
+╔══════════════════════════════════════════════════════════════╗
+║  HUMMINGBOT APEX CONNECTOR - QUICK START AFTER RESTART      ║
+╚══════════════════════════════════════════════════════════════╝
+
+터미널 재시작 후 실행 순서:
+
+1️⃣  Hummingbot 재설치 (5-10분)
+   cd "/c/Users/crypto quant/perpdex farm/hummingbot"
+   pip install -e .
+   python -c "import hummingbot; print('✅ OK')"
+
+2️⃣  Apex Import 테스트
+   cd "../apex"
+   python test_imports.py
+
+3️⃣  Claude Code에게 요청:
+   "HUMMINGBOT_INTEGRATION_PROGRESS.md 읽고 Phase 2부터 계속해줘"
+
+📄 상세 문서: HUMMINGBOT_INTEGRATION_PROGRESS.md
+📊 현재 진행률: 20% (Setup 완료)
+⏱️  남은 예상 시간: 5-6시간
+
+════════════════════════════════════════════════════════════════

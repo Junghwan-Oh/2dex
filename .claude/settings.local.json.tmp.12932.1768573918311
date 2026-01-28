@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__serena__*",
+      "Bash(rm:*)",
+      "Bash(f:/Dropbox/dexbot/perpdex/venv/Scripts/python.exe:*)",
+      "Bash(cat:*)",
+      "Bash(git checkout:*)",
+      "Bash(git gc:*)",
+      "Bash(git add:*)",
+      "Bash(git check-ignore:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\ndocs: Add Phase 2E implementation plan\n\n- Passive Maker strategy for both PRIMARY and HEDGE\n- TP \\(Take Profit\\) close logic with 0.05% target\n- Dynamic stop-loss timeout experiments \\(5s-60s\\)\n- Entry price: BID-1tick for BUY, ASK+1tick for SELL\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfeat\\(2dex\\): Phase A - Implement Passive Maker entry logic\n\nChanges:\n- grvt.py: Change place_open_order/place_close_order from Aggressive to Passive Maker\n  - BUY: best_ask - tick → best_bid - tick\n  - SELL: best_bid + tick → best_ask + tick\n- backpack.py: Same Passive Maker changes for open/close orders\n- hedge_mode_2dex.py: Change HEDGE from market orders to Passive Maker limit orders\n  - Add 60 second fill timeout\n  - Add order status polling via get_order_info\\(\\)\n  - Handle timeout with cancel and position imbalance tracking\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(timeout:*)",
+      "Bash(git commit:*)",
+      "Bash(npm install:*)",
+      "Bash(gh repo view:*)",
+      "Bash(gh api:*)"
+    ]
+  }
+}

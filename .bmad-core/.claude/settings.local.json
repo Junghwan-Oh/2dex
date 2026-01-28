@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 60 python test_avellaneda_apex.py)",
+      "Bash(conda info --envs)",
+      "Bash(python bin/hummingbot_quickstart.py --help)",
+      "Bash(python bin/hummingbot.py --help)",
+      "Bash(pip install aioprocessing)",
+      "Bash(pip install aioresponses aiounittest bip-utils commlib-py injective-py msgpack-python objgraph pandas-ta pyperclip safe-pysha3 scalecodec xrpl-py --quiet)",
+      "Bash(conda create -n hummingbot python=3.10 -y)",
+      "Bash(conda run -n hummingbot pip install aioprocessing aioresponses aiounittest bip-utils commlib-py msgpack-python objgraph pandas-ta pyperclip safe-pysha3 scalecodec xrpl-py --quiet)",
+      "Bash(bash ./install)",
+      "Bash(conda run -n hummingbot python run_live_strategy.py)",
+      "Bash(conda run -n hummingbot python -c \"from hummingbot.client.hummingbot_application import HummingbotApplication; print(''Hummingbot import: OK'')\")",
+      "Bash(conda run -n hummingbot pip install pandas numpy aiohttp)",
+      "Bash(conda run -n hummingbot pip install -r setup/requirements.txt)",
+      "Bash(conda env update -n hummingbot -f setup/environment.yml)"
+    ],
+    "deny": [],
+    "ask": []
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "supabase",
+    "context7",
+    "playwright"
+  ]
+}

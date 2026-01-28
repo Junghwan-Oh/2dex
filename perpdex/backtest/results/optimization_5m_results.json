@@ -1,0 +1,1524 @@
+{
+  "optimization_metric": "sharpe",
+  "best_parameters": {
+    "maPeriods": [
+      3,
+      7,
+      15
+    ],
+    "rsiPeriod": 9,
+    "rsiThreshold": [
+      35,
+      55
+    ],
+    "initialEquity": 5000.0,
+    "leverage": 10
+  },
+  "best_results": {
+    "totalTrades": 67,
+    "winningTrades": 40,
+    "losingTrades": 27,
+    "winRate": 0.5970149253731343,
+    "avgProfit": 39.97831853764636,
+    "avgLoss": -68.83518559641038,
+    "totalPnl": -259.41726959722627,
+    "totalFees": 2718.8164201256363,
+    "finalEquity": 3381.5023463155,
+    "returnRate": -0.32369953073690005,
+    "maxDrawdown": 0.3417075859502213,
+    "sharpeRatio": 0.2621594853902782,
+    "avgDuration": 10.149253731343284,
+    "maxConsecutiveLosses": 5,
+    "tradesPerDay": 11.166666666666666
+  },
+  "all_results": [
+    {
+      "totalTrades": 59,
+      "winningTrades": 27,
+      "losingTrades": 32,
+      "winRate": 0.4576271186440678,
+      "avgProfit": 22.11061843683901,
+      "avgLoss": -67.65028638371321,
+      "totalPnl": -1567.8224664841694,
+      "totalFees": 2086.2645696415825,
+      "finalEquity": 2389.21892074617,
+      "returnRate": -0.522156215850766,
+      "maxDrawdown": 0.527194626136108,
+      "sharpeRatio": -0.15985713716959254,
+      "avgDuration": 10.76271186440678,
+      "maxConsecutiveLosses": 16,
+      "tradesPerDay": 9.833333333333334,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 59,
+      "winningTrades": 24,
+      "losingTrades": 35,
+      "winRate": 0.4067796610169492,
+      "avgProfit": 23.496175542342925,
+      "avgLoss": -65.72337914233283,
+      "totalPnl": -1736.4100569654192,
+      "totalFees": 2018.1179156506919,
+      "finalEquity": 2254.7627872924636,
+      "returnRate": -0.5490474425415073,
+      "maxDrawdown": 0.5538023103017847,
+      "sharpeRatio": -0.22517001546606086,
+      "avgDuration": 11.271186440677965,
+      "maxConsecutiveLosses": 16,
+      "tradesPerDay": 9.833333333333334,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 43,
+      "winningTrades": 20,
+      "losingTrades": 23,
+      "winRate": 0.46511627906976744,
+      "avgProfit": 49.26897379341343,
+      "avgLoss": -77.82310971223282,
+      "totalPnl": -804.5520475130862,
+      "totalFees": 1776.4066740899164,
+      "finalEquity": 3307.6139178051367,
+      "returnRate": -0.33847721643897266,
+      "maxDrawdown": 0.3394275860378485,
+      "sharpeRatio": 0.03232625774727909,
+      "avgDuration": 8.720930232558139,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 7.166666666666667,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 67,
+      "winningTrades": 40,
+      "losingTrades": 27,
+      "winRate": 0.5970149253731343,
+      "avgProfit": 39.97831853764636,
+      "avgLoss": -68.83518559641038,
+      "totalPnl": -259.41726959722627,
+      "totalFees": 2718.8164201256363,
+      "finalEquity": 3381.5023463155,
+      "returnRate": -0.32369953073690005,
+      "maxDrawdown": 0.3417075859502213,
+      "sharpeRatio": 0.2621594853902782,
+      "avgDuration": 10.149253731343284,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 11.166666666666666,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 120,
+      "winningTrades": 58,
+      "losingTrades": 62,
+      "winRate": 0.48333333333333334,
+      "avgProfit": 25.993110067962146,
+      "avgLoss": -50.44089835996895,
+      "totalPnl": -1619.7353143762705,
+      "totalFees": 3558.661395898591,
+      "finalEquity": 1600.8670340554352,
+      "returnRate": -0.6798265931889129,
+      "maxDrawdown": 0.6798265931889129,
+      "sharpeRatio": 0.04283428296304949,
+      "avgDuration": 9.875,
+      "maxConsecutiveLosses": 6,
+      "tradesPerDay": 20.0,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 121,
+      "winningTrades": 60,
+      "losingTrades": 61,
+      "winRate": 0.49586776859504134,
+      "avgProfit": 26.446439269883324,
+      "avgLoss": -52.003253060705084,
+      "totalPnl": -1585.4120805100108,
+      "totalFees": 3620.6420272724718,
+      "finalEquity": 1604.183775431659,
+      "returnRate": -0.6791632449136682,
+      "maxDrawdown": 0.6791632449136682,
+      "sharpeRatio": 0.04848535885172639,
+      "avgDuration": 9.586776859504132,
+      "maxConsecutiveLosses": 6,
+      "tradesPerDay": 20.166666666666668,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 79,
+      "winningTrades": 39,
+      "losingTrades": 40,
+      "winRate": 0.4936708860759494,
+      "avgProfit": 40.63623839631436,
+      "avgLoss": -66.33092616682869,
+      "totalPnl": -1068.423749216888,
+      "totalFees": 2852.099229229111,
+      "finalEquity": 2505.5118575870033,
+      "returnRate": -0.49889762848259933,
+      "maxDrawdown": 0.49889762848259933,
+      "sharpeRatio": 0.07662814425389805,
+      "avgDuration": 10.063291139240507,
+      "maxConsecutiveLosses": 4,
+      "tradesPerDay": 13.166666666666666,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 119,
+      "winningTrades": 56,
+      "losingTrades": 63,
+      "winRate": 0.47058823529411764,
+      "avgProfit": 28.08165039766357,
+      "avgLoss": -53.36482726827236,
+      "totalPnl": -1789.411695631999,
+      "totalFees": 3456.379833509142,
+      "finalEquity": 1482.425154226329,
+      "returnRate": -0.7035149691547342,
+      "maxDrawdown": 0.7035149691547342,
+      "sharpeRatio": 0.001294632015981968,
+      "avgDuration": 11.302521008403362,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 19.833333333333332,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 263,
+      "winningTrades": 104,
+      "losingTrades": 159,
+      "winRate": 0.39543726235741444,
+      "avgProfit": 8.284836758773046,
+      "avgLoss": -24.07618885646037,
+      "totalPnl": -2966.4910052648015,
+      "totalFees": 3697.458343998535,
+      "finalEquity": 184.93743116462352,
+      "returnRate": -0.9630125137670753,
+      "maxDrawdown": 0.9630125137670753,
+      "sharpeRatio": -0.1639700808327917,
+      "avgDuration": 11.311787072243346,
+      "maxConsecutiveLosses": 7,
+      "tradesPerDay": 43.833333333333336,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 264,
+      "winningTrades": 103,
+      "losingTrades": 161,
+      "winRate": 0.39015151515151514,
+      "avgProfit": 8.793639448217151,
+      "avgLoss": -23.725313139862557,
+      "totalPnl": -2914.0305523515053,
+      "totalFees": 3823.1535213547068,
+      "finalEquity": 174.57931628139318,
+      "returnRate": -0.9650841367437213,
+      "maxDrawdown": 0.9650841367437213,
+      "sharpeRatio": -0.17584628224694177,
+      "avgDuration": 11.117424242424242,
+      "maxConsecutiveLosses": 8,
+      "tradesPerDay": 44.0,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 246,
+      "winningTrades": 96,
+      "losingTrades": 150,
+      "winRate": 0.3902439024390244,
+      "avgProfit": 9.808735279312382,
+      "avgLoss": -25.74952525990446,
+      "totalPnl": -2920.79020217168,
+      "totalFees": 3689.9013646549447,
+      "finalEquity": 234.25575039850372,
+      "returnRate": -0.9531488499202992,
+      "maxDrawdown": 0.9531488499202992,
+      "sharpeRatio": -0.13239923997957356,
+      "avgDuration": 11.016260162601625,
+      "maxConsecutiveLosses": 13,
+      "tradesPerDay": 41.0,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 265,
+      "winningTrades": 110,
+      "losingTrades": 155,
+      "winRate": 0.41509433962264153,
+      "avgProfit": 9.566080389412138,
+      "avgLoss": -25.072095127047895,
+      "totalPnl": -2833.905901857089,
+      "totalFees": 3893.4070678800595,
+      "finalEquity": 219.25544470581215,
+      "returnRate": -0.9561489110588376,
+      "maxDrawdown": 0.9561489110588376,
+      "sharpeRatio": -0.09396507114706742,
+      "avgDuration": 11.226415094339623,
+      "maxConsecutiveLosses": 11,
+      "tradesPerDay": 44.166666666666664,
+      "parameters": {
+        "maPeriods": [
+          3,
+          7,
+          15
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 67,
+      "winningTrades": 36,
+      "losingTrades": 31,
+      "winRate": 0.5373134328358209,
+      "avgProfit": 28.31041122341384,
+      "avgLoss": -65.33576450092143,
+      "totalPnl": -1006.233895485666,
+      "totalFees": 2568.7455916568115,
+      "finalEquity": 2709.4693455567185,
+      "returnRate": -0.4581061308886563,
+      "maxDrawdown": 0.47703206410287774,
+      "sharpeRatio": 0.06838741466976563,
+      "avgDuration": 11.194029850746269,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 11.166666666666666,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 67,
+      "winningTrades": 35,
+      "losingTrades": 32,
+      "winRate": 0.5223880597014925,
+      "avgProfit": 24.55488342316031,
+      "avgLoss": -61.24098754348272,
+      "totalPnl": -1100.290681580836,
+      "totalFees": 2501.7663006576545,
+      "finalEquity": 2648.9308914712033,
+      "returnRate": -0.47021382170575937,
+      "maxDrawdown": 0.4887168873423152,
+      "sharpeRatio": 0.046182982298785966,
+      "avgDuration": 10.671641791044776,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 11.166666666666666,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 42,
+      "winningTrades": 22,
+      "losingTrades": 20,
+      "winRate": 0.5238095238095238,
+      "avgProfit": 25.751510017517315,
+      "avgLoss": -79.51473750204373,
+      "totalPnl": -1023.7615296554936,
+      "totalFees": 1707.8010512664605,
+      "finalEquity": 3122.4735706228757,
+      "returnRate": -0.37550528587542487,
+      "maxDrawdown": 0.3758903660928586,
+      "sharpeRatio": -0.0683638524432315,
+      "avgDuration": 10.476190476190476,
+      "maxConsecutiveLosses": 3,
+      "tradesPerDay": 7.0,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 68,
+      "winningTrades": 36,
+      "losingTrades": 32,
+      "winRate": 0.5294117647058824,
+      "avgProfit": 29.024779255971143,
+      "avgLoss": -69.75975944607856,
+      "totalPnl": -1187.4202490595528,
+      "totalFees": 2405.5680012914636,
+      "finalEquity": 2609.762445003456,
+      "returnRate": -0.4780475109993088,
+      "maxDrawdown": 0.49225897623209913,
+      "sharpeRatio": 0.03856788416443974,
+      "avgDuration": 10.367647058823529,
+      "maxConsecutiveLosses": 4,
+      "tradesPerDay": 11.333333333333334,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 67,
+      "winningTrades": 41,
+      "losingTrades": 26,
+      "winRate": 0.6119402985074627,
+      "avgProfit": 28.200701198019615,
+      "avgLoss": -77.51405121861902,
+      "totalPnl": -859.1365825652903,
+      "totalFees": 2501.4522403655264,
+      "finalEquity": 2890.0341449250805,
+      "returnRate": -0.4219931710149839,
+      "maxDrawdown": 0.42751329233405577,
+      "sharpeRatio": 0.11797163685709754,
+      "avgDuration": 10.597014925373134,
+      "maxConsecutiveLosses": 3,
+      "tradesPerDay": 11.166666666666666,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 68,
+      "winningTrades": 41,
+      "losingTrades": 27,
+      "winRate": 0.6029411764705882,
+      "avgProfit": 25.38031079452948,
+      "avgLoss": -73.99516659846815,
+      "totalPnl": -957.2767555829312,
+      "totalFees": 2507.3646788765573,
+      "finalEquity": 2788.943085555537,
+      "returnRate": -0.4422113828888926,
+      "maxDrawdown": 0.4422113828888926,
+      "sharpeRatio": 0.0961103054958759,
+      "avgDuration": 10.073529411764707,
+      "maxConsecutiveLosses": 3,
+      "tradesPerDay": 11.333333333333334,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 29,
+      "winningTrades": 17,
+      "losingTrades": 12,
+      "winRate": 0.5862068965517241,
+      "avgProfit": 21.690530864523293,
+      "avgLoss": -102.21451015572416,
+      "totalPnl": -857.8350971717939,
+      "totalFees": 1211.9374060785121,
+      "finalEquity": 3536.1773232181667,
+      "returnRate": -0.29276453535636665,
+      "maxDrawdown": 0.29475563733671434,
+      "sharpeRatio": -0.09544678334025358,
+      "avgDuration": 10.172413793103448,
+      "maxConsecutiveLosses": 3,
+      "tradesPerDay": 4.833333333333333,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 51,
+      "winningTrades": 26,
+      "losingTrades": 25,
+      "winRate": 0.5098039215686274,
+      "avgProfit": 23.083817669418963,
+      "avgLoss": -73.80039256041763,
+      "totalPnl": -1244.8305546055478,
+      "totalFees": 1869.8356893125624,
+      "finalEquity": 2820.174103186292,
+      "returnRate": -0.4359651793627416,
+      "maxDrawdown": 0.4359651793627416,
+      "sharpeRatio": -0.06631854981367061,
+      "avgDuration": 13.431372549019608,
+      "maxConsecutiveLosses": 6,
+      "tradesPerDay": 8.5,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 172,
+      "winningTrades": 70,
+      "losingTrades": 102,
+      "winRate": 0.4069767441860465,
+      "avgProfit": 10.432568823251154,
+      "avgLoss": -33.70845442003875,
+      "totalPnl": -2707.982533216372,
+      "totalFees": 3495.0726545651614,
+      "finalEquity": 544.6863186188176,
+      "returnRate": -0.8910627362762366,
+      "maxDrawdown": 0.8910627362762366,
+      "sharpeRatio": -0.19209585254415726,
+      "avgDuration": 11.337209302325581,
+      "maxConsecutiveLosses": 8,
+      "tradesPerDay": 28.666666666666668,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 171,
+      "winningTrades": 70,
+      "losingTrades": 101,
+      "winRate": 0.4093567251461988,
+      "avgProfit": 10.887324692049782,
+      "avgLoss": -33.53899737005436,
+      "totalPnl": -2625.3260059320055,
+      "totalFees": 3590.8079679081948,
+      "finalEquity": 579.474554115256,
+      "returnRate": -0.8841050891769487,
+      "maxDrawdown": 0.8841050891769487,
+      "sharpeRatio": -0.17452836148218626,
+      "avgDuration": 11.198830409356725,
+      "maxConsecutiveLosses": 8,
+      "tradesPerDay": 28.5,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 124,
+      "winningTrades": 51,
+      "losingTrades": 73,
+      "winRate": 0.4112903225806452,
+      "avgProfit": 18.276021241459556,
+      "avgLoss": -43.3252513811586,
+      "totalPnl": -2230.6662675101406,
+      "totalFees": 3240.0188087178303,
+      "finalEquity": 1149.5388743006424,
+      "returnRate": -0.7700922251398715,
+      "maxDrawdown": 0.7700922251398715,
+      "sharpeRatio": -0.11840204659005046,
+      "avgDuration": 11.653225806451612,
+      "maxConsecutiveLosses": 9,
+      "tradesPerDay": 20.666666666666668,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 174,
+      "winningTrades": 77,
+      "losingTrades": 97,
+      "winRate": 0.4425287356321839,
+      "avgProfit": 14.446524151880759,
+      "avgLoss": -36.34534334760881,
+      "totalPnl": -2413.1159450232362,
+      "totalFees": 3809.610847297603,
+      "finalEquity": 682.0013098896214,
+      "returnRate": -0.8635997380220757,
+      "maxDrawdown": 0.8636172850067682,
+      "sharpeRatio": -0.09134679976933009,
+      "avgDuration": 12.21264367816092,
+      "maxConsecutiveLosses": 7,
+      "tradesPerDay": 29.0,
+      "parameters": {
+        "maPeriods": [
+          5,
+          10,
+          20
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 99,
+      "winningTrades": 41,
+      "losingTrades": 58,
+      "winRate": 0.41414141414141414,
+      "avgProfit": 22.452932246370242,
+      "avgLoss": -50.6339002196334,
+      "totalPnl": -2016.195990637557,
+      "totalFees": 2918.4054911242456,
+      "finalEquity": 1524.6165646844438,
+      "returnRate": -0.6950766870631112,
+      "maxDrawdown": 0.7027240485915551,
+      "sharpeRatio": -0.10423082656005625,
+      "avgDuration": 11.818181818181818,
+      "maxConsecutiveLosses": 7,
+      "tradesPerDay": 16.5,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 98,
+      "winningTrades": 46,
+      "losingTrades": 52,
+      "winRate": 0.46938775510204084,
+      "avgProfit": 22.762811588516747,
+      "avgLoss": -57.313641401330074,
+      "totalPnl": -1933.2200197973932,
+      "totalFees": 2934.6956566987783,
+      "finalEquity": 1599.3620397719067,
+      "returnRate": -0.6801275920456186,
+      "maxDrawdown": 0.6879027675841362,
+      "sharpeRatio": -0.08235455822381683,
+      "avgDuration": 11.938775510204081,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 16.333333333333332,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 72,
+      "winningTrades": 21,
+      "losingTrades": 51,
+      "winRate": 0.2916666666666667,
+      "avgProfit": 19.74775285905475,
+      "avgLoss": -55.869364257244754,
+      "totalPnl": -2434.634767079333,
+      "totalFees": 2170.10599918271,
+      "finalEquity": 1480.2862438721088,
+      "returnRate": -0.7039427512255783,
+      "maxDrawdown": 0.7039427512255783,
+      "sharpeRatio": -0.39659683750897234,
+      "avgDuration": 11.38888888888889,
+      "maxConsecutiveLosses": 8,
+      "tradesPerDay": 12.0,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 115,
+      "winningTrades": 43,
+      "losingTrades": 72,
+      "winRate": 0.3739130434782609,
+      "avgProfit": 21.64705502194512,
+      "avgLoss": -44.44371060882863,
+      "totalPnl": -2269.1237978920212,
+      "totalFees": 3061.2781250194857,
+      "finalEquity": 1200.1124753630786,
+      "returnRate": -0.7599775049273844,
+      "maxDrawdown": 0.7620743125686223,
+      "sharpeRatio": -0.1370274252286309,
+      "avgDuration": 11.217391304347826,
+      "maxConsecutiveLosses": 7,
+      "tradesPerDay": 19.166666666666668,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 90,
+      "winningTrades": 51,
+      "losingTrades": 39,
+      "winRate": 0.5666666666666667,
+      "avgProfit": 26.741281619091197,
+      "avgLoss": -67.47211948278537,
+      "totalPnl": -1267.607297254979,
+      "totalFees": 3107.723195964324,
+      "finalEquity": 2178.4246802140724,
+      "returnRate": -0.5643150639571856,
+      "maxDrawdown": 0.5686832123202779,
+      "sharpeRatio": 0.05630719944048938,
+      "avgDuration": 10.277777777777779,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 15.0,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 90,
+      "winningTrades": 52,
+      "losingTrades": 38,
+      "winRate": 0.5777777777777777,
+      "avgProfit": 28.16932923113643,
+      "avgLoss": -66.95657136309656,
+      "totalPnl": -1079.544591778575,
+      "totalFees": 3227.2533920093533,
+      "finalEquity": 2306.6569525974514,
+      "returnRate": -0.5386686094805098,
+      "maxDrawdown": 0.5432938875005484,
+      "sharpeRatio": 0.09424394167919144,
+      "avgDuration": 10.055555555555555,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 15.0,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 51,
+      "winningTrades": 30,
+      "losingTrades": 21,
+      "winRate": 0.5882352941176471,
+      "avgProfit": 27.609797734984088,
+      "avgLoss": -83.4307774974349,
+      "totalPnl": -923.7523953966104,
+      "totalFees": 1983.4746019112172,
+      "finalEquity": 3084.399235111684,
+      "returnRate": -0.3831201529776632,
+      "maxDrawdown": 0.3970029777930722,
+      "sharpeRatio": 0.03968806118503444,
+      "avgDuration": 10.784313725490197,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 8.5,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 81,
+      "winningTrades": 39,
+      "losingTrades": 42,
+      "winRate": 0.48148148148148145,
+      "avgProfit": 23.74580387223751,
+      "avgLoss": -59.81492581067705,
+      "totalPnl": -1586.1405330311734,
+      "totalFees": 2736.4039610696877,
+      "finalEquity": 2045.6073890733749,
+      "returnRate": -0.590878522185325,
+      "maxDrawdown": 0.5982416029939959,
+      "sharpeRatio": -0.04878334584520066,
+      "avgDuration": 11.54320987654321,
+      "maxConsecutiveLosses": 6,
+      "tradesPerDay": 13.5,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 70,
+      "winningTrades": 35,
+      "losingTrades": 35,
+      "winRate": 0.5,
+      "avgProfit": 28.306454116268906,
+      "avgLoss": -61.2993639239112,
+      "totalPnl": -1154.7518432674804,
+      "totalFees": 2622.506223078645,
+      "finalEquity": 2533.9559296550156,
+      "returnRate": -0.4932088140689969,
+      "maxDrawdown": 0.4932088140689969,
+      "sharpeRatio": 0.029431398599845428,
+      "avgDuration": 12.785714285714286,
+      "maxConsecutiveLosses": 4,
+      "tradesPerDay": 11.666666666666666,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 70,
+      "winningTrades": 33,
+      "losingTrades": 37,
+      "winRate": 0.4714285714285714,
+      "avgProfit": 29.181421767089812,
+      "avgLoss": -57.03485034290595,
+      "totalPnl": -1147.302544373556,
+      "totalFees": 2624.3406190142714,
+      "finalEquity": 2540.485939479683,
+      "returnRate": -0.4919028121040634,
+      "maxDrawdown": 0.4919028121040634,
+      "sharpeRatio": 0.031933073102127396,
+      "avgDuration": 12.214285714285714,
+      "maxConsecutiveLosses": 7,
+      "tradesPerDay": 11.666666666666666,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 23,
+      "winningTrades": 14,
+      "losingTrades": 9,
+      "winRate": 0.6086956521739131,
+      "avgProfit": 26.15807411148061,
+      "avgLoss": -71.1409812800116,
+      "totalPnl": -274.0557939593759,
+      "totalFees": 1053.9960273286333,
+      "finalEquity": 4198.893626609668,
+      "returnRate": -0.1602212746780664,
+      "maxDrawdown": 0.1618788041938129,
+      "sharpeRatio": 0.212569912120389,
+      "avgDuration": 10.434782608695652,
+      "maxConsecutiveLosses": 4,
+      "tradesPerDay": 3.8333333333333335,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 82,
+      "winningTrades": 34,
+      "losingTrades": 48,
+      "winRate": 0.4146341463414634,
+      "avgProfit": 22.886575105534206,
+      "avgLoss": -49.59125044447017,
+      "totalPnl": -1602.2364677464052,
+      "totalFees": 2710.6225565118493,
+      "finalEquity": 2042.3823450179857,
+      "returnRate": -0.5915235309964029,
+      "maxDrawdown": 0.5915235309964029,
+      "sharpeRatio": -0.05510043893017379,
+      "avgDuration": 11.341463414634147,
+      "maxConsecutiveLosses": 6,
+      "tradesPerDay": 13.666666666666666,
+      "parameters": {
+        "maPeriods": [
+          7,
+          14,
+          30
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 167,
+      "winningTrades": 80,
+      "losingTrades": 87,
+      "winRate": 0.47904191616766467,
+      "avgProfit": 23.074041393024334,
+      "avgLoss": -43.576018918051766,
+      "totalPnl": -1945.190334428557,
+      "totalFees": 4163.338378078384,
+      "finalEquity": 973.1076184088756,
+      "returnRate": -0.8053784763182249,
+      "maxDrawdown": 0.8053784763182249,
+      "sharpeRatio": 0.023120001020942128,
+      "avgDuration": 11.167664670658683,
+      "maxConsecutiveLosses": 6,
+      "tradesPerDay": 27.833333333333332,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 170,
+      "winningTrades": 82,
+      "losingTrades": 88,
+      "winRate": 0.4823529411764706,
+      "avgProfit": 21.175145250081307,
+      "avgLoss": -42.7374783190803,
+      "totalPnl": -2024.5361815723995,
+      "totalFees": 4150.912462311996,
+      "finalEquity": 900.0057794109597,
+      "returnRate": -0.819998844117808,
+      "maxDrawdown": 0.819998844117808,
+      "sharpeRatio": 0.006050564602721762,
+      "avgDuration": 11.352941176470589,
+      "maxConsecutiveLosses": 6,
+      "tradesPerDay": 28.333333333333332,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 160,
+      "winningTrades": 71,
+      "losingTrades": 89,
+      "winRate": 0.44375,
+      "avgProfit": 17.201714507051946,
+      "avgLoss": -38.69936112486147,
+      "totalPnl": -2222.9214101119833,
+      "totalFees": 3800.8253697701225,
+      "finalEquity": 876.6430927095525,
+      "returnRate": -0.8246713814580895,
+      "maxDrawdown": 0.8246713814580895,
+      "sharpeRatio": -0.04412060805185736,
+      "avgDuration": 11.5625,
+      "maxConsecutiveLosses": 7,
+      "tradesPerDay": 26.666666666666668,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 192,
+      "winningTrades": 83,
+      "losingTrades": 109,
+      "winRate": 0.4322916666666667,
+      "avgProfit": 12.276787290592498,
+      "avgLoss": -33.189145772366714,
+      "totalPnl": -2598.6435440687947,
+      "totalFees": 3716.786656931168,
+      "finalEquity": 542.7551372681124,
+      "returnRate": -0.8914489725463774,
+      "maxDrawdown": 0.8914489725463774,
+      "sharpeRatio": -0.08524844872007621,
+      "avgDuration": 11.71875,
+      "maxConsecutiveLosses": 10,
+      "tradesPerDay": 32.0,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 9,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 102,
+      "winningTrades": 56,
+      "losingTrades": 46,
+      "winRate": 0.5490196078431373,
+      "avgProfit": 27.061433773740447,
+      "avgLoss": -56.821779745082225,
+      "totalPnl": -1098.3615769443177,
+      "totalFees": 3423.1875648425134,
+      "finalEquity": 2189.913153744607,
+      "returnRate": -0.5620173692510786,
+      "maxDrawdown": 0.563635358089179,
+      "sharpeRatio": 0.12812975686135888,
+      "avgDuration": 11.176470588235293,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 17.0,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 104,
+      "winningTrades": 59,
+      "losingTrades": 45,
+      "winRate": 0.5673076923076923,
+      "avgProfit": 28.323554147579994,
+      "avgLoss": -58.09989538984617,
+      "totalPnl": -943.4055978358581,
+      "totalFees": 3539.889869470627,
+      "finalEquity": 2286.4796229609606,
+      "returnRate": -0.5427040754078079,
+      "maxDrawdown": 0.5448609216090253,
+      "sharpeRatio": 0.1623635274100153,
+      "avgDuration": 11.057692307692308,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 17.333333333333332,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 63,
+      "winningTrades": 35,
+      "losingTrades": 28,
+      "winRate": 0.5555555555555556,
+      "avgProfit": 29.96433836460765,
+      "avgLoss": -70.32966466063867,
+      "totalPnl": -920.4787677366149,
+      "totalFees": 2437.550529911497,
+      "finalEquity": 2860.6929670555396,
+      "returnRate": -0.4278614065888921,
+      "maxDrawdown": 0.44506374786773534,
+      "sharpeRatio": 0.07924116931292516,
+      "avgDuration": 12.142857142857142,
+      "maxConsecutiveLosses": 4,
+      "tradesPerDay": 10.5,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 107,
+      "winningTrades": 47,
+      "losingTrades": 60,
+      "winRate": 0.4392523364485981,
+      "avgProfit": 14.594257609132736,
+      "avgLoss": -47.56152753153845,
+      "totalPnl": -2167.7615442630686,
+      "totalFees": 2941.8192799272206,
+      "finalEquity": 1361.2023976682897,
+      "returnRate": -0.7277595204663421,
+      "maxDrawdown": 0.728002063518248,
+      "sharpeRatio": -0.13624679985729152,
+      "avgDuration": 11.962616822429906,
+      "maxConsecutiveLosses": 8,
+      "tradesPerDay": 17.833333333333332,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 14,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 90,
+      "winningTrades": 49,
+      "losingTrades": 41,
+      "winRate": 0.5444444444444444,
+      "avgProfit": 32.69218872554376,
+      "avgLoss": -58.3291603218615,
+      "totalPnl": -789.5783256446774,
+      "totalFees": 3258.388674817647,
+      "finalEquity": 2580.9420809415715,
+      "returnRate": -0.4838115838116857,
+      "maxDrawdown": 0.49769374831880764,
+      "sharpeRatio": 0.1694557002467978,
+      "avgDuration": 10.444444444444445,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 15.0,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          25,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 90,
+      "winningTrades": 50,
+      "losingTrades": 40,
+      "winRate": 0.5555555555555556,
+      "avgProfit": 33.780007839526775,
+      "avgLoss": -61.141578435552525,
+      "totalPnl": -756.6627454457625,
+      "totalFees": 3288.1316464705133,
+      "finalEquity": 2598.9732728611084,
+      "returnRate": -0.4802053454277783,
+      "maxDrawdown": 0.501425626831103,
+      "sharpeRatio": 0.17233896450486677,
+      "avgDuration": 10.5,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 15.0,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          30,
+          45
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 53,
+      "winningTrades": 29,
+      "losingTrades": 24,
+      "winRate": 0.5471698113207547,
+      "avgProfit": 22.4159303905448,
+      "avgLoss": -64.74613594094612,
+      "totalPnl": -903.8452812569076,
+      "totalFees": 2157.1930596211996,
+      "finalEquity": 3017.458818597946,
+      "returnRate": -0.3965082362804108,
+      "maxDrawdown": 0.3965082362804108,
+      "sharpeRatio": 0.047119681982806194,
+      "avgDuration": 11.60377358490566,
+      "maxConsecutiveLosses": 5,
+      "tradesPerDay": 8.833333333333334,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          30,
+          50
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    },
+    {
+      "totalTrades": 99,
+      "winningTrades": 44,
+      "losingTrades": 55,
+      "winRate": 0.4444444444444444,
+      "avgProfit": 18.61914020369266,
+      "avgLoss": -46.58617605164753,
+      "totalPnl": -1742.997513878137,
+      "totalFees": 3162.1067628675487,
+      "finalEquity": 1675.8835690366948,
+      "returnRate": -0.664823286192661,
+      "maxDrawdown": 0.664823286192661,
+      "sharpeRatio": -0.07203071540341702,
+      "avgDuration": 12.727272727272727,
+      "maxConsecutiveLosses": 6,
+      "tradesPerDay": 16.5,
+      "parameters": {
+        "maPeriods": [
+          10,
+          20,
+          50
+        ],
+        "rsiPeriod": 21,
+        "rsiThreshold": [
+          35,
+          55
+        ],
+        "initialEquity": 5000.0,
+        "leverage": 10
+      }
+    }
+  ]
+}

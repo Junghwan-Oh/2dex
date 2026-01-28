@@ -1,0 +1,769 @@
+# V4 BBO Routing Merge Correction Plan (Revised)
+
+**Created**: 2026-01-27
+**Status**: Critic-Approved (iteration 1)
+**Iteration**: 1/5
+
+---
+
+## Context
+
+### Problem Statement
+
+Previous implementation created a new file `DN_alternate_backpack_grvt_current.py` instead of modifying the existing `DN_alternate_backpack_grvt.py`. This resulted in:
+- **Loss of all safety features** (MAX_POSITION, MAX_DAILY_LOSS, pre-trade checks, emergency unwind)
+- **Plan specification ambiguity** - target file didn't exist, no explicit creation instruction
+- **Safety regression** - new file can expose unlimited position sizes and losses
+
+### Root Cause
+
+The plan specified `DN_alternate_backpack_grvt_current.py` as the target (line 20 of grvt-bbo-routing-integration.md), but this file:
+1. Did not exist before implementation
+2. No instruction to create it vs. modify existing file
+3. No instruction about preserving safety features from existing `DN_alternate_backpack_grvt.py`
+
+### Correct Approach
+
+**Start with**: `DN_alternate_backpack_grvt.py` (existing, with all safety features)
+**Add**: V4 BBO routing features from `DN_alternate_backpack_grvt_current.py`
+**Result**: Enhanced `DN_alternate_backpack_grvt.py` (V4 + safety features)
+
+---
+
+## CRITICAL ISSUE IDENTIFIED
+
+### Current Production Code Uses INVALID V3 Parameters
+
+**Location**: Lines 858-859, 1053-1054 in `DN_alternate_backpack_grvt.py`
+
+```python
+# CURRENT (WRONG - uses V3 params):
+result = await self.hedge_client.place_iterative_market_order(
+    contract_id=self.hedge_contract_id,
+    target_quantity=quantity,
+    side=order_side,
+    max_iterations=10,
+    max_tick_offset=2,    # V3 PARAM - INVALID IN V4
+    max_fill_duration=30  # V3 PARAM - INVALID IN V4
+)
+```
+
+**V4 Signature (CORRECT)**:
+```python
+# From grvt.py:1218-1226
+async def place_iterative_market_order(
+    self,
+    contract_id: str,
+    target_quantity: Decimal,
+    side: str,
+    max_iterations: int = 20,
+    max_slippage_bps: int = 5,
+    tick_size: int = 10,  # INT, not Decimal
+) -> dict:
+```
+
+**FIX NEEDED**: Remove `max_tick_offset` and `max_fill_duration` parameters, use `tick_size=10` instead.
+
+---
+
+## Source Materials
+
+### 1. V4 Implementation Already Verified
+
+The V4 BBO routing implementation in `grvt.py` is **solid and complete**:
+- ✅ Commit 3d923c1 - All V4 phases implemented
+- ✅ Helper functions: `calculate_timeout()`, `extract_filled_quantity()`
+- ✅ Order book analysis: `analyze_order_book_depth()`, `find_hedge_price_with_liquidity()`
+- ✅ Core routing: `place_iterative_market_order()` (lines 1218-1433)
+
+**Key V4 Files**:
+- [exchanges/grvt.py:18-47](perp-dex-tools-original/hedge/exchanges/grvt.py#L18-L47) - `calculate_timeout()`
+- [exchanges/grvt.py:50-88](perp-dex-tools-original/hedge/exchanges/grvt.py#L50-L88) - `extract_filled_quantity()`
+- [exchanges/grvt.py:751-812](perp-dex-tools-original/hedge/exchanges/grvt.py#L751-L812) - `analyze_order_book_depth()`
+- [exchanges/grvt.py:1218-1226](perp-dex-tools-original/hedge/exchanges/grvt.py#L1218-L1226) - `place_iterative_market_order()` signature
+
+### 2. DN File Status
+
+| File | Status | Issues |
+|------|--------|--------|
+| `DN_alternate_backpack_grvt.py` | ✅ Production-ready, tracked in git | Uses invalid V3 params (lines 858-859, 1053-1054) |
+| `DN_alternate_backpack_grvt_current.py` | ❌ Untracked, created today | Missing all safety features |
+
+### 3. Reference Plans
+
+- [grvt-bbo-routing-integration.md](.omc/plans/grvt-bbo-routing-integration.md) - Original V4 integration plan
+- [grvt-smart-routing-plan-v4.md](.serena/memories/grvt-smart-routing-plan-v4.md) - V4 implementation plan
+
+---
+
+## Safety Features Preservation Matrix
+
+### Critical Safety Features (MUST PRESERVE)
+
+| Feature | Lines in Original | Purpose | Risk if Removed |
+|---------|-------------------|---------|-----------------|
+| **MAX_POSITION** | 141 | Hard cap: 5 ETH total position | Unlimited exposure |
+| **MAX_DAILY_LOSS** | 142 | Daily loss limit: $5 USD | Unlimited losses |
+| **daily_pnl tracking** | 143 | Cumulative daily PnL | No circuit breaker |
+| **_pre_trade_check()** | 1786-1828 | Validates before every order | No validation |
+| **_emergency_unwind_primary_position()** | 1912-1966 | Exit when hedge fails | Dangerous unhedged exposure |
+| **NET_DELTA_WARNING_THRESHOLD** | 637 | 1% drift warning | Silent hedge drift |
+| **NET_DELTA_CRITICAL_THRESHOLD** | 638 | 2% drift critical alert | No awareness |
+| **first_build_completed** | 130, 1046, 1082 | Cold start workaround | First order failures |
+| **hedge_post_only parameter** | 101, 113 | Save 0.05% taker fee | Higher costs |
+
+### Safety Feature Integration Points
+
+```python
+# Line 1834: Pre-trade check call (MUST KEEP)
+await self._pre_trade_check()
+
+# Line 1877: Emergency unwind trigger (MUST KEEP)
+if not success:
+    await self._emergency_unwind_primary_position()
+```
+
+---
+
+## Corrected Line Numbers
+
+| Feature | Actual Line |
+|---------|-------------|
+| **CLI parameter** `hedge_post_only` | 101 |
+| **__init__ assignment** | 113 |
+| **first_build_completed** | 130 |
+| **_pre_trade_check() method** | 1786-1828 |
+| **_emergency_unwind_primary_position() method** | 1912-1966 |
+| **CLOSE logic** (in place_hedge_order) | 850-1035 |
+| **OPEN logic** | 1037-1130 |
+| **force_close_all_positions()** | 1376+ |
+| **Pre-trade check call** | ~1834 |
+| **Emergency unwind trigger** | ~1877 |
+
+---
+
+## Merge Strategy
+
+### Approach: Additive Enhancement + V3 Param Removal
+
+**Principle**: Add V4 features TO the existing safe file, AND remove invalid V3 parameters.
+
+**Workflow**:
+```
+1. Base: DN_alternate_backpack_grvt.py (safe, production-tested)
+2. Add: V4 imports (line 27)
+3. Add: check_grvt_liquidity() method (after print_trade_summary)
+4. Remove: Invalid V3 params from OPEN CLOSE logic (lines 858-859, 1053-1054)
+5. Modify: OPEN logic (lines 1037-1130) - preserve first_build_completed
+6. Modify: CLOSE logic (lines 850-1035) - preserve POST_ONLY fallback
+7. Verify: All safety features still present and functional
+```
+
+### Key Integration Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Start with original file** | Preserves all safety features |
+| **Add V4 imports** | Backward compatible, no conflicts |
+| **Remove V3 params** | They don't exist in V4 and cause errors |
+| **Add liquidity check** | New method, doesn't replace existing code |
+| **Modify OPEN logic carefully** | Preserve first_build_completed conditional (lines 1046, 1082) |
+| **Modify CLOSE logic with fallback** | Preserve POST_ONLY logic (lines 890-981) |
+| **Test safety features first** | Verify _pre_trade_check still works |
+
+---
+
+## Detailed TODOs
+
+### Phase 1: Preparation (Read-Only)
+
+**Objective**: Understand codebase structure and V4 signatures
+
+**Task 1.1: Read V4 function signatures from grvt.py**
+- [x] Read `grvt.py:18-47` - `calculate_timeout()`
+- [x] Read `grvt.py:50-88` - `extract_filled_quantity()`
+- [x] Read `grvt.py:1218-1226` - `place_iterative_market_order()` signature
+- [x] Confirm: `tick_size=10` is INT (10 cents = $0.10)
+- [x] Confirm: NO `max_tick_offset` or `max_fill_duration` in V4
+
+**Task 1.2: Read safety features from DN_alternate_backpack_grvt.py**
+- [x] Read lines 141-143 (MAX_POSITION, MAX_DAILY_LOSS, daily_pnl)
+- [x] Read lines 1786-1828 (_pre_trade_check method)
+- [x] Read lines 1912-1966 (_emergency_unwind_primary_position)
+- [x] Read lines 637-652 (NET_DELTA thresholds)
+- [x] Read lines 101, 113 (hedge_post_only parameter)
+- [x] Read lines 1046, 1082 (first_build_completed logic)
+
+**Task 1.3: Identify modification points in DN file**
+- [x] Line 27: Import statement location
+- [x] Lines ~295: Where to insert check_grvt_liquidity() (after print_trade_summary)
+- [x] Lines 858-859: CLOSE V3 params to REMOVE
+- [x] Lines 1053-1054: OPEN V3 params to REMOVE
+- [x] Lines 1037-1130: OPEN logic with first_build_completed conditionals
+- [x] Lines 850-1035: CLOSE logic with POST_ONLY fallback
+
+**Acceptance Criteria**:
+- All V4 signatures documented
+- All safety feature locations documented
+- Clear modification points identified
+
+---
+
+### Phase 2: Add V4 Imports
+
+**Objective**: Import V4 helper functions
+
+**File**: [DN_alternate_backpack_grvt.py:27](perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py#L27)
+
+**Current Code**:
+```python
+from exchanges.grvt import GrvtClient
+```
+
+**New Code**:
+```python
+from exchanges.grvt import GrvtClient, extract_filled_quantity, calculate_timeout
+```
+
+**Verification**:
+```bash
+cd perp-dex-tools-original/hedge
+python -c "from exchanges.grvt import extract_filled_quantity, calculate_timeout; print('V4 imports OK')"
+```
+
+**Acceptance Criteria**:
+- Import syntax is valid
+- Functions import successfully
+- No conflicts with existing imports
+
+---
+
+### Phase 3: Add Liquidity Check Helper
+
+**Objective**: Add `check_grvt_liquidity()` method to DN class
+
+**Location**: After `print_trade_summary()` method (after line 293 in original)
+
+**Add Method**:
+```python
+async def check_grvt_liquidity(
+    self,
+    client,
+    target_quantity: Decimal,
+    side: str
+) -> dict:
+    """Check if GRVT has sufficient liquidity at BBO.
+
+    Returns:
+        dict with format:
+        {
+            'sufficient_at_bbo': bool,
+            'available_size': Decimal,
+            'depth_levels_used': int,
+            'fallback_needed': bool
+        }
+    """
+    try:
+        # Check if client has analyze_order_book_depth method
+        if not hasattr(client, 'analyze_order_book_depth'):
+            self.logger.warning("[LIQUIDITY_CHECK] Client missing analyze_order_book_depth method")
+            return {
+                'sufficient_at_bbo': False,
+                'available_size': Decimal('0'),
+                'depth_levels_used': 0,
+                'fallback_needed': True
+            }
+
+        analysis = await client.analyze_order_book_depth(
+            symbol=client.config.contract_id,
+            side=side,
+            depth_limit=50
+        )
+
+        bbo_size = analysis['top_size']
+        cumulative = analysis['cumulative']
+
+        return {
+            'sufficient_at_bbo': bbo_size >= target_quantity,
+            'available_size': cumulative,
+            'depth_levels_used': analysis['total_levels_analyzed'],
+            'fallback_needed': cumulative < target_quantity
+        }
+    except Exception as e:
+        self.logger.warning(f"[LIQUIDITY_CHECK] Failed: {e}")
+        return {
+            'sufficient_at_bbo': False,
+            'available_size': Decimal('0'),
+            'depth_levels_used': 0,
+            'fallback_needed': True
+        }
+```
+
+**Acceptance Criteria**:
+- Method added at correct location
+- Returns dict format consistently
+- Has hasattr guard for method availability
+- Handles exceptions gracefully
+
+---
+
+### Phase 4: Remove Invalid V3 Parameters
+
+**Objective**: Remove V3 params that don't exist in V4
+
+**File**: [DN_alternate_backpack_grvt.py](perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py)
+
+**Task 4.1: Remove from CLOSE logic**
+
+**Location**: Lines 858-859
+
+**Find** (in place_hedge_order method, CLOSE section):
+```python
+# OLD (WRONG - V3 params):
+result = await self.hedge_client.place_iterative_market_order(
+    contract_id=self.hedge_contract_id,
+    target_quantity=quantity,
+    side=order_side,
+    max_iterations=10,
+    max_tick_offset=2,    # V3 PARAM - INVALID IN V4 - REMOVE THIS
+    max_fill_duration=30  # V3 PARAM - INVALID IN V4 - REMOVE THIS
+)
+```
+
+**Replace with**:
+```python
+# NEW (V4 signature):
+result = await self.hedge_client.place_iterative_market_order(
+    contract_id=self.hedge_contract_id,
+    target_quantity=quantity,
+    side=order_side,
+    max_iterations=10,
+    tick_size=10  # INT: 10 cents = $0.10
+)
+```
+
+**Task 4.2: Remove from OPEN logic**
+
+**Location**: Lines 1053-1054
+
+**Find** (in place_hedge_order method, OPEN section):
+```python
+# OLD (WRONG - V3 params):
+result = await self.hedge_client.place_iterative_market_order(
+    contract_id=self.hedge_contract_id,
+    target_quantity=quantity,
+    side=order_side,
+    max_iterations=10,
+    max_tick_offset=2,    # V3 PARAM - INVALID IN V4 - REMOVE THIS
+    max_fill_duration=30  # V3 PARAM - INVALID IN V4 - REMOVE THIS
+)
+```
+
+**Replace with**:
+```python
+# NEW (V4 signature):
+result = await self.hedge_client.place_iterative_market_order(
+    contract_id=self.hedge_contract_id,
+    target_quantity=quantity,
+    side=order_side,
+    max_iterations=10,
+    tick_size=10  # INT: 10 cents = $0.10
+)
+```
+
+**Task 4.3: Verify no remaining V3 params**
+```bash
+cd perp-dex-tools-original/hedge
+grep -n "max_tick_offset\|max_fill_duration" DN_alternate_backpack_grvt.py
+# Should return NO RESULTS
+```
+
+**Acceptance Criteria**:
+- All `max_tick_offset` removed from CLOSE logic
+- All `max_fill_duration` removed from CLOSE logic
+- All `max_tick_offset` removed from OPEN logic
+- All `max_fill_duration` removed from OPEN logic
+- All V4 signatures use `tick_size=10` instead
+
+---
+
+### Phase 5: Modify OPEN Logic (CRITICAL - Preserve first_build_completed)
+
+**Objective**: Add V4 routing to OPEN while preserving first_build_completed conditional logic
+
+**Location**: [DN_alternate_backpack_grvt.py:1037-1130](perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py#L1037-L1130)
+
+**CRITICAL CONSTRAINTS**:
+1. **DO NOT REMOVE** first_build_completed logic (lines 1046, 1082)
+2. **PRESERVE** hedge_post_only logic (lines 1089-1116)
+3. **REMOVE** invalid V3 params (already done in Phase 4)
+
+**Implementation Strategy**:
+The current code already has correct V4 signatures (after removing V3 params). The main change needed is adding a liquidity check and using `extract_filled_quantity()` for safer result parsing.
+
+**Step 5.1**: Add liquidity check before OPEN iterative order (at line 1047)
+
+After line 1047 (the logger.info for ITERATIVE market order), add:
+
+```python
+# Get position before placing order
+pos_before = await self.hedge_client.get_account_positions()
+
+# NEW: Check liquidity first
+if hasattr(self, 'check_grvt_liquidity'):
+    liquidity = await self.check_grvt_liquidity(
+        client=self.hedge_client,
+        target_quantity=quantity,
+        side=order_side
+    )
+    self.logger.info(
+        f"[OPEN] [LIQUIDITY] available={liquidity['available_size']}, "
+        f"sufficient_at_bbo={liquidity['sufficient_at_bbo']}"
+    )
+```
+
+**Step 5.2**: Update result parsing to use extract_filled_quantity
+
+**Current code** (lines 1057-1078):
+```python
+if result['success']:
+    self.logger.info(
+        f"[OPEN] [ITERATIVE] Filled {result['total_filled']} @ ${result['average_price']:.2f} "
+        f"({result['iterations']} iterations)"
+    )
+```
+
+**Replace with**:
+```python
+if result.get('success', True):
+    # Use extract_filled_quantity for safe parsing
+    filled = extract_filled_quantity(result)
+    avg_price = result.get('average_price', None) or result.get('traded_size', result.get('size', {}))
+
+    self.logger.info(
+        f"[OPEN] [GRVT] [ITERATIVE_FILL]: "
+        f"{filled} @ ~{avg_price} "
+        f"(target: {quantity})"
+    )
+
+    self.log_trade_to_csv(
+        exchange=self.hedge_exchange.upper(),
+        side=side,
+        price=str(avg_price) if avg_price else "N/A",
+        quantity=str(filled),
+        order_type="hedge_open",
+        mode="iterative_routing"
+    )
+
+    self.hedge_order_filled = True
+    self.order_execution_complete = True
+    self.last_hedge_fill_price = avg_price
+    return True
+else:
+    error_msg = result.get('error', 'unknown') or result.get('reason', 'unknown')
+    self.logger.error(f"[OPEN] Iterative failed: {error_msg}")
+    self.hedge_order_filled = False
+    self.order_execution_complete = False
+    return False
+```
+
+**Step 5.3**: Preserve POST_ONLY fallback (lines 1082-1116)
+
+**DO NOT REMOVE** the first_build_completed logic at line 1082. This section handles the cold start workaround for the first BUILD order.
+
+**Acceptance Criteria**:
+- Liquidity check added before OPEN iterative order
+- extract_filled_quantity() used for safe result parsing
+- All V3 params removed
+- first_build_completed conditional preserved (lines 1046, 1082)
+- hedge_post_only logic preserved (lines 1089-1116)
+- All safety features intact
+
+---
+
+### Phase 6: Modify CLOSE Logic (CRITICAL - Preserve POST_ONLY Fallback)
+
+**Objective**: Enhance CLOSE logic with V4 routing while preserving POST_ONLY fallback
+
+**Location**: [DN_alternate_backpack_grvt.py:850-1035](perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py#L850-L1035)
+
+**CRITICAL CONSTRAINTS**:
+1. **PRESERVE** POST_ONLY logic (lines 890-981)
+2. **PRESERVE** MARKET fallback logic (lines 983-1035)
+3. **REMOVE** invalid V3 params from iterative order
+
+**Implementation**:
+
+**Step 6.1**: Add liquidity check before CLOSE iterative order
+
+Find the CLOSE iterative order section (around line 855) and add liquidity check:
+
+```python
+# Get position before placing order
+pos_before_close = await self.hedge_client.get_account_positions()
+
+# NEW: Check liquidity first
+if hasattr(self, 'check_grvt_liquidity'):
+    liquidity = await self.check_grvt_liquidity(
+        client=self.hedge_client,
+        target_quantity=quantity,
+        side=order_side
+    )
+    self.logger.info(
+        f"[CLOSE] [LIQUIDITY] available={liquidity['available_size']}, "
+        f"sufficient_at_bbo={liquidity['sufficient_at_bbo']}"
+    )
+```
+
+**Step 6.2**: Update result parsing to use extract_filled_quantity
+
+**Current code** (around line 870-881):
+```python
+if result['success']:
+    self.logger.info(
+        f"[CLOSE] [ITERATIVE] Filled {result['total_filled']} @ ${result['average_price']:.2f} "
+        f"({result['iterations']} iterations)"
+    )
+```
+
+**Replace with**:
+```python
+if result.get('success', True):
+    # Use extract_filled_quantity for safe parsing
+    filled = extract_filled_quantity(result)
+    avg_price = result.get('average_price', None) or result.get('traded_size', result.get('size', {}))
+
+    self.logger.info(
+        f"[CLOSE] [GRVT] [ITERATIVE_FILL]: "
+        f"{filled} @ ~{avg_price}"
+    )
+
+    self.log_trade_to_csv(
+        exchange=self.hedge_exchange.upper(),
+        side=side,
+        price=str(avg_price) if avg_price else "N/A",
+        quantity=str(filled),
+        order_type="hedge_close",
+        mode="iterative_routing"
+    )
+
+    self.hedge_order_filled = True
+    self.order_execution_complete = True
+    self.last_hedge_fill_price = avg_price
+    return True
+else:
+    error_msg = result.get('error', 'unknown') or result.get('reason', 'unknown')
+    self.logger.error(f"[CLOSE] Iterative failed: {error_msg}")
+    self.hedge_order_filled = False
+    self.order_execution_complete = False
+    return False
+```
+
+**Step 6.3**: Preserve POST_ONLY fallback (lines 890-981)
+
+**DO NOT REMOVE** the entire POST_ONLY logic block. This section tries POST_ONLY first to save fees, and only falls back to MARKET if needed.
+
+**Acceptance Criteria**:
+- Liquidity check added before CLOSE iterative order
+- extract_filled_quantity() used for safe result parsing
+- POST_ONLY logic preserved (lines 890-981)
+- MARKET fallback preserved (lines 983-1035)
+- All V3 params removed
+- All safety features intact
+
+---
+
+### Phase 7: Verification & Testing
+
+**Objective**: Ensure all features work correctly
+
+**Task 7.1: Code verification**
+- [ ] Run: `python -m py_compile perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+- [ ] Confirm NO syntax errors
+
+**Task 7.2: Safety features verification**
+- [ ] Search for `MAX_POSITION` - must exist (line 141)
+- [ ] Search for `MAX_DAILY_LOSS` - must exist (line 142)
+- [ ] Search for `_pre_trade_check` - method must exist (line 1786)
+- [ ] Search for `_emergency_unwind_primary_position` - method must exist (line 1912)
+- [ ] Search for `NET_DELTA_WARNING_THRESHOLD` - must exist (line 637)
+- [ ] Search for `hedge_post_only` - parameter must exist (line 101)
+- [ ] Search for `first_build_completed` - tracking must exist (lines 130, 1046, 1082)
+
+**Task 7.3: V4 features verification**
+- [ ] Search for `extract_filled_quantity` import - must exist (line 27)
+- [ ] Search for `calculate_timeout` import - must exist (line 27)
+- [ ] Search for `check_grvt_liquidity` - method must exist (line ~295)
+- [ ] Search for `max_tick_offset` - must NOT exist
+- [ ] Search for `max_fill_duration` - must NOT exist
+- [ ] Search for `tick_size=10` - must exist in V4 calls
+
+**Task 7.4: Integration verification**
+- [ ] Confirm `_pre_trade_check()` is called before every DN cycle (line ~1834)
+- [ ] Confirm `_emergency_unwind_primary_position()` is triggered on hedge failure (line ~1877)
+- [ ] Confirm `first_build_completed` logic is preserved (lines 1046, 1082)
+- [ ] Confirm POST_ONLY logic is preserved (lines 890-981)
+
+**Task 7.5: Import verification**
+```bash
+cd perp-dex-tools-original/hedge
+python -c "
+from exchanges.grvt import extract_filled_quantity, calculate_timeout
+print('V4 imports OK')
+print('calculate_timeout(0.5) =', calculate_timeout(Decimal('0.5')))
+"
+```
+
+**Task 7.6: No invalid params check**
+```bash
+cd perp-dex-tools-original/hedge
+grep -n "max_tick_offset\|max_fill_duration" DN_alternate_backpack_grvt.py
+# Should return NO RESULTS
+```
+
+**Acceptance Criteria**:
+- ✅ Python compiles without errors
+- ✅ All safety features present
+- ✅ All V4 features present
+- ✅ NO invalid parameters (max_tick_offset, max_fill_duration)
+- ✅ All integration points preserved
+
+---
+
+### Phase 8: Cleanup (Post-Merge)
+
+**Objective**: Remove redundant files and update documentation
+
+**Task 8.1**: Delete incorrect file
+```bash
+cd perp-dex-tools-original/hedge
+rm DN_alternate_backpack_grvt_current.py
+rm DN_alternate_backpack_grvt_current.py.tmp.*
+```
+
+**Task 8.2**: Update plan references
+- [ ] Update `.omc/plans/grvt-bbo-routing-integration.md` line 20 to specify correct file
+- [ ] Add note about safety features preservation
+
+**Task 8.3**: Git commit (user responsibility)
+```bash
+cd perp-dex-tools-original/hedge
+git add DN_alternate_backpack_grvt.py
+git commit -m "feat(dn-bot): Add V4 BBO routing while preserving all safety features
+
+- Import extract_filled_quantity, calculate_timeout from grvt.py
+- Add check_grvt_liquidity() helper method
+- Remove invalid V3 params (max_tick_offset, max_fill_duration)
+- Use V4 signature (tick_size=10) in OPEN and CLOSE logic
+- Add liquidity checks before order placement
+- Use extract_filled_quantity() for safe result parsing
+- Preserve ALL safety features: MAX_POSITION, MAX_DAILY_LOSS, _pre_trade_check
+- Preserve emergency unwind mechanism
+- Preserve net delta monitoring thresholds
+- Preserve hedge_post_only logic
+- Preserve first_build_completed tracking
+
+This merge corrects the previous approach which created a new file
+and lost all safety features. V4 features are now integrated into the
+production-tested safe baseline."
+```
+
+---
+
+## Definition of Done
+
+- [ ] Python compiles without errors
+- [ ] All safety features from original file preserved:
+  - [ ] MAX_POSITION, MAX_DAILY_LOSS, daily_pnl tracking
+  - [ ] _pre_trade_check() method and call
+  - [ ] _emergency_unwind_primary_position() method and trigger
+  - [ ] NET_DELTA_WARNING_THRESHOLD, NET_DELTA_CRITICAL_THRESHOLD
+  - [ ] hedge_post_only parameter and logic
+  - [ ] first_build_completed tracking
+- [ ] All V4 features added:
+  - [ ] extract_filled_quantity, calculate_timeout imports
+  - [ ] check_grvt_liquidity() method
+  - [ ] place_iterative_market_order() in OPEN logic
+  - [ ] place_iterative_market_order() in CLOSE logic
+- [ ] NO invalid parameters (max_tick_offset, max_fill_duration) - REMOVED
+- [ ] All integration points verified
+- [ ] Redundant file deleted
+
+---
+
+## Risk Mitigation
+
+### High Risk Areas
+
+| Area | Risk | Mitigation |
+|------|------|------------|
+| **Emergency unwind removal** | Dangerous unhedged exposure | Verify line ~1877 still calls _emergency_unwind |
+| **Pre-trade check removal** | Orders without validation | Verify line ~1834 still calls _pre_trade_check |
+| **MAX_POSITION removal** | Unlimited exposure | Verify lines 141-143 exist |
+| **V3 param removal** | Code breaking | Verify V4 signature works (grvt.py already tested) |
+| **first_build_completed removal** | First order failures | Verify lines 1046, 1082 preserved |
+
+### Testing Checklist
+
+Before production use:
+- [ ] Run `--ticker ETH --size 0.1 --iter 1` (small test)
+- [ ] Verify _pre_trade_check logs before first order
+- [ ] Verify iterative routing logs appear
+- [ ] Check all safety features in logs
+- [ ] Verify MAX_POSITION prevents oversized orders
+- [ ] Verify daily loss limit works
+- [ ] Verify no max_tick_offset/max_fill_duration errors
+
+---
+
+## Success Criteria
+
+1. ✅ DN_alternate_backpack_grvt.py has V4 BBO routing
+2. ✅ ALL safety features preserved and functional
+3. ✅ Code compiles without errors
+4. ✅ Integration points verified
+5. ✅ Invalid V3 params removed
+6. ✅ Redundant file removed
+7. ✅ No max_tick_offset or max_fill_duration in codebase
+
+---
+
+## Rollback Plan
+
+If merge fails:
+1. Revert DN_alternate_backpack_grvt.py from git
+2. Manually copy V4 features from grvt.py (already verified)
+3. Test safety features independently
+4. Re-test integration
+
+---
+
+## File References
+
+**Primary Files**:
+- [DN_alternate_backpack_grvt.py](perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py) - Target file (existing, safe)
+- [DN_alternate_backpack_grvt_current.py](perp-dex-tools-original/hedge/DN_alternate_backpack_grvt_current.py) - Reference file (V4 features only, DELETE after merge)
+- [grvt.py](perp-dex-tools-original/hedge/exchanges/grvt.py) - V4 implementation (verified, commit 3d923c1)
+
+**Key Line Numbers**:
+- Line 27: Imports
+- Line 101: hedge_post_only parameter
+- Line 113: self.hedge_post_only assignment
+- Line 130: self.first_build_completed = False
+- Lines 141-143: Safety limits (MAX_POSITION, etc.)
+- Lines 1786-1828: _pre_trade_check() method
+- Lines 1912-1966: _emergency_unwind() method
+- Lines 850-1035: CLOSE logic in place_hedge_order()
+- Lines 1037-1130: OPEN logic with first_build_completed conditionals
+- Line 1834: Pre-trade check call
+- Line 1877: Emergency unwind trigger
+
+---
+
+## Notes
+
+- This plan prioritizes **safety preservation** over pure V4 integration
+- V4 features are **additive** - they enhance without replacing
+- Invalid V3 params are **removed** - they don't exist in V4
+- All V4 routing has **fallback mechanisms** to simple market orders
+- This approach maintains the **production-tested baseline** while adding intelligence

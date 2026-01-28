@@ -1,0 +1,71 @@
+[
+  {
+    "strategy": "Cross-DEX MM",
+    "capital": 100.0,
+    "return": -4.461501520959999,
+    "sharpe": -0.006602370740483101,
+    "winRate": 51.72231054583995,
+    "totalTrades": 3774,
+    "tradesPerDay": 629.0,
+    "maxDrawdown": 9.50280823965826,
+    "totalPnl": -4.461501520959578,
+    "finalEquity": 95.53849847904,
+    "monthlyVolume": 1840668.5892251134,
+    "monthlyTrades": 18870.0,
+    "feeBreakdown": {
+      "apexFees": 73.62674356900455,
+      "paradexFees": 0.0,
+      "netFees": 73.62674356900455,
+      "feeRate": 0.00010000000000000002
+    },
+    "targetAchieved": false,
+    "tradesPerDayTarget": 50,
+    "tradesTargetMet": true
+  },
+  {
+    "strategy": "Cross-DEX MM (Grid)",
+    "capital": 100.0,
+    "return": -4.461501520959999,
+    "sharpe": -0.006602370740483101,
+    "winRate": 51.72231054583995,
+    "totalTrades": 3774,
+    "tradesPerDay": 629.0,
+    "maxDrawdown": 9.50280823965826,
+    "totalPnl": -4.461501520959578,
+    "finalEquity": 95.53849847904,
+    "monthlyVolume": 1840668.5892251134,
+    "monthlyTrades": 18870.0,
+    "feeBreakdown": {
+      "apexFees": 73.62674356900455,
+      "paradexFees": 0.0,
+      "netFees": 73.62674356900455,
+      "feeRate": 0.00010000000000000002
+    },
+    "targetAchieved": false,
+    "tradesPerDayTarget": 50,
+    "tradesTargetMet": true
+  },
+  {
+    "strategy": "Avellaneda MM",
+    "capital": 100.0,
+    "return": 0.19772653176606522,
+    "sharpe": 0.0010876399277466673,
+    "winRate": 49.879692011549565,
+    "totalTrades": 4156,
+    "tradesPerDay": 692.6666666666666,
+    "maxDrawdown": 10.954852831715904,
+    "totalPnl": 0.19772653176619806,
+    "finalEquity": 100.19772653176607,
+    "monthlyVolume": 2017520.4686322215,
+    "monthlyTrades": 20780.0,
+    "feeBreakdown": {
+      "apexFees": 80.70081874528886,
+      "paradexFees": 0.0,
+      "netFees": 80.70081874528886,
+      "effectiveFeeRate": 9.999999999999999e-05
+    },
+    "targetAchieved": true,
+    "tradesPerDayTarget": 50,
+    "tradesTargetMet": true
+  }
+]

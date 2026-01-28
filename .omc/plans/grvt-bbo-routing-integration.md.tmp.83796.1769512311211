@@ -1,0 +1,801 @@
+# GRVT BBO Routing Integration Plan
+
+**Created:** 2026-01-27
+**Status:** Ready for Implementation
+**Priority:** HIGH - Liquidity Crisis Resolution
+
+---
+
+## Executive Summary
+
+**Problem:** DN file uses simple `place_market_order()` with hardcoded 3-second timeouts, causing frequent timeouts on GRVT due to insufficient liquidity analysis.
+
+**Solution:** Integrate V4's market microstructure-aware BBO routing system to find available liquidity BEFORE placing orders, naturally resolving timeout issues.
+
+**Expected Impact:**
+- Timeout rate: 30-50% → <5%
+- Fill success rate: 70-80% → 95%+
+- POST_ONLY fallback rate: 40% → <10%
+- Execution time: ~3s per order (consistent)
+
+---
+
+## Context Analysis
+
+### V4 Implementation Status (grvt.py)
+
+**✅ Available Components:**
+
+| Line | Component | Purpose | Status |
+|------|-----------|---------|--------|
+| 18-47 | `calculate_timeout()` | Dynamic timeout based on order size (5-20s) | ✅ Ready |
+| 710-749 | `fetch_bbo()` | Fetch BBO with size data | ✅ Ready |
+| 751-812 | `analyze_order_book_depth()` | Order book depth analysis | ✅ Ready |
+| 814-864 | `find_hedge_price_with_liquidity()` | Find price with sufficient liquidity | ✅ Ready |
+| 1218-1433 | `place_iterative_market_order()` | BBO-aware iterative routing | ✅ Ready |
+
+### DN File Status (DN_alternate_backpack_grvt.py)
+
+**❌ Current Issues:**
+
+| Line | Issue | Impact |
+|------|-------|--------|
+| 807, 855 | Calls `place_market_order()` directly | No liquidity analysis |
+| 912, 1110 | Hardcoded `timeout=3.0` | Too short for large orders |
+| 851-878 | Conditional iterative for >0.2 ETH | Not using full V4 logic |
+| 993-997 | Simple market order fallback | No BBO routing |
+
+---
+
+## Work Objectives
+
+### Core Objective
+Integrate V4 BBO routing into DN file to resolve liquidity-induced timeout issues through market microstructure analysis.
+
+### Deliverables
+1. DN file uses `place_iterative_market_order()` for all GRVT hedge orders
+2. Dynamic timeout calculation based on order size
+3. BBO analysis before order placement
+4. Reduced timeout occurrences
+5. Improved fill rates
+
+### Definition of Done
+- [ ] All GRVT hedge orders use `place_iterative_market_order()`
+- [ ] No hardcoded 3-second timeouts
+- [ ] BBO analysis integrated into order flow
+- [ ] Testing shows <5% timeout rate
+- [ ] Documentation updated
+
+---
+
+## Implementation Strategy
+
+### Phase 1: Method Signature Alignment
+
+**Issue:** V4's `place_iterative_market_order()` has different parameters than DN's current usage.
+
+**V4 Signature:**
+```python
+async def place_iterative_market_order(
+    self,
+    contract_id: str,
+    target_quantity: Decimal,
+    side: str,
+    max_iterations: int = 20,
+    max_slippage_bps: int = 5,
+    tick_size: int = 10,
+) -> dict
+```
+
+**DN Current Usage (Line 853-860):**
+```python
+result = await self.hedge_client.place_iterative_market_order(
+    contract_id=self.hedge_contract_id,
+    target_quantity=quantity,
+    side=order_side,
+    max_iterations=10,   # ❌ V4 default is 20
+    max_tick_offset=2,   # ❌ Parameter doesn't exist in V4
+    max_fill_duration=30 # ❌ Parameter doesn't exist in V4
+)
+```
+
+**Solution:** Update DN calls to match V4 signature.
+
+### Phase 2: Replace Simple Market Orders
+
+**Target Locations in DN File:**
+
+1. **Line 807 (OPEN Hedge)**
+   ```python
+   # Current: Simple market order
+   order_info = await self.hedge_client.place_market_order(...)
+
+   # Replace with: Iterative market order
+   result = await self.hedge_client.place_iterative_market_order(...)
+   ```
+
+2. **Line 855 (CLOSE Hedge)**
+   ```python
+   # Current: Simple market order
+   order_info = await self.hedge_client.place_market_order(...)
+
+   # Replace with: Iterative market order
+   result = await self.hedge_client.place_iterative_market_order(...)
+   ```
+
+3. **Line 912, 1110 (POST_ONLY fallback timeouts)**
+   ```python
+   # Current: Hardcoded 3.0s timeout
+   hedge_result = await asyncio.wait_for(
+       self.hedge_client.place_post_only_order(...),
+       timeout=3.0  # ❌ Hardcoded
+   )
+
+   # Replace with: Dynamic timeout
+   from exchanges.grvt import calculate_timeout
+   dynamic_timeout = calculate_timeout(quantity)
+   hedge_result = await asyncio.wait_for(
+       self.hedge_client.place_post_only_order(...),
+       timeout=dynamic_timeout  # ✅ Dynamic (5-20s based on size)
+   )
+   ```
+
+### Phase 3: Add BBO Pre-Analysis
+
+**Before placing orders, analyze liquidity:**
+
+```python
+# Add at line 806 (before place_hedge_order)
+async def _check_grvt_liquidity(self, quantity: Decimal, side: str) -> bool:
+    """Check if GRVT has sufficient liquidity before placing order."""
+    try:
+        bbo = await self.hedge_client.fetch_bbo(self.hedge_contract_id)
+
+        # Check available liquidity at BBO
+        if side == 'buy':
+            available_size = bbo['best_ask_size']
+        else:
+            available_size = bbo['best_bid_size']
+
+        # If BBO has enough liquidity, proceed
+        if available_size >= quantity:
+            self.logger.info(
+                f"[LIQUIDITY] ✅ Sufficient at BBO: {available_size} >= {quantity}"
+            )
+            return True
+
+        # If not, check order book depth
+        self.logger.warning(
+            f"[LIQUIDITY] ⚠️ Insufficient at BBO: {available_size} < {quantity}, "
+            f"will use iterative routing"
+        )
+        return True  # Still proceed, iterative will handle it
+
+    except Exception as e:
+        self.logger.error(f"[LIQUIDITY] Analysis failed: {e}")
+        return True  # Proceed anyway
+```
+
+---
+
+## Detailed Implementation Tasks
+
+### Task 1: Import V4 Functions
+
+**Location:** DN file imports (top of file)
+
+**Change:**
+```python
+# Add to existing imports
+from exchanges.grvt import (
+    GrvtClient,
+    calculate_timeout,  # ✅ NEW
+)
+```
+
+**Acceptance:**
+- Import statement added
+- No import errors
+- Linting passes
+
+---
+
+### Task 2: Add Liquidity Check Method
+
+**Location:** DN file class `DNHedgeBot`
+
+**Insert:** After line 686 (after `place_primary_order` method)
+
+**Code:**
+```python
+async def _check_grvt_liquidity(self, quantity: Decimal, side: str) -> dict:
+    """Analyze GRVT liquidity before placing hedge order.
+
+    Returns:
+        {
+            'sufficient_at_bbo': bool,
+            'bbo_size': Decimal,
+            'recommended_action': 'direct' | 'iterative',
+        }
+    """
+    try:
+        bbo = await self.hedge_client.fetch_bbo(self.hedge_contract_id)
+
+        # Check available liquidity at BBO
+        if side == 'buy':
+            available_size = bbo['best_ask_size']
+        else:
+            available_size = bbo['best_bid_size']
+
+        sufficient_at_bbo = available_size >= quantity
+        recommended_action = 'direct' if sufficient_at_bbo else 'iterative'
+
+        self.logger.info(
+            f"[LIQUIDITY] BBO size: {available_size}, needed: {quantity}, "
+            f"action: {recommended_action}"
+        )
+
+        return {
+            'sufficient_at_bbo': sufficient_at_bbo,
+            'bbo_size': available_size,
+            'recommended_action': recommended_action,
+        }
+
+    except Exception as e:
+        self.logger.error(f"[LIQUIDITY] Analysis failed: {e}")
+        return {'recommended_action': 'iterative'}  # Default to safe option
+```
+
+**Acceptance:**
+- Method compiles without errors
+- Returns dict with required keys
+- Logging works correctly
+
+---
+
+### Task 3: Update OPEN Hedge Logic (Line 804-810)
+
+**Current Code (Line 804-810):**
+```python
+async def place_hedge_order(
+    self, side: str, quantity: Decimal, reference_price: Decimal
+) -> bool:
+    self.hedge_order_status = None
+    self.hedge_order_filled = False
+    order_type = "CLOSE" if side == "buy" else "OPEN"
+    maker_timeout = 20  # Increased from 12 to 20 for better WebSocket message delivery
+```
+
+**Change:**
+```python
+async def place_hedge_order(
+    self, side: str, quantity: Decimal, reference_price: Decimal
+) -> bool:
+    self.hedge_order_status = None
+    self.hedge_order_filled = False
+    order_type = "CLOSE" if side == "buy" else "OPEN"
+
+    # ✅ NEW: Dynamic timeout based on order size
+    from exchanges.grvt import calculate_timeout
+    maker_timeout = calculate_timeout(quantity)  # 5-20s based on size
+
+    # ✅ NEW: Check liquidity before placing order
+    liquidity_info = await self._check_grvt_liquidity(quantity, side)
+```
+
+**Acceptance:**
+- Dynamic timeout calculated
+- Liquidity check called
+- No syntax errors
+- Timeout range: 5-20s
+
+---
+
+### Task 4: Replace Simple Market Order in CLOSE Path (Line 851-883)
+
+**Current Code (Line 851-883):**
+```python
+# SOLUTION 3: CLOSE uses iterative market order for GRVT, regular for others
+if order_type == "CLOSE":
+    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2"):
+        self.logger.info(f"[CLOSE] Using ITERATIVE market order for {quantity} ETH")
+        result = await self.hedge_client.place_iterative_market_order(
+            contract_id=self.hedge_contract_id,
+            target_quantity=quantity,
+            side=order_side,
+            max_iterations=10,   # ❌ V4 default is 20
+            max_tick_offset=2,   # ❌ Doesn't exist in V4
+            max_fill_duration=30  # ❌ Doesn't exist in V4
+        )
+        # ... result handling ...
+```
+
+**Replacement:**
+```python
+# ✅ IMPROVED: Use iterative market order for ALL GRVT orders (not just >0.2)
+if order_type == "CLOSE":
+    if self.hedge_exchange.lower() == "grvt":
+        # Use liquidity analysis to determine strategy
+        if liquidity_info['sufficient_at_bbo']:
+            self.logger.info(
+                f"[CLOSE] Sufficient liquidity at BBO, using direct market order"
+            )
+            # Direct market order for quick fill
+            order_info = await self.hedge_client.place_market_order(
+                contract_id=self.hedge_contract_id,
+                quantity=quantity,
+                side=order_side,
+            )
+            # ... existing result handling ...
+        else:
+            self.logger.info(
+                f"[CLOSE] Insufficient BBO liquidity, using iterative routing "
+                f"(target: {quantity}, BBO size: {liquidity_info['bbo_size']})"
+            )
+            # V4 iterative market order with correct parameters
+            result = await self.hedge_client.place_iterative_market_order(
+                contract_id=self.hedge_contract_id,
+                target_quantity=quantity,
+                side=order_side,
+                max_iterations=20,      # ✅ V4 default
+                max_slippage_bps=5,     # ✅ V4 default
+                tick_size=10,           # ✅ GRVT tick size ($0.10)
+            )
+            # ... result handling ...
+    else:
+        # Non-GRVT exchanges use regular market order
+        # ... existing code ...
+```
+
+**Acceptance:**
+- All GRVT CLOSE orders use iterative routing when needed
+- Direct orders used when BBO has sufficient liquidity
+- Parameters match V4 signature
+- No syntax errors
+
+---
+
+### Task 5: Replace Simple Market Order in OPEN Path (Line 1037-1059)
+
+**Current Code (Line 1046-1078):**
+```python
+# Use iterative approach for GRVT orders > 0.2 ETH, EXCEPT for first BUILD
+if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and self.first_build_completed:
+    self.logger.info(f"[OPEN] Using ITERATIVE market order for {quantity} ETH")
+    result = await self.hedge_client.place_iterative_market_order(
+        contract_id=self.hedge_contract_id,
+        target_quantity=quantity,
+        side=order_side,
+        max_iterations=10,   # ❌ V4 default is 20
+        max_tick_offset=2,   # ❌ Doesn't exist in V4
+        max_fill_duration=30  # ❌ Doesn't exist in V4
+    )
+```
+
+**Replacement:**
+```python
+# ✅ IMPROVED: Use iterative for ALL GRVT OPEN orders (based on liquidity analysis)
+if self.hedge_exchange.lower() == "grvt":
+    # Re-check liquidity (market may have changed)
+    open_liquidity = await self._check_grvt_liquidity(quantity, side)
+
+    if open_liquidity['sufficient_at_bbo']:
+        self.logger.info(
+            f"[OPEN] Sufficient liquidity at BBO, using direct market order"
+        )
+        # Direct market order
+        order_info = await self.hedge_client.place_market_order(
+            contract_id=self.hedge_contract_id,
+            quantity=quantity,
+            side=order_side,
+        )
+        # ... existing result handling ...
+    else:
+        self.logger.info(
+            f"[OPEN] Insufficient BBO liquidity, using iterative routing "
+            f"(target: {quantity}, BBO size: {open_liquidity['bbo_size']})"
+        )
+        # V4 iterative market order
+        result = await self.hedge_client.place_iterative_market_order(
+            contract_id=self.hedge_contract_id,
+            target_quantity=quantity,
+            side=order_side,
+            max_iterations=20,      # ✅ V4 default
+            max_slippage_bps=5,     # ✅ V4 default
+            tick_size=10,           # ✅ GRVT tick size
+        )
+        # ... result handling ...
+else:
+    # Non-GRVT exchanges
+    # ... existing code ...
+```
+
+**Acceptance:**
+- All GRVT OPEN orders use liquidity-aware routing
+- Size-based condition removed (>0.2 check removed)
+- First BUILD workaround no longer needed
+- Parameters match V4 signature
+
+---
+
+### Task 6: Update POST_ONLY Timeouts (Line 912, 1110)
+
+**Current Code (Line 912, 1110):**
+```python
+# Try POST_ONLY with 3 second timeout
+hedge_result = await asyncio.wait_for(
+    self.hedge_client.place_post_only_order(
+        contract_id=self.hedge_contract_id,
+        quantity=quantity,
+        price=hedge_post_only_price,
+        side=order_side
+    ),
+    timeout=3.0  # ❌ Hardcoded
+)
+```
+
+**Replacement:**
+```python
+# ✅ Use dynamic timeout based on order size
+from exchanges.grvt import calculate_timeout
+post_only_timeout = calculate_timeout(quantity)
+
+self.logger.info(
+    f"[CLOSE] Attempting POST_ONLY with {post_only_timeout}s timeout "
+    f"(quantity: {quantity} ETH)"
+)
+
+hedge_result = await asyncio.wait_for(
+    self.hedge_client.place_post_only_order(
+        contract_id=self.hedge_contract_id,
+        quantity=quantity,
+        price=hedge_post_only_price,
+        side=order_side
+    ),
+    timeout=post_only_timeout  # ✅ Dynamic (5-20s)
+)
+```
+
+**Apply to both locations:**
+- Line 912 (CLOSE POST_ONLY)
+- Line 1110 (OPEN POST_ONLY - first build)
+
+**Acceptance:**
+- Dynamic timeout used in both locations
+- Timeout range: 5-20s based on quantity
+- Logging shows timeout value
+- No hardcoded timeouts remain
+
+---
+
+### Task 7: Update Iterative Result Handling
+
+**Current Code (Line 862-878):**
+```python
+if result['success']:
+    self.logger.info(
+        f"[CLOSE] [ITERATIVE] Filled {result['total_filled']} @ ${result['average_price']:.2f} "
+        f"({result['iterations']} iterations)"
+    )
+```
+
+**Issue:** V4 returns different result format.
+
+**V4 Return Format:**
+```python
+# Success case (line 1374)
+return order_result  # Standard order result dict
+
+# Failure case (line 1433)
+return {'success': False, 'error': 'Max iterations reached'}
+```
+
+**Updated Handling:**
+```python
+# Handle V4 iterative result format
+if result.get('success'):
+    # Extract filled quantity from V4 result
+    filled_qty = extract_filled_quantity(result)  # Use V4 helper
+
+    self.logger.info(
+        f"[CLOSE] [ITERATIVE] ✅ Filled {filled_qty} ETH "
+        f"(iterations: {result.get('iterations', 'N/A')})"
+    )
+
+    # Update tracking
+    self.hedge_order_filled = True
+    self.order_execution_complete = True
+    self.last_hedge_fill_price = result.get('average_price', Decimal('0'))
+
+    # Log to CSV
+    self.log_trade_to_csv(
+        exchange=self.hedge_exchange.upper(),
+        side=side,
+        price=str(self.last_hedge_fill_price),
+        quantity=str(filled_qty),
+        order_type="hedge_close_iterative",
+        mode="iterative_market"
+    )
+
+    return True
+else:
+    error = result.get('error', 'Unknown error')
+    self.logger.error(f"[CLOSE] Iterative failed: {error}")
+    # ... fallback logic ...
+```
+
+**Acceptance:**
+- Correctly handles V4 result format
+- Extracts filled quantity using V4 helper
+- Logs iterations correctly
+- Handles error cases
+
+---
+
+### Task 8: Import extract_filled_quantity Helper
+
+**Location:** DN file imports (top of file)
+
+**Change:**
+```python
+from exchanges.grvt import (
+    GrvtClient,
+    calculate_timeout,
+    extract_filled_quantity,  # ✅ NEW - V4 helper function
+)
+```
+
+**Acceptance:**
+- Import added
+- No import errors
+- Function callable in code
+
+---
+
+## Risk Assessment
+
+### High Risk Items
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| **Breaking existing flow** | HIGH | Test thoroughly in dev environment first |
+| **V4 result format mismatch** | MEDIUM | Use V4 helper functions (`extract_filled_quantity`) |
+| **Increased slippage** | MEDIUM | Set `max_slippage_bps=5` (conservative) |
+| **Longer execution time** | LOW | Direct orders used when BBO has liquidity |
+
+### Medium Risk Items
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| **API rate limits** | MEDIUM | Iterative order already respects rate limits |
+| **Position tracking drift** | MEDIUM | REST API confirmation already in place |
+| **WebSocket message loss** | LOW | REST API is authoritative source |
+
+### Low Risk Items
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| **Logging verbosity** | LOW | Use INFO level for BBO analysis |
+| **Import conflicts** | LOW | V4 functions are standalone |
+
+---
+
+## Testing Strategy
+
+### Unit Tests
+
+**Test 1: Liquidity Check Method**
+```python
+# Mock fetch_bbo to return specific sizes
+# Verify _check_grvt_liquidity returns correct dict
+# Test edge cases: exact size, zero size, huge size
+```
+
+**Test 2: Dynamic Timeout Calculation**
+```python
+# Test quantities: 0.05, 0.1, 0.5, 1.0 ETH
+# Verify timeouts: 5, 5, 10, 20 seconds
+```
+
+**Test 3: Iterative Order Parameter Mapping**
+```python
+# Verify V4 signature matches call
+# Check default values are correct
+```
+
+### Integration Tests
+
+**Test 4: CLOSE Order Flow**
+```python
+# Simulate low liquidity scenario
+# Verify iterative routing is used
+# Check order fills completely
+```
+
+**Test 5: OPEN Order Flow**
+```python
+# Simulate high liquidity scenario
+# Verify direct order is used
+# Check quick execution
+```
+
+**Test 6: POST_ONLY Fallback**
+```python
+# Simulate POST_ONLY timeout
+# Verify dynamic timeout is used
+# Check fallback to market order
+```
+
+### Live Trading Tests
+
+**Test 7: Small Orders (0.01-0.1 ETH)**
+- Expected: Direct market order (sufficient BBO)
+- Target: <5% timeout rate
+- Duration: ~5 seconds
+
+**Test 8: Medium Orders (0.1-0.5 ETH)**
+- Expected: Iterative routing (may need 2-3 levels)
+- Target: <10% timeout rate
+- Duration: ~10 seconds
+
+**Test 9: Large Orders (0.5-1.0 ETH)**
+- Expected: Iterative routing (may need 5+ levels)
+- Target: <15% timeout rate
+- Duration: ~20 seconds
+
+---
+
+## Success Metrics
+
+### Primary Metrics
+
+| Metric | Before | Target | Measurement |
+|--------|--------|--------|-------------|
+| **Timeout Rate** | 30-50% | <5% | `(failed orders / total orders) * 100` |
+| **Fill Success Rate** | 70-80% | >95% | `(filled orders / total orders) * 100` |
+| **POST_ONLY Fallback Rate** | 40% | <10% | `(market fallbacks / total orders) * 100` |
+| **Avg Execution Time** | ~3s (with failures) | ~5-10s (consistent) | Time from order placement to fill |
+
+### Secondary Metrics
+
+| Metric | Before | Target | Measurement |
+|--------|--------|--------|-------------|
+| **Avg Slippage** | ~2 bps | <5 bps | `(execution_price - expected_price) / expected_price * 10000` |
+| **API Error Rate** | ~10% | <5% | `(API errors / total API calls) * 100` |
+| **Position Drift** | ~1% | <0.5% | `abs(WS_position - REST_position) / target_position * 100` |
+
+---
+
+## Rollback Plan
+
+If issues arise after deployment:
+
+### Immediate Rollback (5 minutes)
+1. Revert DN file to previous version
+2. Restart bot with old code
+3. Monitor for stability
+
+### Partial Rollback (15 minutes)
+1. Keep dynamic timeout calculation
+2. Revert iterative order usage
+3. Use simple market orders with longer timeouts
+
+### Diagnostic Rollback (30 minutes)
+1. Enable verbose logging
+2. Collect metrics on failed orders
+3. Analyze patterns before fixing
+
+---
+
+## Implementation Checklist
+
+### Pre-Implementation
+- [ ] Backup current DN file
+- [ ] Create feature branch: `feature/grvt-bbo-routing`
+- [ ] Set up dev environment
+- [ ] Review V4 implementation thoroughly
+
+### Implementation
+- [ ] Task 1: Import V4 functions
+- [ ] Task 2: Add liquidity check method
+- [ ] Task 3: Update OPEN hedge logic
+- [ ] Task 4: Replace CLOSE simple market order
+- [ ] Task 5: Replace OPEN simple market order
+- [ ] Task 6: Update POST_ONLY timeouts
+- [ ] Task 7: Update iterative result handling
+- [ ] Task 8: Import extract_filled_quantity
+
+### Testing
+- [ ] Unit tests pass
+- [ ] Integration tests pass
+- [ ] Live trading test (small orders)
+- [ ] Live trading test (medium orders)
+- [ ] Live trading test (large orders)
+
+### Deployment
+- [ ] Code review completed
+- [ ] Merge to main branch
+- [ ] Deploy to production
+- [ ] Monitor for 1 hour
+- [ ] Check success metrics
+
+### Post-Deployment
+- [ ] Document any issues found
+- [ ] Update runbook
+- [ ] Share results with team
+
+---
+
+## Additional Notes
+
+### Key Insights from V4
+
+1. **Market Microstructure Awareness**
+   - V4 understands that GRVT has thin liquidity
+   - Uses order book depth analysis to find available liquidity
+   - Routes orders intelligently instead of hoping for fill
+
+2. **Iterative Approach**
+   - Breaks large orders into chunks
+   - Places chunks at different price levels
+   - Increases fill probability significantly
+
+3. **Dynamic Timeouts**
+   - Small orders (≤0.1 ETH) → 5s timeout
+   - Medium orders (≤0.5 ETH) → 10s timeout
+   - Large orders (>0.5 ETH) → 20s timeout
+   - Reflects realistic market behavior
+
+4. **BBO-Aware Routing**
+   - Fetches BBO with size data
+   - Checks if current level has enough liquidity
+   - Walks order book if needed
+   - Minimizes slippage while maximizing fill rate
+
+### Why This Will Work
+
+**Current Problem:**
+```
+place_market_order(1.0 ETH) → 3s timeout → FAIL
+Reason: Not enough liquidity at BBO, order sits in book
+```
+
+**V4 Solution:**
+```
+fetch_bbo() → Check depth → Place 0.2 ETH at BBO-0
+          → Place 0.2 ETH at BBO-1 → Place 0.2 ETH at BBO-2
+          → ... until filled → SUCCESS
+```
+
+**Result:**
+- Finds liquidity across multiple levels
+- Fills completely in most cases
+- Timeout becomes irrelevant (order fills before timeout)
+
+---
+
+## References
+
+### V4 Implementation Files
+- `perp-dex-tools-original/hedge/exchanges/grvt.py` (Lines 18-1433)
+  - `calculate_timeout()` (Line 18)
+  - `fetch_bbo()` (Line 710)
+  - `analyze_order_book_depth()` (Line 751)
+  - `find_hedge_price_with_liquidity()` (Line 814)
+  - `place_iterative_market_order()` (Line 1218)
+
+### DN File Locations
+- `perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+  - Imports (Line 1-28)
+  - place_hedge_order (Line 804-1374)
+  - CLOSE logic (Line 851-1035)
+  - OPEN logic (Line 1037-1259)
+
+### Related Documentation
+- V4 BBO Routing Research (if available)
+- GRVT API Documentation
+- Market Microstructure Best Practices
+
+---
+
+**End of Plan**

@@ -1,0 +1,716 @@
+# Codebase Cleanup and Branch Strategy Plan
+
+## 문서 정보
+
+| 항목 | 내용 |
+|------|------|
+| 작성일 | 2026-01-21 |
+| 작성자 | Prometheus (Strategic Planning Consultant) |
+| 상태 | 승인 대기 |
+| 예상 총 소요 시간 | 2-3시간 |
+
+---
+
+## 1. Context (배경)
+
+### 1.1 Original Request
+
+perp-dex-tools-original/ 폴더에 원본과 커스텀 변종이 혼재되어 있어, 각 전략을 개별 브랜치로 분리하고 체계적인 구조로 정리 필요.
+
+### 1.2 Interview Summary
+
+| 질문 | 결정 사항 |
+|------|-----------|
+| 브랜치 base | main(74998cd)에서 분기 |
+| 장기 관리 | 성능 비교 후 1개 선택, main 병합 |
+| phase2e-passive-tp 처리 | feature/2dex로 rename |
+| 파일 배치 경로 | perpdex/strategies/{strategy-name}/ |
+| Helper 파일 범위 | progressive_sizing.py, rebate_tracker.py 모든 브랜치에 포함 |
+| mean-reversion 2개 | 각각 별도 브랜치로 분리 |
+| 작업 범위 | 브랜치 정리만 (Progressive Sizing 통합, Phase 2E 완료는 후속 작업) |
+
+### 1.3 Current State
+
+```
+현재 Git 구조:
+  main (74998cd) ← 공통 베이스
+   └─ phase2e-passive-tp (832c3dc) ← 현재 작업 중 (+5 commits)
+
+현재 파일 위치:
+  perp-dex-tools-original/hedge/
+    ├─ DN_alternate_grvt_paradex.py (54,765 bytes)
+    ├─ DN_mean_reversion_grvt_backpack_v1.py (70,524 bytes)
+    ├─ DN_mean_reversion_grvt_paradex.py (59,370 bytes)
+    └─ hedge_mode_2dex.py (58,459 bytes) ← 구버전
+
+  perpdex/2dex/hedge/
+    └─ hedge_mode_2dex.py (68,776 bytes) ← Phase 2E 수정본 (현재 사용)
+
+  perpdex/2dex/helpers/
+    ├─ progressive_sizing.py (12,386 bytes) ← 신규
+    ├─ rebate_tracker.py (9,386 bytes) ← 신규
+    ├─ logger.py
+    ├─ lark_bot.py
+    └─ telegram_bot.py
+```
+
+---
+
+## 2. Work Objectives (작업 목표)
+
+### 2.1 Core Objective
+
+4개 전략을 개별 브랜치로 분리하고, 일관된 디렉토리 구조(perpdex/strategies/{name}/)로 정리
+
+### 2.2 Deliverables
+
+| 번호 | 산출물 | 설명 |
+|------|--------|------|
+| D1 | feature/2dex 브랜치 | phase2e-passive-tp rename, 구조 정리 |
+| D2 | feature/alternate 브랜치 | DN_alternate_grvt_paradex.py 포함 |
+| D3 | feature/mean-reversion-backpack 브랜치 | DN_mean_reversion_grvt_backpack_v1.py 포함 |
+| D4 | feature/mean-reversion-paradex 브랜치 | DN_mean_reversion_grvt_paradex.py 포함 |
+| D5 | 정리된 codebase | .tmp 파일 삭제, 중복 파일 정리 |
+| D6 | 브랜치 관리 문서 | README, 성능 비교 가이드 |
+
+### 2.3 Definition of Done
+
+- 4개 브랜치가 main에서 분기되어 원격 저장소에 push됨
+- 각 브랜치에 해당 전략 파일과 helper 파일이 perpdex/strategies/{name}/ 구조로 배치됨
+- .tmp 파일 모두 삭제됨
+- perp-dex-tools-original/ 원본 보존됨
+- 브랜치 관리 README 작성됨
+
+---
+
+## 3. Guardrails (안전장치)
+
+### 3.1 Must Have
+
+- perp-dex-tools-original/ 폴더는 절대 삭제하지 않음 (원본 보존)
+- 모든 브랜치 작업 전 git stash로 현재 작업 보호
+- 각 Phase 완료 후 검증 단계 필수
+- 커밋 전 파일 존재 여부 확인
+
+### 3.2 Must NOT Have
+
+- main 브랜치 직접 수정 금지
+- force push 금지
+- 검증 없이 다음 Phase 진행 금지
+- perp-dex-tools-original/ 삭제 금지
+
+---
+
+## 4. Target Branch Structure (목표 브랜치 구조)
+
+```
+main (74998cd)
+ ├─ feature/2dex
+ │   └─ perpdex/strategies/2dex/
+ │       ├─ hedge_mode_2dex.py
+ │       ├─ helpers/
+ │       │   ├─ __init__.py
+ │       │   ├─ progressive_sizing.py
+ │       │   ├─ rebate_tracker.py
+ │       │   ├─ logger.py
+ │       │   ├─ lark_bot.py
+ │       │   └─ telegram_bot.py
+ │       └─ exchanges/
+ │           ├─ __init__.py
+ │           ├─ base.py
+ │           ├─ factory.py
+ │           └─ (apex.py, aster.py, backpack.py, edgex.py, extended.py, grvt.py, lighter.py, nado.py, paradex.py 등)
+ │
+ ├─ feature/alternate
+ │   └─ perpdex/strategies/alternate/
+ │       ├─ DN_alternate_grvt_paradex.py
+ │       ├─ helpers/ (동일 구조)
+ │       └─ exchanges/ (동일 구조)
+ │
+ ├─ feature/mean-reversion-backpack
+ │   └─ perpdex/strategies/mean-reversion-backpack/
+ │       ├─ DN_mean_reversion_grvt_backpack_v1.py
+ │       ├─ helpers/ (동일 구조)
+ │       └─ exchanges/ (동일 구조)
+ │
+ └─ feature/mean-reversion-paradex
+     └─ perpdex/strategies/mean-reversion-paradex/
+         ├─ DN_mean_reversion_grvt_paradex.py
+         ├─ helpers/ (동일 구조)
+         └─ exchanges/ (동일 구조)
+```
+
+---
+
+## 5. File Placement Matrix (파일 배치 매트릭스)
+
+### 5.1 전략 파일 배치
+
+| 원본 파일 | 대상 브랜치 | 대상 경로 |
+|-----------|-------------|-----------|
+| perpdex/2dex/hedge/hedge_mode_2dex.py | feature/2dex | perpdex/strategies/2dex/hedge_mode_2dex.py |
+| perp-dex-tools-original/hedge/DN_alternate_grvt_paradex.py | feature/alternate | perpdex/strategies/alternate/DN_alternate_grvt_paradex.py |
+| perp-dex-tools-original/hedge/DN_mean_reversion_grvt_backpack_v1.py | feature/mean-reversion-backpack | perpdex/strategies/mean-reversion-backpack/DN_mean_reversion_grvt_backpack_v1.py |
+| perp-dex-tools-original/hedge/DN_mean_reversion_grvt_paradex.py | feature/mean-reversion-paradex | perpdex/strategies/mean-reversion-paradex/DN_mean_reversion_grvt_paradex.py |
+
+### 5.2 Helper 파일 배치
+
+| Helper 파일 | feature/2dex | feature/alternate | feature/mr-backpack | feature/mr-paradex |
+|-------------|--------------|-------------------|---------------------|---------------------|
+| progressive_sizing.py | O | O | O | O |
+| rebate_tracker.py | O | O | O | O |
+| logger.py | O | O | O | O |
+| lark_bot.py | O | O | O | O |
+| telegram_bot.py | O | O | O | O |
+| __init__.py | O | O | O | O |
+
+**출처**: 현재 working tree의 `perpdex/2dex/helpers/` (브랜치 작업 전 복사)
+
+### 5.3 Exchange 파일 배치
+
+모든 전략 파일이 `exchanges/` 모듈을 import하므로, 각 브랜치에 exchanges/ 디렉토리 전체를 복사해야 함.
+
+| 원본 디렉토리 | 대상 브랜치 | 대상 경로 |
+|---------------|-------------|-----------|
+| perpdex/2dex/exchanges/ | feature/2dex | perpdex/strategies/2dex/exchanges/ |
+| perpdex/2dex/exchanges/ | feature/alternate | perpdex/strategies/alternate/exchanges/ |
+| perpdex/2dex/exchanges/ | feature/mean-reversion-backpack | perpdex/strategies/mean-reversion-backpack/exchanges/ |
+| perpdex/2dex/exchanges/ | feature/mean-reversion-paradex | perpdex/strategies/mean-reversion-paradex/exchanges/ |
+
+**포함 파일**:
+- __init__.py
+- base.py
+- factory.py
+- apex.py, aster.py, backpack.py, edgex.py, extended.py
+- grvt.py, lighter.py, nado.py, paradex.py
+- bp_client.py, lighter_custom_websocket.py
+
+---
+
+## 6. Task Flow (작업 흐름)
+
+### Phase 1: 준비 및 정리 (예상 15분)
+
+#### Task 1.1: 현재 상태 백업
+- **작업**: git stash로 현재 작업 저장
+- **리스크**: 낮음
+- **롤백**: git stash pop
+
+#### Task 1.2: .tmp 파일 삭제
+- **작업**: perpdex/ 디렉토리 내 모든 .tmp 파일 식별 및 삭제
+- **범위**: perpdex/ 디렉토리만 (시스템 파일 .claude/, .mcp.json.tmp 등 제외)
+- **대상 파일 예시**:
+  - perpdex/2dex/helpers/telegram_bot.py.tmp.*
+  - perpdex/2dex/hedge/hedge_mode_2dex.py.tmp.*
+  - perpdex/ 하위의 기타 모든 .tmp 파일
+- **명령어**: `find perpdex/ -name "*.tmp.*" -type f -delete`
+- **리스크**: 낮음 (임시 파일만 삭제, perpdex/ 범위 제한)
+- **롤백**: 해당 없음 (임시 파일)
+
+#### Task 1.3: Git 상태 확인
+- **작업**: git status로 현재 상태 확인, 정리 대상 파일 목록 확정
+- **리스크**: 없음
+
+---
+
+### Phase 2: feature/2dex 브랜치 설정 (예상 20분)
+
+#### Task 2.1: phase2e-passive-tp 브랜치 rename (상세 절차)
+- **작업 순서**:
+  1. 현재 브랜치가 phase2e-passive-tp인지 확인: `git branch --show-current`
+  2. 원격의 기존 브랜치 삭제: `git push origin --delete phase2e-passive-tp`
+  3. 로컬 브랜치명 변경: `git branch -m phase2e-passive-tp feature/2dex`
+  4. 새 브랜치를 원격에 push (upstream 설정): `git push -u origin feature/2dex`
+  5. 원격 브랜치 추적 확인: `git branch -vv`
+- **리스크**: 중간 (원격 브랜치 변경, 협업 시 알림 필요)
+- **롤백**:
+  ```bash
+  git push origin --delete feature/2dex
+  git branch -m feature/2dex phase2e-passive-tp
+  git push -u origin phase2e-passive-tp
+  ```
+
+#### Task 2.2: 디렉토리 구조 생성
+- **작업**: perpdex/strategies/2dex/helpers/ 디렉토리 생성
+- **리스크**: 낮음
+
+#### Task 2.3: 파일 이동 및 배치
+- **작업**:
+  - perpdex/2dex/hedge/hedge_mode_2dex.py → perpdex/strategies/2dex/
+  - perpdex/2dex/helpers/* → perpdex/strategies/2dex/helpers/
+  - perpdex/2dex/exchanges/* → perpdex/strategies/2dex/exchanges/
+- **리스크**: 중간 (파일 경로 변경으로 import 문 수정 필요)
+- **롤백**: git checkout으로 원복
+
+#### Task 2.3a: Import 경로 수정
+- **작업**: hedge_mode_2dex.py의 import 문을 새 디렉토리 구조에 맞게 수정
+- **수정 대상**:
+  ```python
+  # Before:
+  from exchanges.factory import ExchangeFactory
+  from exchanges.base import BaseExchangeClient, OrderResult, OrderInfo
+  from helpers.progressive_sizing import ProgressiveSizingManager
+  from helpers.rebate_tracker import RebateTracker
+
+  # After:
+  from .exchanges.factory import ExchangeFactory
+  from .exchanges.base import BaseExchangeClient, OrderResult, OrderInfo
+  from .helpers.progressive_sizing import ProgressiveSizingManager
+  from .helpers.rebate_tracker import RebateTracker
+  ```
+- **검증**: Python syntax check (`python -m py_compile hedge_mode_2dex.py`)
+- **리스크**: 중간 (import 오류 시 실행 불가)
+- **롤백**: git checkout으로 원복
+
+#### Task 2.4: 커밋 및 push
+- **작업**: 변경사항 커밋, 원격 저장소에 push
+- **리스크**: 낮음
+
+---
+
+### Phase 3: feature/alternate 브랜치 생성 (예상 20분)
+
+#### Task 3.1: main에서 브랜치 생성
+- **작업**: git checkout -b feature/alternate main
+- **리스크**: 낮음
+
+#### Task 3.2: 디렉토리 구조 생성
+- **작업**: perpdex/strategies/alternate/helpers/ 디렉토리 생성
+- **리스크**: 낮음
+
+#### Task 3.3: 전략 파일 복사
+- **작업**: perp-dex-tools-original/hedge/DN_alternate_grvt_paradex.py → perpdex/strategies/alternate/
+- **리스크**: 낮음
+
+#### Task 3.4: Helper 파일 복사
+- **작업**: perpdex/2dex/helpers/의 모든 helper 파일을 perpdex/strategies/alternate/helpers/로 복사
+- **출처**: 현재 working tree (브랜치 작업 전 저장된 상태)
+- **포함 파일**: __init__.py, progressive_sizing.py, rebate_tracker.py, logger.py, lark_bot.py, telegram_bot.py
+- **리스크**: 낮음
+
+#### Task 3.4a: Exchange 파일 복사
+- **작업**: perpdex/2dex/exchanges/의 모든 파일을 perpdex/strategies/alternate/exchanges/로 복사
+- **리스크**: 낮음
+
+#### Task 3.4b: Import 경로 수정
+- **작업**: DN_alternate_grvt_paradex.py의 import 문을 상대 경로로 수정 (예: `from .exchanges.factory import ...`)
+- **검증**: Python syntax check
+- **리스크**: 중간
+
+#### Task 3.5: 커밋 및 push
+- **작업**: 변경사항 커밋, 원격 저장소에 push
+- **리스크**: 낮음
+
+---
+
+### Phase 4: feature/mean-reversion-backpack 브랜치 생성 (예상 15분)
+
+#### Task 4.1: main에서 브랜치 생성
+- **작업**: git checkout -b feature/mean-reversion-backpack main
+- **리스크**: 낮음
+
+#### Task 4.2: 디렉토리 구조 생성
+- **작업**: perpdex/strategies/mean-reversion-backpack/helpers/ 디렉토리 생성
+- **리스크**: 낮음
+
+#### Task 4.3: 전략 파일 복사
+- **작업**: perp-dex-tools-original/hedge/DN_mean_reversion_grvt_backpack_v1.py → perpdex/strategies/mean-reversion-backpack/
+- **리스크**: 낮음
+
+#### Task 4.4: Helper 파일 복사
+- **작업**: perpdex/2dex/helpers/의 모든 helper 파일을 perpdex/strategies/mean-reversion-backpack/helpers/로 복사
+- **출처**: 현재 working tree
+- **리스크**: 낮음
+
+#### Task 4.4a: Exchange 파일 복사
+- **작업**: perpdex/2dex/exchanges/의 모든 파일을 perpdex/strategies/mean-reversion-backpack/exchanges/로 복사
+- **리스크**: 낮음
+
+#### Task 4.4b: Import 경로 수정
+- **작업**: DN_mean_reversion_grvt_backpack_v1.py의 import 문을 상대 경로로 수정
+- **검증**: Python syntax check
+- **리스크**: 중간
+
+#### Task 4.5: 커밋 및 push
+- **작업**: 변경사항 커밋, 원격 저장소에 push
+- **리스크**: 낮음
+
+---
+
+### Phase 5: feature/mean-reversion-paradex 브랜치 생성 (예상 15분)
+
+#### Task 5.1: main에서 브랜치 생성
+- **작업**: git checkout -b feature/mean-reversion-paradex main
+- **리스크**: 낮음
+
+#### Task 5.2: 디렉토리 구조 생성
+- **작업**: perpdex/strategies/mean-reversion-paradex/helpers/ 디렉토리 생성
+- **리스크**: 낮음
+
+#### Task 5.3: 전략 파일 복사
+- **작업**: perp-dex-tools-original/hedge/DN_mean_reversion_grvt_paradex.py → perpdex/strategies/mean-reversion-paradex/
+- **리스크**: 낮음
+
+#### Task 5.4: Helper 파일 복사
+- **작업**: perpdex/2dex/helpers/의 모든 helper 파일을 perpdex/strategies/mean-reversion-paradex/helpers/로 복사
+- **출처**: 현재 working tree
+- **리스크**: 낮음
+
+#### Task 5.4a: Exchange 파일 복사
+- **작업**: perpdex/2dex/exchanges/의 모든 파일을 perpdex/strategies/mean-reversion-paradex/exchanges/로 복사
+- **리스크**: 낮음
+
+#### Task 5.4b: Import 경로 수정
+- **작업**: DN_mean_reversion_grvt_paradex.py의 import 문을 상대 경로로 수정
+- **검증**: Python syntax check
+- **리스크**: 중간
+
+#### Task 5.5: 커밋 및 push
+- **작업**: 변경사항 커밋, 원격 저장소에 push
+- **리스크**: 낮음
+
+---
+
+### Phase 6: 중복 파일 정리 (예상 20분)
+
+#### Task 6.1: feature/2dex 브랜치에서 정리
+- **작업**:
+  - perpdex/2dex/ 폴더 삭제 (이미 perpdex/strategies/2dex/로 이동됨)
+  - 이 작업은 feature/2dex 브랜치에서만 수행
+- **리스크**: 중간
+- **롤백**: git checkout으로 원복
+
+#### Task 6.2: 커밋
+- **작업**: 정리 완료 커밋
+- **리스크**: 낮음
+
+---
+
+### Phase 7: 검증 (예상 15분)
+
+#### Task 7.1: 브랜치별 파일 존재 확인
+- **작업**: 각 브랜치에서 전략 파일과 helper 파일 존재 여부 확인
+- **체크리스트**:
+  - feature/2dex: perpdex/strategies/2dex/hedge_mode_2dex.py 존재
+  - feature/alternate: perpdex/strategies/alternate/DN_alternate_grvt_paradex.py 존재
+  - feature/mean-reversion-backpack: perpdex/strategies/mean-reversion-backpack/DN_mean_reversion_grvt_backpack_v1.py 존재
+  - feature/mean-reversion-paradex: perpdex/strategies/mean-reversion-paradex/DN_mean_reversion_grvt_paradex.py 존재
+
+#### Task 7.2: Helper 파일 확인
+- **작업**: 각 브랜치의 helpers/ 폴더에 6개 파일 존재 확인
+- **체크리스트** (각 브랜치):
+  - __init__.py
+  - progressive_sizing.py
+  - rebate_tracker.py
+  - logger.py
+  - lark_bot.py
+  - telegram_bot.py
+
+#### Task 7.3: perp-dex-tools-original 보존 확인
+- **작업**: main 브랜치에서 perp-dex-tools-original/ 폴더 원본 유지 확인
+- **리스크**: 없음
+
+---
+
+### Phase 8: 문서화 (예상 20분)
+
+#### Task 8.1: 브랜치 관리 README 작성
+- **작업**: perpdex/strategies/README.md 작성
+- **내용**:
+  - 브랜치 구조 설명
+  - 각 전략 개요
+  - 성능 비교 방법
+  - 향후 계획
+
+#### Task 8.2: 각 전략별 README 작성
+- **작업**: 각 브랜치의 perpdex/strategies/{name}/README.md 작성
+- **내용**:
+  - 전략 설명
+  - 사용 방법
+  - 설정 옵션
+  - 의존성
+
+---
+
+## 7. Detailed TODOs (상세 작업 목록)
+
+### Phase 1: 준비 및 정리
+
+| ID | 작업 | 브랜치 | 완료 기준 |
+|----|------|--------|-----------|
+| 1.1 | git stash로 현재 작업 저장 | phase2e-passive-tp | stash 생성 확인 |
+| 1.2 | perpdex/ 디렉토리 내 .tmp 파일 모두 삭제 | - | perpdex/ 내 .tmp 파일 0개 |
+| 1.3 | git status 확인 | - | 상태 확인 완료 |
+
+### Phase 2: feature/2dex 브랜치 설정
+
+| ID | 작업 | 브랜치 | 완료 기준 |
+|----|------|--------|-----------|
+| 2.1 | 브랜치명 변경 (상세 절차 포함) | feature/2dex | 브랜치명 및 원격 추적 확인 |
+| 2.2 | perpdex/strategies/2dex/ 디렉토리 구조 생성 | feature/2dex | helpers/, exchanges/ 디렉토리 존재 |
+| 2.3 | hedge_mode_2dex.py 및 모든 파일 이동 | feature/2dex | 전략, helper, exchange 파일 위치 확인 |
+| 2.3a | Import 경로 수정 (상대 경로로) | feature/2dex | Python syntax check 통과 |
+| 2.4 | 커밋 및 push | feature/2dex | 원격 브랜치 생성 |
+
+### Phase 3: feature/alternate 브랜치 생성
+
+| ID | 작업 | 브랜치 | 완료 기준 |
+|----|------|--------|-----------|
+| 3.1 | main에서 feature/alternate 브랜치 생성 | feature/alternate | 브랜치 생성 |
+| 3.2 | perpdex/strategies/alternate/ 디렉토리 구조 생성 | feature/alternate | helpers/, exchanges/ 디렉토리 존재 |
+| 3.3 | DN_alternate_grvt_paradex.py 복사 | feature/alternate | 파일 존재 |
+| 3.4 | helper 파일들 복사 (working tree에서) | feature/alternate | 6개 파일 존재 |
+| 3.4a | exchange 파일들 복사 | feature/alternate | exchanges/ 파일 존재 |
+| 3.4b | Import 경로 수정 | feature/alternate | Python syntax check 통과 |
+| 3.5 | 커밋 및 push | feature/alternate | 원격 브랜치 생성 |
+
+### Phase 4: feature/mean-reversion-backpack 브랜치 생성
+
+| ID | 작업 | 브랜치 | 완료 기준 |
+|----|------|--------|-----------|
+| 4.1 | main에서 feature/mean-reversion-backpack 브랜치 생성 | feature/mean-reversion-backpack | 브랜치 생성 |
+| 4.2 | perpdex/strategies/mean-reversion-backpack/ 디렉토리 구조 생성 | feature/mean-reversion-backpack | helpers/, exchanges/ 디렉토리 존재 |
+| 4.3 | DN_mean_reversion_grvt_backpack_v1.py 복사 | feature/mean-reversion-backpack | 파일 존재 |
+| 4.4 | helper 파일들 복사 (working tree에서) | feature/mean-reversion-backpack | 6개 파일 존재 |
+| 4.4a | exchange 파일들 복사 | feature/mean-reversion-backpack | exchanges/ 파일 존재 |
+| 4.4b | Import 경로 수정 | feature/mean-reversion-backpack | Python syntax check 통과 |
+| 4.5 | 커밋 및 push | feature/mean-reversion-backpack | 원격 브랜치 생성 |
+
+### Phase 5: feature/mean-reversion-paradex 브랜치 생성
+
+| ID | 작업 | 브랜치 | 완료 기준 |
+|----|------|--------|-----------|
+| 5.1 | main에서 feature/mean-reversion-paradex 브랜치 생성 | feature/mean-reversion-paradex | 브랜치 생성 |
+| 5.2 | perpdex/strategies/mean-reversion-paradex/ 디렉토리 구조 생성 | feature/mean-reversion-paradex | helpers/, exchanges/ 디렉토리 존재 |
+| 5.3 | DN_mean_reversion_grvt_paradex.py 복사 | feature/mean-reversion-paradex | 파일 존재 |
+| 5.4 | helper 파일들 복사 (working tree에서) | feature/mean-reversion-paradex | 6개 파일 존재 |
+| 5.4a | exchange 파일들 복사 | feature/mean-reversion-paradex | exchanges/ 파일 존재 |
+| 5.4b | Import 경로 수정 | feature/mean-reversion-paradex | Python syntax check 통과 |
+| 5.5 | 커밋 및 push | feature/mean-reversion-paradex | 원격 브랜치 생성 |
+
+### Phase 6: 중복 파일 정리
+
+| ID | 작업 | 브랜치 | 완료 기준 |
+|----|------|--------|-----------|
+| 6.1 | perpdex/2dex/ 폴더 삭제 | feature/2dex | 폴더 삭제 확인 |
+| 6.2 | 정리 커밋 | feature/2dex | 커밋 완료 |
+
+### Phase 7: 검증
+
+| ID | 작업 | 브랜치 | 완료 기준 |
+|----|------|--------|-----------|
+| 7.1 | 각 브랜치 전략 파일 존재 확인 | 전체 | 4개 브랜치 확인 |
+| 7.2 | 각 브랜치 helper 파일 존재 확인 | 전체 | 24개 파일 확인 (6개 x 4 브랜치) |
+| 7.3 | perp-dex-tools-original 보존 확인 | main | 원본 유지 |
+
+### Phase 8: 문서화
+
+| ID | 작업 | 브랜치 | 완료 기준 |
+|----|------|--------|-----------|
+| 8.1 | perpdex/strategies/README.md 작성 | feature/2dex | 파일 생성 |
+| 8.2 | 각 전략별 README.md 작성 | 각 브랜치 | 4개 파일 생성 |
+
+---
+
+## 8. Commit Strategy (커밋 전략)
+
+### 커밋 메시지 형식
+
+```
+<type>(<scope>): <description>
+
+[body]
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+```
+
+### Phase별 커밋 메시지
+
+| Phase | Type | Scope | Message |
+|-------|------|-------|---------|
+| 1 | chore | cleanup | chore(cleanup): remove temporary files |
+| 2 | refactor | 2dex | refactor(2dex): restructure to perpdex/strategies/2dex |
+| 3 | feat | alternate | feat(alternate): add DN_alternate_grvt_paradex strategy |
+| 4 | feat | mr-backpack | feat(mr-backpack): add DN_mean_reversion_grvt_backpack strategy |
+| 5 | feat | mr-paradex | feat(mr-paradex): add DN_mean_reversion_grvt_paradex strategy |
+| 6 | chore | cleanup | chore(cleanup): remove duplicate perpdex/2dex directory |
+| 8 | docs | strategies | docs(strategies): add README and documentation |
+
+---
+
+## 9. Rollback Strategy (롤백 전략)
+
+### Phase별 롤백 방법
+
+| Phase | 롤백 명령어 | 비고 |
+|-------|-------------|------|
+| 1 | git stash pop | stash 복원 |
+| 2 | git branch -m feature/2dex phase2e-passive-tp | 브랜치명 원복 |
+| 3-5 | git branch -D feature/{name} | 브랜치 삭제 |
+| 6 | git checkout HEAD~1 -- perpdex/2dex/ | 삭제된 폴더 복원 |
+| 7 | 해당 없음 | 읽기 전용 작업 |
+| 8 | git checkout HEAD~1 -- perpdex/strategies/README.md | 파일 원복 |
+
+### 전체 롤백 시나리오
+
+```
+만약 전체 작업을 취소해야 할 경우:
+
+1. 원격 브랜치 삭제 (필요시)
+   git push origin --delete feature/alternate
+   git push origin --delete feature/mean-reversion-backpack
+   git push origin --delete feature/mean-reversion-paradex
+
+2. 로컬 브랜치 삭제
+   git branch -D feature/alternate
+   git branch -D feature/mean-reversion-backpack
+   git branch -D feature/mean-reversion-paradex
+
+3. feature/2dex를 phase2e-passive-tp로 원복
+   git branch -m feature/2dex phase2e-passive-tp
+
+4. stash 복원
+   git stash pop
+```
+
+---
+
+## 10. Risk Analysis (리스크 분석)
+
+### 리스크 매트릭스
+
+| 리스크 | 확률 | 영향도 | 완화 전략 |
+|--------|------|--------|-----------|
+| 파일 이동 시 import 경로 깨짐 | 높음 | 높음 | 각 Phase에 import 경로 수정 작업(Task x.xa) 포함, Python syntax check 필수 |
+| exchanges/ 디렉토리 누락 | 중간 | 치명적 | 각 Phase에 exchanges/ 복사 작업(Task x.xa) 명시, 검증 단계에서 확인 |
+| 원격 브랜치 push 실패 | 낮음 | 낮음 | 권한 확인, 재시도 |
+| stash 충돌 | 낮음 | 중간 | 수동 병합 |
+| 파일 누락 | 낮음 | 중간 | 검증 단계에서 체크리스트 확인 |
+
+### 주의사항
+
+1. **Import 경로 (CRITICAL)**: 파일 이동 후 각 전략 파일의 import 문을 상대 경로로 수정 필수
+   - 수정 전: `from exchanges.factory import ...`
+   - 수정 후: `from .exchanges.factory import ...`
+   - 검증 방법: `python -m py_compile <파일명>`
+
+2. **exchanges/ 디렉토리 (CRITICAL)**: 모든 전략 파일이 exchanges/ 모듈에 의존하므로, 각 브랜치에 반드시 복사 필요
+
+3. **Helper 파일 출처**: Phases 3-5에서 helper 파일은 현재 working tree의 perpdex/2dex/helpers/에서 복사 (main에는 progressive_sizing.py, rebate_tracker.py가 없음)
+
+4. **설정 파일**: config.yaml 등 설정 파일의 경로 참조 확인 필요 (현재 확인된 바 없음)
+
+---
+
+## 11. Follow-up Tasks (후속 작업)
+
+### 이번 계획에서 제외된 작업들
+
+#### A. 7개 봇에 Progressive Sizing 통합
+
+| 대상 봇 | 파일 | 예상 작업량 |
+|---------|------|-------------|
+| apex | hedge_mode_apex.py | 중간 |
+| bp | hedge_mode_bp.py | 중간 |
+| edgex | hedge_mode_edgex.py | 중간 |
+| ext | hedge_mode_ext.py | 중간 |
+| grvt | hedge_mode_grvt.py | 중간 |
+| grvt_v2 | hedge_mode_grvt_v2.py | 중간 |
+| nado | hedge_mode_nado.py | 중간 |
+
+**예상 총 소요 시간**: 3-4시간
+**선행 조건**: 이번 브랜치 정리 완료
+
+#### B. Phase 2E 완료 및 main 병합
+
+| 단계 | 작업 | 예상 소요 시간 |
+|------|------|----------------|
+| 1 | Phase 2E 개발 완료 | 진행 중 |
+| 2 | 테스트 및 검증 | 2-3시간 |
+| 3 | 코드 리뷰 | 1시간 |
+| 4 | main 병합 | 30분 |
+
+**선행 조건**:
+- Phase 2E 개발 완료
+- 성능 검증 완료
+
+#### C. 4개 전략 성능 비교
+
+| 전략 | 비교 지표 |
+|------|-----------|
+| 2dex | 수익률, 거래량, 리베이트 |
+| alternate | 수익률, 거래량, 리베이트 |
+| mean-reversion-backpack | 수익률, 거래량, 리베이트 |
+| mean-reversion-paradex | 수익률, 거래량, 리베이트 |
+
+**예상 소요 시간**: 1-2주 (실제 운영 데이터 수집 필요)
+**결과물**: 성능 비교 리포트, 최종 전략 선정
+
+---
+
+## 12. Success Criteria (성공 기준)
+
+### 필수 조건
+
+- 4개 브랜치가 원격 저장소에 존재
+- 각 브랜치에 해당 전략 파일이 perpdex/strategies/{name}/ 경로에 존재
+- 각 브랜치에 6개 helper 파일이 helpers/ 폴더에 존재
+- perp-dex-tools-original/ 폴더가 main에 원본 상태로 보존
+- .tmp 파일이 모두 삭제됨
+
+### 선택 조건
+
+- 브랜치 관리 README 작성 완료
+- 각 전략별 README 작성 완료
+
+---
+
+## 13. Execution Instructions (실행 지침)
+
+이 계획을 실행하려면:
+
+```
+/start-work codebase-cleanup-and-branch-strategy
+```
+
+또는 Alfred에게:
+
+```
+이 계획(codebase-cleanup-and-branch-strategy.md)을 실행해 주세요.
+```
+
+---
+
+## Appendix: 참고 정보
+
+### A. Helper 파일 원본 위치
+
+```
+perpdex/2dex/helpers/
+ ├─ __init__.py
+ ├─ progressive_sizing.py (12,386 bytes) ← 신규
+ ├─ rebate_tracker.py (9,386 bytes) ← 신규
+ ├─ logger.py
+ ├─ lark_bot.py
+ └─ telegram_bot.py
+```
+
+### B. 전략 파일 원본 위치
+
+```
+perp-dex-tools-original/hedge/
+ ├─ DN_alternate_grvt_paradex.py (54,765 bytes)
+ ├─ DN_mean_reversion_grvt_backpack_v1.py (70,524 bytes)
+ ├─ DN_mean_reversion_grvt_paradex.py (59,370 bytes)
+ └─ hedge_mode_2dex.py (58,459 bytes) ← 구버전 (사용 안 함)
+
+perpdex/2dex/hedge/
+ └─ hedge_mode_2dex.py (68,776 bytes) ← Phase 2E 수정본 (사용)
+```
+
+### C. Git 브랜치 현황
+
+```
+main (74998cd) ← 공통 베이스
+ └─ phase2e-passive-tp (832c3dc) ← feature/2dex로 rename 예정
+```

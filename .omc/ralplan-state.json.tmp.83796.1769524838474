@@ -1,0 +1,1 @@
+{"active":true,"mode":"ralplan","iteration":4,"max_iterations":5,"plan_path":".omc/plans/v4-merge-correction-plan.md","current_phase":"completed","started_at":"2026-01-27T13:04:26Z","task_description":"Correctly merge V4 BBO routing into DN_alternate_backpack_grvt.py preserving safety features","previous_iterations":3}

@@ -1,0 +1,100 @@
+[
+  {
+    "strategy": "Cross-DEX MM",
+    "return": -4.461501520959354,
+    "sharpe": -0.006602370740483097,
+    "winRate": 51.72231054583995,
+    "totalTrades": 3774,
+    "tradesPerDay": 629.0,
+    "maxDrawdown": 9.502808239657544,
+    "totalPnl": -223.0750760479795,
+    "totalFees": 0.0,
+    "finalEquity": 4776.924923952032,
+    "feeBreakdown": {
+      "apexFees": 3681.3371784502383,
+      "paradexFees": -920.3342946125596,
+      "netFees": 2761.002883837679,
+      "feeRate": 7.500000000000001e-05
+    },
+    "targetAchieved": false,
+    "profitAboveFees": false,
+    "monthlyVolume": 92033429.46125595,
+    "monthlyTrades": 18870.0
+  },
+  {
+    "strategy": "Cross-DEX MM (Grid)",
+    "return": -4.461501520959354,
+    "sharpe": -0.006602370740483097,
+    "winRate": 51.72231054583995,
+    "totalTrades": 3774,
+    "tradesPerDay": 629.0,
+    "maxDrawdown": 9.502808239657544,
+    "totalPnl": -223.0750760479795,
+    "totalFees": 0.0,
+    "finalEquity": 4776.924923952032,
+    "feeBreakdown": {
+      "apexFees": -368.13371784502385,
+      "paradexFees": -920.3342946125596,
+      "netFees": -1288.4680124575834,
+      "feeRate": -3.5000000000000004e-05
+    },
+    "targetAchieved": false,
+    "profitAboveFees": false,
+    "monthlyVolume": 92033429.46125595,
+    "monthlyTrades": 18870.0
+  },
+  {
+    "strategy": "Avellaneda MM",
+    "return": 0.19772653176578386,
+    "sharpe": 0.0010876399277466667,
+    "winRate": 49.879692011549565,
+    "totalTrades": 4156,
+    "tradesPerDay": 692.6666666666666,
+    "maxDrawdown": 10.954852831715971,
+    "totalPnl": 9.886326588308567,
+    "totalFees": 0.0,
+    "finalEquity": 5009.886326588289,
+    "feeBreakdown": {
+      "apexFees": 4035.0409372644417,
+      "paradexFees": -1008.7602343161104,
+      "netFees": 3026.280702948331,
+      "effectiveFeeRate": 7.5e-05
+    },
+    "targetAchieved": true,
+    "profitAboveFees": true,
+    "monthlyVolume": 100876023.43161103,
+    "monthlyTrades": 20780.0
+  },
+  {
+    "strategy": "MA+RSI (optimized)",
+    "return": -1.031468459663647,
+    "sharpe": 0.40399167195872865,
+    "winRate": 62.5,
+    "totalTrades": 64,
+    "tradesPerDay": 10.666666666666666,
+    "maxDrawdown": 1.9999527496382488,
+    "totalPnl": 107.03643908532479,
+    "totalFees": 317.3556518848518,
+    "finalEquity": 4948.426577016818,
+    "targetAchieved": false,
+    "profitAboveFees": false,
+    "monthlyVolume": 1586778.259424259,
+    "monthlyTrades": 320.0
+  },
+  {
+    "strategy": "Grid Trading",
+    "return": -42.04212315821007,
+    "sharpe": -0.043486625070256454,
+    "winRate": 45.65217391304348,
+    "totalTrades": 460,
+    "tradesPerDay": 76.66666666666667,
+    "maxDrawdown": 42.832915197209935,
+    "totalPnl": -1237.721254564993,
+    "totalFees": 1728.5704339078159,
+    "finalEquity": 2897.8938420894965,
+    "targetAchieved": false,
+    "profitAboveFees": false,
+    "monthlyVolume": 8642852.16953908,
+    "monthlyTrades": 2300.0
+  }
+]

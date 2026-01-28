@@ -1,0 +1,84 @@
+# Apex Pro Exchange Configuration Template
+#
+# Copy this file and fill in your credentials from Apex Pro dashboard
+# These credentials are required for the Apex Pro connector to function
+
+connector_name: apex_pro
+
+# Network Configuration
+# Options: "mainnet" or "testnet"
+# Mainnet uses Arbitrum network, Testnet uses BSC testnet
+network: "mainnet"
+
+# API Credentials (from Apex Pro dashboard -> API Management)
+api_credentials:
+  api_key: ""              # Your Apex Pro API Key
+  api_secret: ""           # Your Apex Pro API Secret
+  api_passphrase: ""       # Your Apex Pro API Passphrase
+
+  # ZK-Rollup Layer 2 Credentials (required for Apex Pro)
+  zk_seeds: ""             # ZK-rollup seed phrase (12 words)
+  zk_l2_key: ""            # Layer 2 private key (hex format)
+
+# Trading Configuration
+trading_pairs:
+  - "BTC-USDT"
+  - "ETH-USDT"
+  - "SOL-USDT"
+  - "ARB-USDT"
+
+# Trading Settings
+trading_required: true     # Set to false for read-only mode
+
+# Fee Structure (Apex Pro default)
+fees:
+  maker_fee: 0.0002       # 0.02% maker fee
+  taker_fee: 0.0005       # 0.05% taker fee
+
+# Order Configuration
+order_config:
+  max_order_id_length: 64
+  order_id_prefix: "HBOT-"
+  min_order_size: 0.001
+
+# Network IDs
+network_ids:
+  mainnet: 42161          # Arbitrum mainnet
+  testnet: 97             # BSC testnet
+
+# API Endpoints (auto-configured based on network)
+# Mainnet: https://omni.pro.apex.exchange
+# Testnet: https://omni.qa.apex.exchange
+
+# ==========================================
+# How to obtain credentials:
+# ==========================================
+# 1. API Credentials:
+#    - Go to Apex Pro dashboard (pro.apex.exchange)
+#    - Navigate to API Management
+#    - Create new API key with trading permissions
+#    - Save api_key, api_secret, api_passphrase
+#
+# 2. ZK-Rollup Credentials:
+#    - During account creation, Apex provides ZK-rollup seed phrase
+#    - L2 private key is derived from your wallet
+#    - These are required for L2 settlement transactions
+#    - KEEP THESE SECURE - they control your funds
+#
+# 3. Trading Pairs:
+#    - List all pairs you want to trade
+#    - Format: "BASE-QUOTE" (e.g., "BTC-USDT")
+#    - Check Apex Pro for available pairs
+#
+# ==========================================
+# Security Notes:
+# ==========================================
+# - NEVER commit this file with real credentials
+# - Store credentials in environment variables:
+#   export APEX_PRO_API_KEY="your_key"
+#   export APEX_PRO_API_SECRET="your_secret"
+#   export APEX_PRO_API_PASSPHRASE="your_passphrase"
+#   export APEX_PRO_ZK_SEEDS="your twelve word seed phrase"
+#   export APEX_PRO_ZK_L2KEY="your_l2_key"
+# - Add apex_pro_config.yml to .gitignore
+# - Use API key restrictions (IP whitelist, trading-only permissions)

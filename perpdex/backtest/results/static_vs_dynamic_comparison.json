@@ -1,0 +1,77 @@
+{
+  "static": {
+    "totalTrades": 4156,
+    "winningTrades": 2073,
+    "losingTrades": 2083,
+    "winRate": 0.49879692011549565,
+    "avgProfit": 4.340730651294887,
+    "avgLoss": -4.315145613800285,
+    "totalPnl": 9.886326588308567,
+    "totalFees": 0.0,
+    "totalVolume": 40350409.37264442,
+    "avgTradeSize": 4854.476584774352,
+    "finalEquity": 5009.886326588289,
+    "returnRate": 0.0019772653176578386,
+    "maxDrawdown": 0.10954852831715971,
+    "sharpeRatio": 0.0010876399277466667,
+    "avgDuration": 5.274302213666988,
+    "maxConsecutiveLosses": 12,
+    "tradesPerDay": 692.6666666666666,
+    "parameters": {
+      "strategy": "Avellaneda-Stoikov MM",
+      "gamma": 0.1,
+      "sigma": 0.02,
+      "positionLimit": 1000.0,
+      "k": 1.5,
+      "eta": 1.0,
+      "useDynamicParams": false
+    },
+    "feeBreakdown": {
+      "apexFees": 4035.0409372644417,
+      "paradexFees": 0.0,
+      "netFees": 4035.0409372644417,
+      "effectiveFeeRate": 0.0001
+    },
+    "targetAchieved": true
+  },
+  "dynamic": {
+    "totalTrades": 4156,
+    "winningTrades": 2073,
+    "losingTrades": 2083,
+    "winRate": 0.49879692011549565,
+    "avgProfit": 4.340730651294887,
+    "avgLoss": -4.315145613800285,
+    "totalPnl": 9.886326588308567,
+    "totalFees": 0.0,
+    "totalVolume": 40350409.37264442,
+    "avgTradeSize": 4854.476584774352,
+    "finalEquity": 5009.886326588289,
+    "returnRate": 0.0019772653176578386,
+    "maxDrawdown": 0.10954852831715971,
+    "sharpeRatio": 0.0010876399277466667,
+    "avgDuration": 5.274302213666988,
+    "maxConsecutiveLosses": 12,
+    "tradesPerDay": 692.6666666666666,
+    "parameters": {
+      "strategy": "Avellaneda-Stoikov MM",
+      "gamma": 0.1,
+      "sigma": 0.02,
+      "positionLimit": 1000.0,
+      "k": 1.5,
+      "eta": 1.0,
+      "useDynamicParams": true
+    },
+    "feeBreakdown": {
+      "apexFees": 4035.0409372644417,
+      "paradexFees": 0.0,
+      "netFees": 4035.0409372644417,
+      "effectiveFeeRate": 0.0001
+    },
+    "targetAchieved": true
+  },
+  "improvements": {
+    "return": 0.0,
+    "trades": 0,
+    "sharpe": 0.0
+  }
+}

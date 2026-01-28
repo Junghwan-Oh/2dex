@@ -1,0 +1,914 @@
+# DN Bot BUILD Failure Fix & GRVT Root Cause Analysis Plan
+
+**Date**: 2026-01-25
+**Status**: REVISED (After Critic Feedback)
+**Priority**: HIGH
+**Complexity**: MEDIUM
+
+---
+
+## Context
+
+### Original Request
+Fix three critical issues in the Delta Neutral hedge bot:
+1. **BUILD failure → Backpack position accumulation**: When BUILD succeeds on Backpack but fails on GRVT, the bot retries BUILD without unwinding Backpack, causing position accumulation
+2. **NetDelta drift auto-recovery**: Need automatic cleanup when positions drift apart
+3. **GRVT iterative failure root cause**: 0.5 ETH works (8/8 success) but 0.6+ ETH fails (0% success) despite iterative implementation
+
+### Critical Code Flow Analysis (After Code Review)
+
+**File**: `perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+
+#### Actual Failure Mode in `execute_dn_cycle()` (Lines 1531-1597)
+
+**The Bug**: `execute_dn_cycle()` ALWAYS returns `True` once primary fills, even if hedge fails.
+
+```python
+# Line 1543: Primary order placed
+order_id = await self.place_primary_order(direction, self.order_quantity)
+if order_id is None:
+    return False, None, None  # Only returns False if primary fails
+
+# Line 1555-1573: Wait for hedge fill
+while not self.order_execution_complete and not self.stop_flag:
+    if self.waiting_for_hedge_fill:
+        success = await self.place_hedge_order(...)  # Returns True/False
+
+        if success and hasattr(self, "last_hedge_fill_price"):
+            hedge_fill_price = self.last_hedge_fill_price
+        break  # Breaks regardless of success value!
+
+# Line 1597: ALWAYS returns True if primary filled
+return True, primary_fill_price, hedge_fill_price
+```
+
+**Why Backpack accumulates**:
+1. Primary order fills (Backpack position > 0)
+2. `place_hedge_order()` fails on GRVT (returns False)
+3. `execute_dn_cycle()` breaks and returns `True` anyway
+4. BUILD loop (line 1740) sees `success=True` and continues
+5. While loop condition (line 1707): `abs(primary_position) < max_position`
+6. Since Backpack has position but not yet at max_position, loop continues
+7. Next BUILD iteration adds MORE to Backpack position
+
+**The actual fix location**: After `place_hedge_order()` fails (line 1562-1566), need to check return value and unwind Backpack position.
+
+#### GRVT Iterative Implementation Analysis (File: exchanges/grvt.py)
+
+**Existing Implementation** (Lines 698-895):
+- Function signature defaults: `max_iterations=20`, `max_tick_offset=10`, `max_fill_duration=30`
+- BUT called with strict limits: `max_iterations=3`, `max_tick_offset=2`, `max_fill_duration=1` (lines 814-816, 904-906)
+
+**Why 0.5 ETH fails** (Hypothesis):
+1. `max_fill_duration=1` second - too short for larger orders
+2. At 0.5 ETH, GRVT liquidity may require multiple partial fills
+3. Each iteration sleeps 0.5s (line 824) + order processing time
+4. With max_iterations=3, total time budget = 3 iterations × ~0.7s = ~2.1s
+5. But `max_fill_duration=1` kills it at 1 second
+
+**User's requirement**: Analyze WHY iterative fails before adding more code. Don't just add logging.
+
+---
+
+## Work Objectives
+
+### Core Objective
+Fix Backpack position accumulation during BUILD failures and identify the root cause of GRVT iterative failures beyond 0.5 ETH.
+
+### Deliverables
+1. **BUILD failure → Backpack UNWIND logic**
+   - Check hedge order result in `execute_dn_cycle()`
+   - Unwind Backpack position when hedge fails after primary fills
+   - Prevent position accumulation
+
+2. **NetDelta auto-recovery**
+   - Automatic position cleanup when drift detected
+   - Configurable tolerance threshold
+
+3. **GRVT failure root cause analysis**
+   - Analyze existing iterative behavior (not add new code)
+   - Identify if it's: parameter tuning, API limit, margin/balance, or different failure mode
+   - Recommend fix based on findings
+
+### Definition of Done
+- [ ] BUILD failures trigger Backpack-only unwind
+- [ ] NetDelta drift auto-corrects within tolerance
+- [ ] GRVT failure root cause identified with evidence
+- [ ] All changes tested with 10+ iterations
+- [ ] Zero position accumulation in test runs
+- [ ] NetDelta stays within 1% tolerance
+
+---
+
+## Must Have / Must NOT Have
+
+### Must Have (Guardrails)
+- Check hedge order result in `execute_dn_cycle()` before continuing
+- Unwind Backpack position if hedge fails after primary fills
+- NetDelta auto-cleanup in `reconcile_positions()`
+- Analyze existing iterative code behavior (read logs, trace execution)
+- Binary search test to find exact failure threshold
+- All changes maintain 1% NetDelta tolerance
+
+### Must NOT Have
+- Modify existing `place_iterative_market_order()` logic until root cause is known
+- Increase `max_iterations` or `max_tick_offset` without evidence
+- Add more logging code until existing behavior is analyzed
+- Add complex state machines (keep it simple)
+- Break existing 0.2 ETH 95% success rate
+
+---
+
+## Task Flow and Dependencies
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 1: BUILD Failure Fix (HIGH PRIORITY)                  │
+├─────────────────────────────────────────────────────────────┤
+│ 1. Fix execute_dn_cycle() to check hedge result             │
+│ 2. Add Backpack-only unwind when hedge fails                │
+│ 3. Test with simulated GRVT failures                        │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 2: NetDelta Auto-Recovery (MEDIUM PRIORITY)           │
+├─────────────────────────────────────────────────────────────┤
+│ 1. Add auto-unwind to reconcile_positions()                 │
+│ 2. Configurable tolerance & cleanup threshold               │
+│ 3. Test with induced drift                                  │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 3: GRVT Root Cause Analysis (CRITICAL)                │
+├─────────────────────────────────────────────────────────────┤
+│ 1. Analyze existing iterative parameters vs defaults        │
+│ 2. Trace execution flow for 0.5 ETH failure                 │
+│ 3. Binary search test: 0.4, 0.45, 0.5, 0.55, 0.6 ETH       │
+│ 4. Document root cause with evidence                       │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 4: Integration Testing                                │
+├─────────────────────────────────────────────────────────────┤
+│ 1. Full trading_loop test (10+ iterations)                  │
+│ 2. Verify zero position accumulation                        │
+│ 3. Verify NetDelta stays within 1%                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Dependencies**:
+- Phase 2 depends on Phase 1 (unwind logic first)
+- Phase 3 is independent (can run in parallel with Phase 1)
+- Phase 4 depends on all previous phases
+
+---
+
+## Detailed TODOs
+
+### Task 1: BUILD Failure → Backpack UNWIND Logic (FIXED)
+
+**File**: `perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+
+**Location**: `execute_dn_cycle()` method (lines 1562-1597)
+
+**The Bug**: At line 1571-1573, the code breaks after `place_hedge_order()` but doesn't check if it succeeded. Then at line 1597, it returns `True` regardless.
+
+**Fix Strategy**:
+
+**Option 1: Return False when hedge fails** (Recommended - cleaner)
+```python
+# At line 1562-1573, REPLACE current logic with:
+success = await self.place_hedge_order(
+    self.current_hedge_side,
+    self.current_hedge_quantity,
+    self.current_hedge_price,
+)
+
+# NEW: Check hedge result before continuing
+if not success:
+    self.logger.error(
+        f"[DN_CYCLE] Hedge order failed after primary filled - "
+        f"unwinding Backpack position to prevent accumulation"
+    )
+
+    # Unwind Backpack position immediately
+    await self._unwind_primary_position(direction)
+
+    return False, None, None  # Signal failure to BUILD loop
+
+if success and hasattr(self, "last_hedge_fill_price"):
+    hedge_fill_price = self.last_hedge_fill_price
+
+break  # Only break if hedge succeeded
+```
+
+**Option 2: Add unwind after loop** (Alternative - if you want to preserve True return)
+```python
+# At line 1597, BEFORE return True, add:
+# Check if hedge actually filled
+if not self.hedge_order_filled and self.primary_order_filled:
+    self.logger.error(
+        f"[DN_CYCLE] Primary filled but hedge failed - "
+        f"unwinding Backpack position"
+    )
+    await self._unwind_primary_position(direction)
+    return False, None, None
+```
+
+**New Helper Method** (add after `execute_dn_cycle`):
+```python
+async def _unwind_primary_position(self, original_direction: str):
+    """Unwind Backpack position when hedge fails.
+
+    Args:
+        original_direction: The direction of the original primary order ("buy" or "sell")
+    """
+    # Get current Backpack position
+    current_position = await self.primary_client.get_account_positions()
+
+    if abs(current_position) == 0:
+        self.logger.warning("[UNWIND] No Backpack position to unwind")
+        return
+
+    # Determine unwind side (opposite of position)
+    unwind_side = "sell" if current_position > 0 else "buy"
+    unwind_qty = abs(current_position)
+
+    self.logger.info(
+        f"[UNWIND] Unwinding Backpack: {unwind_side.upper()} {unwind_qty} ETH "
+        f"(original direction was {original_direction})"
+    )
+
+    try:
+        # Place market order to unwind
+        await self.primary_client.place_market_order(
+            contract_id=self.primary_contract_id,
+            quantity=unwind_qty,
+            side=unwind_side
+        )
+        self.logger.info(
+            f"[UNWIND] Successfully unwound Backpack: {unwind_side.upper()} {unwind_qty}"
+        )
+    except Exception as e:
+        self.logger.error(f"[UNWIND] Failed to unwind Backpack: {e}")
+        # Set stop flag to prevent further accumulation
+        self.stop_flag = True
+```
+
+**Acceptance Criteria**:
+- [ ] When GRVT fails after Backpack fills, Backpack position unwinds
+- [ ] `execute_dn_cycle()` returns `False` on hedge failure
+- [ ] BUILD loop stops retrying after hedge failure
+- [ ] No position accumulation across multiple failures
+- [ ] Logs clearly indicate BUILD failure handling and unwind
+
+---
+
+### Task 2: NetDelta Auto-Recovery
+
+**File**: `perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+
+**Location**: `reconcile_positions()` method (after line 645)
+
+**Changes**:
+
+```python
+# Add at end of reconcile_positions() method (after line 645)
+
+# Auto-recovery: If net delta exceeds threshold, auto-correct
+NET_DELTA_CLEANUP_THRESHOLD = Decimal("0.02")  # 2% - more permissive than warning
+if abs(net_delta) > self.order_quantity * NET_DELTA_CLEANUP_THRESHOLD:
+    self.logger.warning(
+        f"[RECONCILE] Net delta {net_delta} exceeds cleanup threshold - initiating auto-correction"
+    )
+
+    # Determine which side to close
+    if abs(primary_pos) > abs(hedge_pos):
+        # Backpack has larger position - unwind to match GRVT
+        unwind_qty = abs(primary_pos) - abs(hedge_pos)
+        unwind_side = "sell" if primary_pos > hedge_pos else "buy"
+
+        self.logger.info(
+            f"[RECONCILE] Unwinding Backpack: {unwind_side.upper()} {unwind_qty} "
+            f"(P: {primary_pos} -> {hedge_pos})"
+        )
+
+        try:
+            await self.primary_client.place_market_order(
+                contract_id=self.primary_contract_id,
+                quantity=unwind_qty,
+                side=unwind_side
+            )
+        except Exception as e:
+            self.logger.error(f"[RECONCILE] Failed to auto-correct Backpack: {e}")
+
+    elif abs(hedge_pos) > abs(primary_pos):
+        # GRVT has larger position - unwind to match Backpack
+        unwind_qty = abs(hedge_pos) - abs(primary_pos)
+        unwind_side = "sell" if hedge_pos > primary_pos else "buy"
+
+        self.logger.info(
+            f"[RECONCILE] Unwinding GRVT: {unwind_side.upper()} {unwind_qty} "
+            f"(H: {hedge_pos} -> {primary_pos})"
+        )
+
+        try:
+            await self.hedge_client.place_market_order(
+                contract_id=self.hedge_contract_id,
+                quantity=unwind_qty,
+                side=unwind_side
+            )
+        except Exception as e:
+            self.logger.error(f"[RECONCILE] Failed to auto-correct GRVT: {e}")
+```
+
+**Acceptance Criteria**:
+- [ ] NetDelta drift > 2% triggers auto-correction
+- [ ] Corrects the larger position to match the smaller one
+- [ ] Logs all auto-correction actions
+- [ ] Handles both Backpack and GRVT excess positions
+
+---
+
+### Task 3: GRVT Root Cause Analysis - Analyze Existing Code
+
+**File**: `perp-dex-tools-original/hedge/exchanges/grvt.py`
+
+**Goal**: Understand WHY 0.5 ETH fails without adding new code yet.
+
+**Analysis Steps**:
+
+**3.1. Compare function defaults vs call parameters**
+
+```python
+# Function signature (line 698-706):
+async def place_iterative_market_order(
+    self,
+    contract_id: str,
+    target_quantity: Decimal,
+    side: str,
+    max_iterations: int = 20,      # DEFAULT: 20
+    max_tick_offset: int = 10,     # DEFAULT: 10
+    max_fill_duration: int = 30,   # DEFAULT: 30 seconds
+) -> dict:
+
+# Called at (lines 814-816, 904-906):
+result = await self.hedge_client.place_iterative_market_order(
+    contract_id=self.hedge_contract_id,
+    target_quantity=quantity,
+    side=order_side,
+    max_iterations=3,       # OVERRIDDEN: 3
+    max_tick_offset=2,      # OVERRIDDEN: 2
+    max_fill_duration=1     # OVERRIDDEN: 1 second
+)
+```
+
+**Analysis**:
+- Defaults are reasonable (20 iterations, 30 seconds)
+- Call parameters are extremely strict (3 iterations, 1 second)
+- At 0.5 ETH, with 1 second timeout, likely hitting time limit
+
+**3.2. Trace execution timing for 0.5 ETH**
+
+```python
+# For 0.5 ETH at 3 iterations:
+# Iteration 1: place order (0.1s) + sleep(0.5) + check fill (0.1s) = 0.7s
+# Iteration 2: place order (0.1s) + sleep(0.5) + check fill (0.1s) = 0.7s
+# Iteration 3: place order (0.1s) + sleep(0.5) + check fill (0.1s) = 0.7s
+# Total: ~2.1 seconds > max_fill_duration=1 second
+```
+
+**Hypothesis**: With max_fill_duration=1, the function exits at line 774-784 before completing 3 iterations.
+
+**3.3. Check return values on failure**
+
+```python
+# Line 774-784: Time-based failure
+if time.time() - start_time > max_fill_duration:
+    return {
+        'total_filled': total_filled,  # Partial fill amount
+        'success': False,
+        'reason': f"Max fill duration ({max_fill_duration}s) exceeded"
+    }
+```
+
+**What gets logged**:
+- Line 821: `[CLOSE] Iterative failed: Max fill duration (1s) exceeded`
+- No detail about how much was actually filled
+
+**3.4. Analyze order book depth**
+
+For 0.5 ETH to fail:
+- Each iteration tries to fill remaining amount
+- With tick_offset=2, price moves 2 ticks worse each iteration
+- GRVT order book may have < 0.2 ETH at top 2 ticks
+
+**Questions to answer**:
+1. How much actually fills before timeout? (total_filled in return dict)
+2. Does it hit max_iterations first or max_fill_duration?
+3. Is it liquidity (partial fills) or timing (network/API delay)?
+
+**Action Plan** (no code changes yet):
+1. Review existing logs for 0.5 ETH failures
+2. Check if `total_filled` > 0 in failed attempts
+3. If `total_filled` > 0: liquidity issue (need more iterations/tick_offset)
+4. If `total_filled` == 0: API/network issue (different problem)
+
+**Acceptance Criteria**:
+- [ ] Document comparison: defaults vs call parameters
+- [ ] Calculate expected execution time for 0.5 ETH at current params
+- [ ] Identify failure mode: time limit vs iteration limit vs liquidity
+- [ ] Recommend parameter changes based on analysis (not implementation yet)
+
+---
+
+### Task 4: GRVT Root Cause Analysis - Binary Search Test (WITH SAFETY)
+
+**File**: Create new test script `perp-dex-tools-original/hedge/test_grvt_liquidity_threshold.py`
+
+**Purpose**: Find exact ETH threshold where iterative fails
+
+**Safety Features**:
+1. Pre-test position check (abort if positions exist)
+2. Order status tracking (detect stuck orders)
+3. Timeout-based cancellation
+4. Post-test cleanup (force close if needed)
+5. Partial fill handling
+
+```python
+#!/usr/bin/env python3
+"""
+Binary search test to find GRVT's exact liquidity threshold.
+
+Tests: 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7 ETH
+
+SAFETY FEATURES:
+- Pre-test position check
+- Order status tracking
+- Timeout-based cancellation
+- Post-test cleanup
+- Partial fill handling
+"""
+
+import asyncio
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from exchanges.grvt import GrvtClient
+
+class GRVTThresholdTester:
+    def __init__(self):
+        self.client = None
+        self.contract_id = "ETH_USDT_Perp"
+        self.results = {}
+
+    async def initialize(self):
+        """Initialize GRVT client."""
+        self.client = GrvtClient(
+            api_key="your_key",
+            api_secret="your_secret",
+            # ... rest of config
+        )
+        await self.client.connect()
+
+    async def pre_test_safety_check(self) -> bool:
+        """Check for existing positions before test."""
+        try:
+            positions = await self.client.get_account_positions()
+            if abs(positions) > Decimal("0.001"):
+                print(f"❌ UNSAFE: Existing position detected: {positions}")
+                print("Please close all positions before running test.")
+                return False
+            return True
+        except Exception as e:
+            print(f"❌ Failed to check positions: {e}")
+            return False
+
+    async def test_order_size(self, size: Decimal) -> dict:
+        """Test a single order size with safety checks."""
+        print(f"\n{'='*60}")
+        print(f"Testing {size} ETH")
+        print(f"{'='*60}")
+
+        result = {
+            'size': size,
+            'buy_success': False,
+            'sell_success': False,
+            'buy_filled': Decimal("0"),
+            'sell_filled': Decimal("0"),
+            'buy_iterations': 0,
+            'sell_iterations': 0,
+            'error': None
+        }
+
+        try:
+            # Test BUY
+            print(f"[{size}] Placing BUY order...")
+            buy_result = await self.client.place_iterative_market_order(
+                contract_id=self.contract_id,
+                target_quantity=size,
+                side="buy",
+                max_iterations=3,
+                max_tick_offset=2,
+                max_fill_duration=1
+            )
+
+            result['buy_success'] = buy_result['success']
+            result['buy_filled'] = buy_result.get('total_filled', Decimal("0"))
+            result['buy_iterations'] = buy_result.get('iterations', 0)
+
+            if buy_result['success']:
+                print(f"✅ BUY filled: {result['buy_filled']} @ ${buy_result['average_price']:.2f}")
+            else:
+                print(f"❌ BUY failed: {buy_result.get('reason', 'unknown')}")
+                print(f"   Partial fill: {result['buy_filled']}/{size}")
+
+                # Handle partial fill - sell back what we got
+                if result['buy_filled'] > 0:
+                    print(f"[{size}] Cleaning up partial fill...")
+                    sell_result = await self.client.place_iterative_market_order(
+                        contract_id=self.contract_id,
+                        target_quantity=result['buy_filled'],
+                        side="sell",
+                        max_iterations=3,
+                        max_tick_offset=2,
+                        max_fill_duration=1
+                    )
+                    if sell_result['success']:
+                        print(f"✅ Cleanup complete")
+                    else:
+                        print(f"⚠️  Cleanup failed - manual intervention may be needed")
+
+                return result  # Don't test sell if buy failed
+
+            # Test SELL (close position)
+            print(f"[{size}] Placing SELL order to close...")
+            sell_result = await self.client.place_iterative_market_order(
+                contract_id=self.contract_id,
+                target_quantity=size,
+                side="sell",
+                max_iterations=3,
+                max_tick_offset=2,
+                max_fill_duration=1
+            )
+
+            result['sell_success'] = sell_result['success']
+            result['sell_filled'] = sell_result.get('total_filled', Decimal("0"))
+            result['sell_iterations'] = sell_result.get('iterations', 0)
+
+            if sell_result['success']:
+                print(f"✅ SELL filled: {result['sell_filled']} @ ${sell_result['average_price']:.2f}")
+            else:
+                print(f"❌ SELL failed: {sell_result.get('reason', 'unknown')}")
+                print(f"   Partial fill: {result['sell_filled']}/{size}")
+
+        except Exception as e:
+            result['error'] = str(e)
+            print(f"❌ Exception: {e}")
+
+        return result
+
+    async def post_test_cleanup(self):
+        """Force close any remaining positions."""
+        try:
+            positions = await self.client.get_account_positions()
+            if abs(positions) > Decimal("0.001"):
+                print(f"\n⚠️  POST-TEST CLEANUP: Closing remaining position: {positions}")
+                side = "sell" if positions > 0 else "buy"
+                await self.client.place_market_order(
+                    contract_id=self.contract_id,
+                    quantity=abs(positions),
+                    side=side
+                )
+                await asyncio.sleep(1)
+                final_pos = await self.client.get_account_positions()
+                if abs(final_pos) < Decimal("0.001"):
+                    print(f"✅ Cleanup successful")
+                else:
+                    print(f"❌ Cleanup failed - position: {final_pos}")
+        except Exception as e:
+            print(f"❌ Cleanup error: {e}")
+
+    async def run_tests(self):
+        """Run all tests."""
+        if not await self.pre_test_safety_check():
+            return
+
+        test_sizes = [
+            Decimal("0.3"),
+            Decimal("0.35"),
+            Decimal("0.4"),
+            Decimal("0.45"),
+            Decimal("0.5"),
+            Decimal("0.55"),
+            Decimal("0.6"),
+            Decimal("0.65"),
+            Decimal("0.7"),
+        ]
+
+        for size in test_sizes:
+            result = await self.test_order_size(size)
+            self.results[str(size)] = result
+
+            # Safety check between tests
+            await asyncio.sleep(2)
+
+        # Final cleanup
+        await self.post_test_cleanup()
+
+        # Print summary
+        self.print_summary()
+
+    def print_summary(self):
+        """Print test summary."""
+        print("\n" + "="*60)
+        print("TEST SUMMARY")
+        print("="*60)
+
+        for size, result in self.results.items():
+            status = "✅" if result['buy_success'] and result['sell_success'] else "❌"
+            buy_fill_pct = (result['buy_filled'] / Decimal(size)) * 100 if result['buy_filled'] else 0
+            print(
+                f"{status} {size} ETH: "
+                f"Buy={'OK' if result['buy_success'] else 'FAIL'} "
+                f"({result['buy_filled']}/{size} = {buy_fill_pct:.0f}%), "
+                f"Iter={result['buy_iterations']}"
+            )
+
+        # Find threshold
+        print("\n" + "-"*60)
+        print("THRESHOLD ANALYSIS")
+        print("-"*60)
+
+        last_success = None
+        first_failure = None
+
+        for size in sorted([Decimal(s) for s in self.results.keys()]):
+            result = self.results[str(size)]
+            if result['buy_success'] and result['sell_success']:
+                last_success = size
+            else:
+                first_failure = size
+                break
+
+        if last_success and first_failure:
+            print(f"✅ Last success: {last_success} ETH")
+            print(f"❌ First failure: {first_failure} ETH")
+            print(f"📍 Threshold: between {last_success} and {first_failure} ETH")
+        elif last_success:
+            print(f"✅ All tested sizes succeeded (up to {last_success} ETH)")
+        elif first_failure:
+            print(f"❌ All tested sizes failed (starting at {first_failure} ETH)")
+
+async def main():
+    tester = GRVTThresholdTester()
+    await tester.initialize()
+    await tester.run_tests()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+**Test Execution Plan**:
+1. Run binary search test
+2. Document exact failure point
+3. Analyze partial fill amounts
+4. Identify root cause category:
+   - **Time limit**: "Max fill duration exceeded" + total_filled < target
+   - **Iteration limit**: "Max iterations exceeded" + partial fills
+   - **Liquidity**: Partial fills at every iteration
+   - **API error**: Exception during order placement
+5. Recommend fix based on root cause
+
+**Acceptance Criteria**:
+- [ ] Pre-test safety check passes (no existing positions)
+- [ ] Test all sizes from 0.3 to 0.7 ETH
+- [ ] Document exact threshold (e.g., "0.55 ETH fails, 0.5 ETH works")
+- [ ] Document partial fill percentages for each failure
+- [ ] Post-test cleanup leaves zero positions
+- [ ] Recommend fix based on root cause category
+
+---
+
+### Task 5: Integration Testing
+
+**File**: `perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+
+**Test Scenarios**:
+
+**Scenario 1: Normal Operation (Baseline)**
+```bash
+python DN_alternate_backpack_grvt.py --ticker SOL --size 0.1 --iter 10
+```
+- Expected: 10 iterations complete successfully
+- NetDelta: Within 1%
+- Position accumulation: Zero
+
+**Scenario 2: Simulated GRVT Failure**
+- Method: Temporarily disable GRVT API key or disconnect network
+- Verify: `execute_dn_cycle()` returns False when hedge fails
+- Verify: Backpack position unwinds via `_unwind_primary_position()`
+- Verify: No accumulation
+- Verify: Bot stops BUILD loop after failure
+
+**Scenario 3: Induced NetDelta Drift**
+- Method: Manually create small drift (0.05 ETH) via REST API
+- Verify: Auto-correction triggers in `reconcile_positions()`
+- Verify: NetDelta returns to < 1%
+
+**Scenario 4: Large Order Test (after root cause fix)**
+- Method: Run with 0.5 ETH size (or newly discovered threshold)
+- Verify: Orders succeed with updated parameters
+- Verify: NetDelta stays within 1%
+
+**Acceptance Criteria**:
+- [ ] Scenario 1: 10+ iterations, zero accumulation
+- [ ] Scenario 2: Backpack unwinds when GRVT fails, bot stops
+- [ ] Scenario 3: Auto-correction triggers and fixes drift
+- [ ] Scenario 4: Large orders succeed with fixed parameters
+- [ ] All scenarios: NetDelta stays within 1% tolerance
+- [ ] All scenarios: Clear logging of actions taken
+
+---
+
+## Commit Strategy
+
+**Commit 1: BUILD Failure Fix**
+```
+fix(dn): Check hedge order result and unwind Backpack on failure
+
+- Fix execute_dn_cycle() to check place_hedge_order() return value
+- Add _unwind_primary_position() helper method
+- Unwind Backpack position when hedge fails after primary fills
+- Return False to BUILD loop to prevent retry
+- Prevent position accumulation
+
+Fixes issue where Backpack accumulated position when GRVT failed.
+
+File: perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py
+Lines: ~1560-1620 (modify execute_dn_cycle) + ~1620-1660 (new helper)
+```
+
+**Commit 2: NetDelta Auto-Recovery**
+```
+feat(dn): Add NetDelta auto-correction in reconcile_positions
+
+- Auto-unwind excess position when drift > 2%
+- Correct larger position to match smaller one
+- Handle both Backpack and GRVT excess
+- Maintain 1% NetDelta tolerance
+
+File: perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py
+Lines: ~645-690 (in reconcile_positions)
+```
+
+**Commit 3: GRVT Root Cause Analysis**
+```
+analysis(grvt): Document iterative order failure root cause
+
+- Compare default parameters (20/10/30) vs call parameters (3/2/1)
+- Calculate expected execution time for 0.5 ETH
+- Identify failure mode: max_fill_duration=1 too short
+- Recommend parameter adjustment based on analysis
+
+File: perp-dex-tools-original/hedge/GRVT_ITERATIVE_FAILURE_ANALYSIS.md
+New file: ~100 lines
+```
+
+**Commit 4: GRVT Threshold Test**
+```
+test(grvt): Add binary search test for liquidity threshold
+
+- Test sizes: 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7 ETH
+- Safety features: pre-test check, partial fill handling, cleanup
+- Document exact failure point and partial fill percentages
+- Identify root cause (time/iteration/liquidity/API)
+
+File: perp-dex-tools-original/hedge/test_grvt_liquidity_threshold.py
+New file: ~250 lines with safety features
+```
+
+**Commit 5: Parameter Fix (if needed after analysis)**
+```
+fix(grvt): Adjust iterative parameters based on root cause analysis
+
+- Increase max_fill_duration from 1 to 5 seconds
+- Increase max_iterations from 3 to 10
+- Keep max_tick_offset at 2 (sufficient for liquidity depth)
+- Test with 0.5 ETH to verify fix
+
+ONLY if root cause analysis confirms parameter tuning is needed.
+
+File: perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py
+Lines: ~814-816, ~904-906 (parameter values)
+```
+
+---
+
+## Success Criteria
+
+### Functional Success
+1. ✅ BUILD failures no longer accumulate Backpack positions
+2. ✅ NetDelta drift auto-corrects within 2% threshold
+3. ✅ GRVT failure root cause identified with evidence
+4. ✅ 0.2 ETH orders maintain 95%+ success rate
+5. ✅ Clear logging of all recovery actions
+
+### Technical Success
+1. ✅ Fix applied to correct location (execute_dn_cycle hedge check)
+2. ✅ Root cause analyzed before code changes (Task 3 analysis first)
+3. ✅ All changes tested with 10+ iterations
+4. ✅ NetDelta stays within 1% tolerance in all tests
+5. ✅ Zero position accumulation in test runs
+
+### Operational Success
+1. ✅ Logs clearly indicate what happened and why
+2. ✅ Error messages actionable (not "Details not available")
+3. ✅ Auto-recovery prevents manual intervention
+4. ✅ Trading can continue safely after failures
+
+---
+
+## Notes & Assumptions
+
+### Key Insights from Code Review
+
+**CRITICAL BUG FOUND**:
+1. `execute_dn_cycle()` at line 1571 breaks after `place_hedge_order()` but doesn't check return value
+2. Line 1597 returns `True` regardless of hedge success
+3. BUILD loop continues and accumulates Backpack position
+
+**GRVT Iterative Analysis**:
+1. Default parameters are reasonable (20 iterations, 30 seconds)
+2. Call parameters are too strict (3 iterations, 1 second)
+3. At 0.5 ETH, with 0.5s sleep per iteration, 3 iterations = ~2.1s total
+4. max_fill_duration=1 kills it before 2nd iteration completes
+
+**Likely Root Cause**:
+- Time limit (max_fill_duration=1) is too short
+- Should be at least: max_iterations × (0.5s sleep + 0.3s overhead) = 3 × 0.8 = 2.4s
+- Recommendation: Set max_fill_duration=5 or remove time limit entirely
+
+### Assumptions
+1. **GRVT test results are accurate**: 0.5 ETH = 0% success is real
+2. **Margin is not the issue**: Test account should have sufficient margin for 0.5 ETH
+3. **Network is stable**: Failures are not due to network issues
+4. **Backpack is reliable**: Failures are specific to GRVT
+
+### Risks
+1. **Auto-correction might lose money**: Unwinding at bad prices
+2. **Fix might not solve GRVT issue**: Could be API limit, not parameters
+3. **Test environment differences**: Prod might behave differently
+4. **Safety cleanup might fail**: Need manual intervention fallback
+
+### Open Questions
+1. **What is the exact GRVT error message?** Test execution will reveal
+2. **How much actually fills before timeout?** Need to check total_filled in return dict
+3. **Is it time limit or iteration limit?** Analysis will determine
+4. **What is the safe production order size?** After finding threshold, we'll know
+
+---
+
+## Next Steps
+
+1. **Implement Task 1** (BUILD failure fix) - HIGH PRIORITY
+   - Fix `execute_dn_cycle()` to check hedge result
+   - Add `_unwind_primary_position()` helper
+   - Test with simulated GRVT failures
+
+2. **Implement Task 3** (Root cause analysis) - CRITICAL
+   - Compare parameters (done: 3/2/1 vs 20/10/30)
+   - Calculate timing (done: ~2.1s needed, 1s allowed)
+   - Document findings
+
+3. **Implement Task 4** (Binary search test) - CRITICAL
+   - Run test with safety features
+   - Document exact threshold
+   - Confirm root cause hypothesis
+
+4. **Analyze results** from Tasks 3 & 4
+5. **Implement Task 2** (Auto-recovery) - MEDIUM PRIORITY
+6. **Integration testing** (Task 5)
+
+**Order of execution**:
+- Task 1 → prevents accumulation immediately
+- Task 3 → identifies root cause (no code changes)
+- Task 4 → confirms root cause with test data
+- Analysis → determines parameter fix
+- Task 5 → validates everything works
+
+---
+
+**Plan Status**: REVISED AND READY FOR IMPLEMENTATION
+**Estimated Time**: 4-6 hours (implementation + testing)
+**Risk Level**: MEDIUM (auto-correction could lose money in extreme volatility)
+
+**Key Changes from Original Plan**:
+1. Fixed `execute_dn_cycle()` understanding - the bug is at line 1571, not in BUILD loop
+2. Task 3 changed from "add logging" to "analyze existing code"
+3. Task 4 added safety features (pre-test check, cleanup, partial fill handling)
+4. Task 5 added large order test scenario

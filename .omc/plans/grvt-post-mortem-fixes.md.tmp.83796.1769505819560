@@ -1,0 +1,511 @@
+# GRVT Post-Mortem Fixes - Work Plan
+
+**Created**: 2026-01-27
+**Test Context**: DN_alternate_backpack_grvt.py, ETH 0.5, 1 iteration
+**Test Outcome**: Test completed but hedge order failed due to POST_ONLY timeout and low GRVT liquidity
+
+---
+
+## Executive Summary
+
+This plan addresses 4 critical issues identified after GRVT test completion:
+
+1. **Task 1 (COMPLETE)**: Test results documented in grvt-smart-routing-plan-v4.md
+2. **Task 2**: Investigate iterative order condition (quantity > 0.2 threshold)
+3. **Task 3**: Verify grvt_websocket_rpc order submission flow
+4. **Task 4**: Fix POST_ONLY timeout fallback problem (3s → MARKET with 0.05% fee)
+
+**Root Cause**: POST_ONLY timeout (3s) → MARKET fallback → insufficient liquidity at market prices
+
+---
+
+## Issue Analysis
+
+### Issue 1: Test Results Documentation ✅ COMPLETE
+
+**Status**: Already documented
+**Location**: `.serena/memories/grvt-smart-routing-plan-v4.md` (lines 539-664)
+
+**Content**:
+- Implementation commit verification (3d923c1)
+- Test files verification
+- Iterative order quality assessment
+- Post-test Q&A analysis
+
+**Action Required**: None
+
+---
+
+### Issue 2: Iterative Order Condition Analysis
+
+**Question**: Does DN file call `place_iterative_market_order()` for orders ≤ 0.2 ETH?
+
+**Findings**:
+
+#### Location 1: CLOSE Orders (Line 851)
+```python
+if order_type == "CLOSE":
+    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2"):
+        self.logger.info(f"[CLOSE] Using ITERATIVE market order for {quantity} ETH")
+        result = await self.hedge_client.place_iterative_market_order(...)
+```
+
+#### Location 2: OPEN Orders After First Build (Line 1046)
+```python
+if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and self.first_build_completed:
+    self.logger.info(f"[OPEN] Using ITERATIVE market order for {quantity} ETH")
+    result = await self.hedge_client.place_iterative_market_order(...)
+```
+
+#### Location 3: First BUILD Orders (Line 1082)
+```python
+if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:
+    # Uses POST_ONLY with 3s timeout → MARKET fallback
+```
+
+**Key Insight**: For 0.5 ETH test, iterative order SHOULD have been triggered, but test logs show POST_ONLY timeout.
+
+**Why This Happened**:
+1. Test used `--size 0.5` (meets > 0.2 threshold)
+2. BUT test may have hit FIRST BUILD path (line 1082) which uses POST_ONLY, not iterative
+3. `first_build_completed` flag may have been False
+
+**Issue**: The 0.2 threshold check is inconsistent across different code paths.
+
+**File**: `perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+**Lines**: 851, 1046, 1082
+
+---
+
+### Issue 3: grvt_websocket_rpc Verification
+
+**Test Log Error**: "Operation: [get_order_info] failed after 5 retries"
+
+**Investigation**:
+
+#### WebSocket RPC Flow (grvt.py:221-413)
+```python
+async def _ws_rpc_submit_order(self, ...):
+    # 1. Submit order via WebSocket RPC
+    result = await asyncio.wait_for(
+        self._ws_client.rpc_create_limit_order(...),
+        timeout=10.0
+    )
+
+    # 2. Extract client_order_id from response
+    client_order_id = result.get('params', {}).get('order', {}).get('metadata', {}).get('client_order_id', '')
+
+    # 3. Verify via REST API
+    if verify_with_rest:
+        order_info = await self._verify_order_status(
+            symbol=symbol,
+            client_order_id=client_order_id,
+            timeout=10.0
+        )
+```
+
+#### Order Verification (grvt.py:168-220)
+```python
+async def _verify_order_status(self, symbol: str, client_order_id: str, timeout: float = 10.0):
+    while time.time() - start_time < timeout:
+        try:
+            order_info = self.rest_client.fetch_order(params={"client_order_id": client_order_id})
+            if order_info:
+                status = order_info.get('state', {}).get('status', 'UNKNOWN')
+                if status in ["FILLED", "CANCELLED", "REJECTED"]:
+                    return order_info
+```
+
+**Potential Failure Points**:
+1. **client_order_id extraction failure**: If RPC response doesn't contain expected structure
+2. **REST API delay**: fetch_order() takes >10s to return order info
+3. **Order not found**: GRVT REST API doesn't have order yet (race condition)
+
+**File**: `perp-dex-tools-original/hedge/exchanges/grvt.py`
+**Lines**: 168-220, 221-413
+
+---
+
+### Issue 4: POST_ONLY Timeout Fallback Problem
+
+**Root Cause Analysis**:
+
+#### Current Flow (DN_alternate_backpack_grvt.py)
+```python
+# Lines 912-920 (CLOSE)
+hedge_result = await asyncio.wait_for(
+    self.hedge_client.place_post_only_order(...),
+    timeout=3.0  # ⚠️ ONLY 3 SECONDS
+)
+
+# Lines 974-977
+except asyncio.TimeoutError:
+    self.logger.warning("[CLOSE] POST_ONLY timeout after 3s, falling back to MARKET")
+
+# Lines 983-997
+if not hedge_filled:
+    order_info = await self.hedge_client.place_market_order(...)
+    # ⚠️ 0.05% taker fee + insufficient liquidity
+```
+
+**The Problem**:
+1. POST_ONLY order placed at best bid/ask (maker price)
+2. Timeout after 3 seconds (too aggressive for thin liquidity)
+3. Fallback to MARKET order (crosses spread, pays taker fee)
+4. MARKET order fails due to insufficient liquidity at market prices
+
+**Why This Happens on GRVT**:
+- GRVT has thin order book depth
+- 0.5 ETH order requires walking the book
+- POST_ONLY at BBO may take time to fill
+- 3 seconds is too short for large orders
+
+**Files**:
+- `perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py` (lines 912, 1110)
+- `perp-dex-tools-original/hedge/exchanges/grvt.py` (line 883: order_duration_secs)
+
+---
+
+## Proposed Solutions
+
+### Solution 1: Increase POST_ONLY Timeout (HIGH PRIORITY)
+
+**Location**: `DN_alternate_backpack_grvt.py` lines 912, 1110
+
+**Change**:
+```python
+# BEFORE:
+timeout=3.0
+
+# AFTER:
+timeout=10.0  # Give POST_ONLY more time to fill
+```
+
+**Rationale**:
+- 3 seconds is too aggressive for 0.5 ETH orders on thin liquidity
+- 10 seconds matches the WebSocket RPC verification timeout
+- Reduces unnecessary MARKET fallbacks
+
+**Risk**: LOW - increases wait time but reduces failed orders
+
+---
+
+### Solution 2: Implement Dynamic Timeout Based on Order Size
+
+**Location**: `DN_alternate_backpack_grvt.py` lines 912, 1110
+
+**Add helper function**:
+```python
+def calculate_post_only_timeout(quantity: Decimal) -> float:
+    """Calculate POST_ONLY timeout based on order size."""
+    quantity_float = float(quantity)
+    if quantity_float <= 0.1:
+        return 5.0   # Quick fills for small orders
+    elif quantity_float <= 0.5:
+        return 10.0  # Moderate wait time
+    else:
+        return 15.0  # Longer wait for large orders
+```
+
+**Usage**:
+```python
+timeout=calculate_post_only_timeout(quantity)
+```
+
+**Rationale**:
+- Small orders: Quick fills (5s)
+- Large orders: More time to walk the book (15s)
+- Matches GRVT's liquidity characteristics
+
+**Risk**: LOW - aligns timeout with order size
+
+---
+
+### Solution 3: Use Iterative Order for All GRVT Orders > 0.2 ETH
+
+**Location**: `DN_alternate_backpack_grvt.py` line 1082
+
+**Change**:
+```python
+# BEFORE:
+if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:
+    # POST_ONLY with 3s timeout → MARKET fallback
+
+# AFTER:
+if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2"):
+    # Always use iterative for orders > 0.2 ETH
+    if not self.first_build_completed:
+        # Use iterative for first build too
+        result = await self.hedge_client.place_iterative_market_order(...)
+    else:
+        result = await self.hedge_client.place_iterative_market_order(...)
+```
+
+**Rationale**:
+- Iterative order handles thin liquidity better
+- No POST_ONLY timeout issues
+- Consistent behavior across all order types
+
+**Risk**: MEDIUM - changes first build behavior, needs testing
+
+---
+
+### Solution 4: Fix WebSocket RPC Order Verification
+
+**Location**: `grvt.py` lines 168-220, 304
+
+**Issue**: `get_order_info` failure may be due to incorrect client_order_id extraction
+
+**Fix**:
+```python
+# Add better error handling and logging
+async def _verify_order_status(self, symbol: str, client_order_id: str, timeout: float = 10.0):
+    if not client_order_id:
+        self.logger.log("[ORDER_VERIFICATION] No client_order_id provided", "ERROR")
+        return None
+
+    start_time = time.time()
+    retry_count = 0
+    max_retries = 5
+
+    while time.time() - start_time < timeout and retry_count < max_retries:
+        try:
+            order_info = self.rest_client.fetch_order(params={"client_order_id": client_order_id})
+
+            if order_info and 'result' in order_info:
+                status = order_info['result'].get('state', {}).get('status', 'UNKNOWN')
+                self.logger.log(
+                    f"[ORDER_VERIFICATION] Order {client_order_id} status: {status} (attempt {retry_count + 1})",
+                    "DEBUG"
+                )
+
+                if status in ["FILLED", "CANCELLED", "REJECTED"]:
+                    return order_info['result']
+                elif status in ["OPEN", "PENDING"]:
+                    await asyncio.sleep(0.2)  # Increased from 0.1
+                    retry_count += 1
+                    continue
+
+        except Exception as e:
+            self.logger.log(f"[ORDER_VERIFICATION] Error: {e} (attempt {retry_count + 1})", "WARNING")
+            retry_count += 1
+            await asyncio.sleep(0.5)
+
+    self.logger.log(
+        f"[ORDER_VERIFICATION] Order {client_order_id} timeout after {retry_count} retries",
+        "WARNING"
+    )
+    return None
+```
+
+**Rationale**:
+- Better error handling
+- Increased retry delays
+- More detailed logging
+- Returns 'result' dict, not raw response
+
+**Risk**: LOW - improves robustness
+
+---
+
+### Solution 5: Add Fallback to REST Direct Order Submission
+
+**Location**: `grvt.py` line 221 (_ws_rpc_submit_order)
+
+**Add fallback before REST submission**:
+```python
+# If WebSocket RPC fails, try REST without going through verification
+if not order_info:
+    self.logger.log("[WS_RPC] Verification failed, using REST direct submission", "WARNING")
+
+    try:
+        if order_type == "market":
+            return self.rest_client.create_order(
+                symbol=symbol,
+                type="market",
+                side=side,
+                amount=amount
+            )
+        else:
+            return self.rest_client.create_limit_order(
+                symbol=symbol,
+                side=side,
+                amount=amount,
+                price=price,
+                params=params or {}
+            )
+    except Exception as e:
+        self.logger.log(f"[WS_RPC] REST fallback also failed: {e}", "ERROR")
+        return {'success': False, 'error': str(e)}
+```
+
+**Rationale**:
+- If verification fails, still try to submit order via REST
+- Prevents order submission failures
+
+**Risk**: LOW - adds redundancy
+
+---
+
+## Risk Assessment
+
+| Solution | Risk | Impact | Mitigation |
+|----------|------|--------|------------|
+| Solution 1: Increase timeout to 10s | LOW | Longer wait for small orders | Use Solution 2 (dynamic timeout) |
+| Solution 2: Dynamic timeout | LOW | Complex logic | Test with various order sizes |
+| Solution 3: Always use iterative | MEDIUM | Changes first build behavior | Test first build thoroughly |
+| Solution 4: Fix verification | LOW | May not solve root cause | Add more logging |
+| Solution 5: REST fallback | LOW | May duplicate orders | Add deduplication logic |
+
+---
+
+## Acceptance Criteria
+
+### For Solution 1 & 2 (Timeout Fixes)
+- [ ] POST_ONLY orders no longer timeout for 0.5 ETH
+- [ ] MARKET fallback rate < 10% (from current ~100%)
+- [ ] Order execution time < 15s for 0.5 ETH
+
+### For Solution 3 (Iterative Order)
+- [ ] All GRVT orders > 0.2 ETH use iterative approach
+- [ ] First BUILD works with iterative order
+- [ ] Fill rate > 95% for 0.5 ETH orders
+
+### For Solution 4 & 5 (WebSocket RPC)
+- [ ] `get_order_info` failures < 5%
+- [ ] Order verification completes within 10s
+- [ ] REST fallback works when WebSocket fails
+
+### Overall Test Criteria
+```bash
+# Test command
+cd perp-dex-tools-original/hedge
+python DN_alternate_backpack_grvt.py --ticker ETH --size 0.5 --iter 10
+
+# Expected results:
+# - 10 iterations complete successfully
+# - Hedge orders fill (no failures)
+# - POST_ONLY timeout rate < 10%
+# - No "get_order_info failed" errors
+```
+
+---
+
+## Implementation Order
+
+### Phase 1: Quick Wins (Day 1)
+1. **Solution 1**: Increase POST_ONLY timeout to 10s
+   - File: `DN_alternate_backpack_grvt.py` lines 912, 1110
+   - Change: `timeout=3.0` → `timeout=10.0`
+   - Test: Run 0.5 ETH test, verify POST_ONLY fills
+
+2. **Solution 4**: Add better error handling to order verification
+   - File: `grvt.py` lines 168-220
+   - Add retry logging and increased delays
+   - Test: Run test, check logs for "get_order_info" errors
+
+### Phase 2: Structural Improvements (Day 2)
+3. **Solution 2**: Implement dynamic timeout
+   - File: `DN_alternate_backpack_grvt.py`
+   - Add `calculate_post_only_timeout()` function
+   - Test: Run tests with 0.1, 0.5, 1.0 ETH sizes
+
+4. **Solution 5**: Add REST direct submission fallback
+   - File: `grvt.py` line 221
+   - Add fallback logic
+   - Test: Simulate WebSocket failure, verify REST works
+
+### Phase 3: Long-term Fix (Day 3)
+5. **Solution 3**: Always use iterative for > 0.2 ETH
+   - File: `DN_alternate_backpack_grvt.py` line 1082
+   - Remove first build special case
+   - Test: Full integration test with 10 iterations
+
+---
+
+## Testing Strategy
+
+### Unit Tests
+```bash
+# Test timeout calculation
+python -c "from DN_alternate_backpack_grvt import calculate_post_only_timeout; print(calculate_post_only_timeout(Decimal('0.5')))"
+# Expected: 10.0
+```
+
+### Integration Tests
+```bash
+# Small order (should use 5s timeout)
+python DN_alternate_backpack_grvt.py --ticker ETH --size 0.1 --iter 5
+
+# Medium order (should use 10s timeout)
+python DN_alternate_backpack_grvt.py --ticker ETH --size 0.5 --iter 5
+
+# Large order (should use 15s timeout)
+python DN_alternate_backpack_grvt.py --ticker ETH --size 1.0 --iter 5
+```
+
+### Verification Steps
+1. **Before Fix**: Run 0.5 ETH test, document failure rate
+2. **After Fix**: Run same test, verify improvement
+3. **Log Analysis**: Check for "POST_ONLY timeout" messages
+4. **Metrics**: Compare fill rates, execution times, fee costs
+
+---
+
+## Success Metrics
+
+| Metric | Before | Target | After |
+|--------|--------|--------|-------|
+| POST_ONLY timeout rate | ~100% | < 10% | TBD |
+| Hedge order fill rate | ~0% | > 95% | TBD |
+| Avg execution time (0.5 ETH) | N/A | < 15s | TBD |
+| "get_order_info failed" errors | ~5/iter | < 1/iter | TBD |
+| Fee cost (taker vs maker) | 0.05% | 0% | TBD |
+
+---
+
+## Rollback Plan
+
+If fixes cause issues:
+
+1. **Revert timeout changes**: Change `timeout=10.0` back to `timeout=3.0`
+2. **Disable iterative**: Set `quantity > Decimal("999")` to bypass
+3. **Restore old verification**: Revert `grvt.py` changes
+4. **Fallback to Backpack**: Use `--hedge-exchange backpack` temporarily
+
+**Command to revert**:
+```bash
+cd perp-dex-tools-original/hedge
+git checkout HEAD~1 DN_alternate_backpack_grvt.py
+git checkout HEAD~1 exchanges/grvt.py
+```
+
+---
+
+## Next Steps
+
+1. **Immediate**: Implement Solution 1 (increase timeout to 10s)
+2. **Today**: Implement Solution 4 (fix verification)
+3. **Tomorrow**: Implement Solution 2 (dynamic timeout)
+4. **Day 3**: Implement Solution 3 (always iterative)
+5. **Continuous**: Monitor logs, adjust timeouts as needed
+
+**Test Command**:
+```bash
+cd perp-dex-tools-original/hedge
+python DN_alternate_backpack_grvt.py --ticker ETH --size 0.5 --iter 10
+```
+
+**Expected Log Output**:
+```
+[CLOSE] Using ITERATIVE market order for 0.5 ETH
+[SMART_ROUTING] Starting with buy order at 3400.00
+[ITERATIVE] SUCCESS: Filled 0.5 ETH in 2 iterations
+```
+
+---
+
+**Plan Status**: Ready for implementation
+**Priority**: HIGH (blocks production trading)
+**Estimated Effort**: 2-3 days
+**Risk Level**: MEDIUM (well-understood issues, tested solutions)

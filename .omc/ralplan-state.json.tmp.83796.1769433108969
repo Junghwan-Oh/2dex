@@ -1,0 +1,1 @@
+{"active":true,"mode":"ralplan","iteration":0,"max_iterations":5,"plan_path":".omc/plans/grvt-bug-fixes.md","current_phase":"critic_review","started_at":"2026-01-26T21:50:00Z","task_description":"Implement GRVT bug fixes: P0 (REST→WebSocket migration), P1 (Session auth), P3 (Reduce retracement with aggressive pricing). Exclude P2 (already implemented)."}

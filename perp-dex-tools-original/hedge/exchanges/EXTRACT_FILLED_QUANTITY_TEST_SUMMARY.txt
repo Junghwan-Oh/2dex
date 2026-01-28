@@ -1,0 +1,173 @@
+================================================================================
+EXTRACT_FILLED_QUANTITY FIX - TEST SUMMARY
+================================================================================
+
+Date: 2025-01-28
+Component: GRVT Exchange Client
+File: f:\Dropbox\dexbot\perp-dex-tools-original\hedge\exchanges\grvt.py
+Function: extract_filled_quantity() (lines 50-97)
+
+================================================================================
+PROBLEM STATEMENT
+================================================================================
+
+The extract_filled_quantity() function failed to extract filled quantities from
+WebSocket RPC order responses when the traded_size field was in list format
+(e.g., ["0.5"]), causing it to return 0 instead of the actual filled amount.
+
+This affected:
+- WebSocket RPC order submission with REST verification
+- Position tracking accuracy
+- Fill quantity reporting in logs
+
+================================================================================
+ROOT CAUSE
+================================================================================
+
+Original code (line 68):
+    return Decimal(order_result['state']['traded_size'])
+
+When traded_size is a list like ["0.5"], Decimal() conversion fails with
+TypeError, causing the function to fall through and return Decimal('0').
+
+================================================================================
+SOLUTION IMPLEMENTED
+================================================================================
+
+Modified code (lines 67-73):
+    if 'state' in order_result and 'traded_size' in order_result['state']:
+        traded_size = order_result['state']['traded_size']
+        # Handle list format: ["0.5"]
+        if isinstance(traded_size, list):
+            return Decimal(traded_size[0]) if len(traded_size) > 0 else Decimal('0')
+        # Handle string format: "0.5"
+        return Decimal(traded_size)
+
+Changes:
+1. Extract traded_size to variable first
+2. Check if it's a list using isinstance()
+3. If list, extract first element (with empty list protection)
+4. If not list, convert directly (backward compatible)
+5. Also applied same logic to top-level traded_size field
+
+================================================================================
+TEST RESULTS
+================================================================================
+
+Comprehensive Test Suite: 11/11 PASSED (100%)
+
+Critical Tests:
+  [PASS] WS RPC List format: traded_size=["0.5"] -> 0.5
+  [PASS] WS RPC String format: traded_size="0.25" -> 0.25
+  [PASS] WS RPC No traded_size: fallback -> 0
+  [PASS] Direct List format: traded_size=["1.0"] -> 1.0
+  [PASS] Direct String format: traded_size="0.75" -> 0.75
+  [PASS] Direct Size field: size="2.5" -> 2.5
+  [PASS] List [price, size]: ["2500", "1.5"] -> 1.5
+  [PASS] WS Metadata only: metadata only -> 0
+
+Edge Cases:
+  [PASS] WS RPC Empty list: traded_size=[] -> 0
+  [PASS] Tuple (price, size): ("2500", "2.0") -> 2.0
+  [PASS] Empty dict: {} -> 0
+
+================================================================================
+VERIFICATION CHECKLIST
+================================================================================
+
+Required verifications (from test specification):
+  [x] raw_rest_response['state']['traded_size'] = ["0.5"] returns 0.5
+  [x] raw_rest_response['state']['traded_size'] = "0.25" returns 0.25
+  [x] Without raw_rest_response, returns 0 (fallback)
+  [x] Metadata check no longer causes zero returns when traded_size exists
+  [x] Handles list format ["0.5"]
+  [x] Handles direct format "0.5"
+
+All verifications: PASSED
+
+================================================================================
+BACKWARD COMPATIBILITY
+================================================================================
+
+The fix maintains full backward compatibility:
+- String format "0.5" still works
+- Direct size field still works
+- List/tuple format [price, size] still works
+- Metadata fallback still works
+- Empty/missing data still returns 0
+
+No breaking changes introduced.
+
+================================================================================
+IMPACT ANALYSIS
+================================================================================
+
+Positive Impacts:
+  1. Accurate fill quantity tracking for WebSocket RPC orders
+  2. Correct position calculations in trading strategies
+  3. Proper fill size logging for debugging
+  4. REST API verification data correctly utilized
+
+Risk Assessment: LOW
+  - Change is additive only
+  - All existing functionality preserved
+  - Comprehensive test coverage
+  - Defensive programming (empty list protection)
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+1. f:\Dropbox\dexbot\perp-dex-tools-original\hedge\exchanges\grvt.py
+   Function: extract_filled_quantity()
+   Lines: 50-97
+   Type: Bug fix
+   Scope: Single function
+   Breaking Changes: None
+
+================================================================================
+RECOMMENDATIONS
+================================================================================
+
+1. Production Monitoring:
+   - Monitor WebSocket RPC order fills for correct quantities
+   - Verify position accuracy in live trading
+   - Check logs for fill size reporting
+
+2. Future Enhancements:
+   - Add unit tests to regression test suite
+   - Consider debug logging for list format extraction
+   - Document traded_size format variations
+
+3. Related Areas:
+   - Verify place_iterative_market_order() uses this correctly
+   - Check other functions that parse order results
+   - Review position tracking logic
+
+================================================================================
+CONCLUSION
+================================================================================
+
+The extract_filled_quantity() fix has been successfully implemented and tested.
+All test cases pass, including critical WebSocket RPC scenarios and edge cases.
+
+The fix correctly handles:
+  - List format: ["0.5"]
+  - String format: "0.5"
+  - Fallback to 0 when data missing
+
+Status: VERIFIED AND APPLIED
+Test Coverage: 100% (11/11 tests passed)
+Backward Compatibility: MAINTAINED
+Risk Level: LOW
+
+================================================================================
+SIGN-OFF
+================================================================================
+
+Tested By: QA Tester Agent
+Test Date: 2025-01-28
+Test Result: PASS
+Recommendation: APPROVED FOR PRODUCTION
+
+================================================================================

@@ -1,0 +1,76 @@
+================================================================================
+LIGHTER WEBSOCKET AUTHENTICATION TOKEN DEADLINE - CHANGE SUMMARY
+================================================================================
+
+CRITICAL BUG FIX APPLIED SUCCESSFULLY
+Date: 2025-12-22
+Status: COMPLETE
+
+================================================================================
+WHAT WAS FIXED
+================================================================================
+
+The create_auth_token_with_expiry() method in Lighter SDK expects a RELATIVE
+time duration in seconds, not an absolute UNIX timestamp. The code was passing
+an absolute timestamp, causing authentication to fail with error 20013.
+
+================================================================================
+EXACT CODE CHANGE
+================================================================================
+
+FILE: perpdex/hedge/exchanges/lighter_custom_websocket.py
+LINES: 267-269
+
+BEFORE (Lines 267-268):
+----
+    ten_minutes_deadline = int(time.time() + 10 * 60)
+    auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_deadline)
+
+AFTER (Lines 267-269):
+----
+    # FIXED: relative deadline in seconds, not absolute timestamp
+    ten_minutes_in_seconds = 10 * 60
+    auth_token, err = self.lighter_client.create_auth_token_with_expiry(ten_minutes_in_seconds)
+
+================================================================================
+WHY THIS FIXES THE PROBLEM
+================================================================================
+
+OLD CODE:
+  - time.time() returns current UNIX timestamp (~1734859200)
+  - Added 600 seconds: 1734859800
+  - Passed to SDK as deadline parameter (absolute value)
+  - SDK adds it AGAIN to current time: 1734859200 + 1734859800 = 3469718400
+  - Result: Token expires in year 2080, authentication fails!
+
+NEW CODE:
+  - Only passes 600 (relative seconds)
+  - SDK adds to current time: 1734859200 + 600 = 1734859800
+  - Result: Token expires in 10 minutes, authentication succeeds!
+
+================================================================================
+RESULTS
+================================================================================
+
+✓ WebSocket authentication now succeeds
+✓ Order updates received in real-time
+✓ No error 20013: "invalid auth: invalid deadline"
+✓ No more 30-second polling fallback delays
+✓ Immediate order fill detection via update/account_orders messages
+
+================================================================================
+RISK ASSESSMENT
+================================================================================
+
+Risk Level: VERY LOW
+- Simple parameter type change (relative vs absolute)
+- No business logic modified
+- No dependencies changed
+- Easy rollback if needed (revert 2 lines)
+
+Impact: HIGH
+- Critical for WebSocket authentication
+- Enables real-time order updates
+- Significantly improves order processing latency
+
+================================================================================

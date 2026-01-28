@@ -1,0 +1,1 @@
+{"active":true,"mode":"ralplan","iteration":2,"max_iterations":5,"plan_path":".omc/plans/grvt-bug-fixes-v3.md","current_phase":"critic_review","started_at":"2026-01-26T22:00:00Z","task_description":"Implement GRVT bug fixes: P0 (REST→WebSocket RPC migration) with proper SDK verification. Excluded P1 (already in SDK), P3 (already implemented)."}

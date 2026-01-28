@@ -1,0 +1,102 @@
+# BBO Routing Fix Plan
+
+## Issues Summary
+
+### Issue 1: BBO Level Spacing Too Large (90 USD gap)
+
+**Root Cause**: [grvt.py:1343](grvt.py#L1343) uses `tick_size=10`
+```python
+current_price = bbo['best_ask_price'] - (Decimal(tick_size) * Decimal(tick_offset))
+```
+
+**Effect**: 10 iterations × $0.10 = $1.00 gap per iteration → 90 USD total gap
+
+### Issue 2: Chunk Size Too Small
+
+**Root Cause**: [grvt.py:1348](grvt.py#L1348) uses single level size
+```python
+current_level_size = bbo['best_ask_size'] if side == 'buy' else bbo['best_bid_size']
+chunk_size = current_level_size  # 0.02 ETH
+```
+
+**Effect**: Never fills target (0.02 × 10 = 0.2 < 0.5 target)
+
+---
+
+## Fix Strategy
+
+### Fix 1: Reduce tick_size from 10 to 1
+
+**Change**: Use 1 cent increments instead of 10 cent increments
+
+```python
+# grvt.py:1225
+tick_size: int = 1,  # Was 10
+```
+
+**Effect**: 10 iterations × $0.01 = $0.10 gap per iteration → 10 USD total gap
+
+### Fix 2: Use cumulative depth for chunks
+
+**Change**: Calculate chunk size from cumulative liquidity instead of single level
+
+```python
+# grvt.py:1348 - Replace single level size with cumulative depth
+price_levels = analysis['price_levels']
+chunk_size = Decimal('0')
+
+if side == 'buy':
+    for level in price_levels:
+        if level['cumulative'] >= remaining:
+            chunk_size = remaining  # Try to fill entire remaining quantity
+            current_price = level['price']
+            break
+else:
+    for level in reversed(price_levels):
+        if level['cumulative'] >= remaining:
+            chunk_size = remaining
+            current_price = level['price']
+            break
+```
+
+**Effect**: First iteration tries to fill entire remaining quantity (0.5 ETH), not 0.02 ETH
+
+---
+
+## Expected Results
+
+### Before Fix
+| Metric | Value |
+|--------|-------|
+| BBO price gap | 90 USD |
+| Chunk size | 0.02 ETH |
+| Fill attempts | 10 iterations |
+| Total filled | 0.2 ETH (40%) |
+| Result | **FAILED** |
+
+### After Fix
+| Metric | Expected Value |
+|--------|----------------|
+| BBO price gap | 10 USD |
+| Chunk size | 0.5 ETH (full remaining) |
+| Fill attempts | 1 iteration |
+| Total filled | 0.5 ETH (100%) |
+| Result | **SUCCESS** |
+
+---
+
+## Implementation Steps
+
+### Step 1: Update grvt.py default tick_size
+**File**: [grvt.py:1225](grvt.py#L1225)
+```python
+tick_size: int = 1,  # Changed from 10
+```
+
+### Step 2: Update chunk size calculation
+**File**: [grvt.py:1348-1381](grvt.py#L1348)
+Use cumulative depth from price_levels instead of single level size.
+
+### Step 3: Update DN_alternate_backpack_grvt.py
+**Files**: [DN_alternate_backpack_grvt.py:909](DN_alternate_backpack_grvt.py#L909), [1109](DN_alternate_backpack_grvt.py#L1109)
+Ensure `tick_size=1` is passed (default will now be 1).

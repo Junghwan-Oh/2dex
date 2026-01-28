@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@context7/mcp"]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "F:\Dropbox\dexbot"]
+    },
+    "serena": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-serena"]
+    }
+  }
+}

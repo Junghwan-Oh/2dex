@@ -1,0 +1,53 @@
+# Avellaneda Market Making Strategy - Apex Pro ETH-USDT Mainnet
+# Conservative parameters for initial live testing
+
+strategy: avellaneda_market_making
+
+# Exchange and trading pair
+exchange: apex_pro_mainnet
+market: ETH-USDT
+
+# Execution timeframe (run continuously)
+execution_timeframe_mode:
+  infinite
+
+# Order sizing (0.01 ETH = ~$35 per order, minimum size)
+order_amount: 0.01
+
+# Risk parameters
+risk_factor: 1.0  # γ (gamma) - risk aversion parameter (1.0 = moderate)
+order_amount_shape_factor: 0.0  # η (eta) - order size adjustment (0 = constant size)
+
+# Spread parameters
+min_spread: 0.1  # Minimum 0.1% spread from mid price
+order_optimization_enabled: true  # Adjust prices based on top of book
+
+# Order refresh settings
+order_refresh_time: 30.0  # Refresh orders every 30 seconds
+max_order_age: 1800.0  # Cancel orders after 30 minutes regardless of spread
+order_refresh_tolerance_pct: 0.2  # 0.2% price tolerance before refresh
+filled_order_delay: 60.0  # Wait 60 seconds after fill before placing new order
+
+# Inventory management
+inventory_target_base_pct: 50  # Target 50% ETH, 50% USDT
+
+# Cost settings
+add_transaction_costs: true  # Add fees to order prices (maker: 0.02%, taker: 0.05%)
+
+# Buffer sizes for volatility and liquidity estimation
+volatility_buffer_size: 200  # 200 ticks for volatility calculation
+trading_intensity_buffer_size: 200  # 200 ticks for liquidity estimation
+
+# Order levels (single order on each side)
+order_levels_mode:
+  single_order_level
+
+# Hanging orders (don't track - simpler for initial test)
+hanging_orders_mode:
+  ignore_hanging_orders
+
+# Confirmation settings
+should_wait_order_cancel_confirmation: true  # Wait for cancel confirmation
+
+# Optional overrides (none for now)
+order_override: null

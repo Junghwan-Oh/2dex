@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<!--
+    Currents of Emergence - Flow Field Generative Art
+    An algorithmic exploration of invisible forces made visible through particle traces
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Currents of Emergence - Flow Field Art</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.7.0/p5.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Lora:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        /* Anthropic Brand Colors */
+        :root {
+            --anthropic-dark: #141413;
+            --anthropic-light: #faf9f5;
+            --anthropic-mid-gray: #b0aea5;
+            --anthropic-light-gray: #e8e6dc;
+            --anthropic-orange: #d97757;
+            --anthropic-blue: #6a9bcc;
+            --anthropic-green: #788c5d;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Poppins', sans-serif;
+            background: linear-gradient(135deg, var(--anthropic-light) 0%, #f5f3ee 100%);
+            min-height: 100vh;
+            color: var(--anthropic-dark);
+        }
+
+        .container {
+            display: flex;
+            min-height: 100vh;
+            padding: 20px;
+            gap: 20px;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 320px;
+            flex-shrink: 0;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(20, 20, 19, 0.1);
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+
+        .sidebar h1 {
+            font-family: 'Lora', serif;
+            font-size: 24px;
+            font-weight: 500;
+            color: var(--anthropic-dark);
+            margin-bottom: 8px;
+        }
+
+        .sidebar .subtitle {
+            color: var(--anthropic-mid-gray);
+            font-size: 14px;
+            margin-bottom: 32px;
+            line-height: 1.4;
+        }
+
+        /* Control Sections */
+        .control-section {
+            margin-bottom: 32px;
+        }
+
+        .control-section h3 {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--anthropic-dark);
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .control-section h3::before {
+            content: '•';
+            color: var(--anthropic-orange);
+            font-weight: bold;
+        }
+
+        /* Seed Controls */
+        .seed-input {
+            width: 100%;
+            background: var(--anthropic-light);
+            padding: 12px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            margin-bottom: 12px;
+            border: 1px solid var(--anthropic-light-gray);
+            text-align: center;
+        }
+
+        .seed-input:focus {
+            outline: none;
+            border-color: var(--anthropic-orange);
+            box-shadow: 0 0 0 2px rgba(217, 119, 87, 0.1);
+            background: white;
+        }
+
+        .seed-controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .regen-button {
+            margin-bottom: 0;
+        }
+
+        /* Parameter Controls */
+        .control-group {
+            margin-bottom: 20px;
+        }
+
+        .control-group label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--anthropic-dark);
+            margin-bottom: 8px;
+        }
+
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .slider-container input[type="range"] {
+            flex: 1;
+            height: 4px;
+            background: var(--anthropic-light-gray);
+            border-radius: 2px;
+            outline: none;
+            -webkit-appearance: none;
+        }
+
+        .slider-container input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            background: var(--anthropic-orange);
+            border-radius: 50%;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .slider-container input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.1);
+            background: #c86641;
+        }
+
+        .slider-container input[type="range"]::-moz-range-thumb {
+            width: 16px;
+            height: 16px;
+            background: var(--anthropic-orange);
+            border-radius: 50%;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .value-display {
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            color: var(--anthropic-mid-gray);
+            min-width: 60px;
+            text-align: right;
+        }
+
+        /* Color Pickers */
+        .color-group {
+            margin-bottom: 16px;
+        }
+
+        .color-group label {
+            display: block;
+            font-size: 12px;
+            color: var(--anthropic-mid-gray);
+            margin-bottom: 4px;
+        }
+
+        .color-picker-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .color-picker-container input[type="color"] {
+            width: 32px;
+            height: 32px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            background: none;
+            padding: 0;
+        }
+
+        .color-value {
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            color: var(--anthropic-mid-gray);
+        }
+
+        /* Buttons */
+        .button {
+            background: var(--anthropic-orange);
+            color: white;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            width: 100%;
+        }
+
+        .button:hover {
+            background: #c86641;
+            transform: translateY(-1px);
+        }
+
+        .button:active {
+            transform: translateY(0);
+        }
+
+        .button.secondary {
+            background: var(--anthropic-blue);
+        }
+
+        .button.secondary:hover {
+            background: #5a8bb8;
+        }
+
+        .button.tertiary {
+            background: var(--anthropic-green);
+        }
+
+        .button.tertiary:hover {
+            background: #6b7b52;
+        }
+
+        .button-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .button-row .button {
+            flex: 1;
+        }
+
+        /* Canvas Area */
+        .canvas-area {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 0;
+        }
+
+        #canvas-container {
+            width: 100%;
+            max-width: 1000px;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 20px 40px rgba(20, 20, 19, 0.1);
+            background: white;
+        }
+
+        #canvas-container canvas {
+            display: block;
+            width: 100% !important;
+            height: auto !important;
+        }
+
+        /* Loading State */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            color: var(--anthropic-mid-gray);
+        }
+
+        /* Responsive - Stack on mobile */
+        @media (max-width: 600px) {
+            .container {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                width: 100%;
+            }
+
+            .canvas-area {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Control Sidebar -->
+        <div class="sidebar">
+            <!-- Headers -->
+            <h1>Currents of Emergence</h1>
+            <div class="subtitle">Flow field generative art revealing invisible forces through particle traces</div>
+
+            <!-- Seed Section -->
+            <div class="control-section">
+                <h3>Seed</h3>
+                <input type="number" id="seed-input" class="seed-input" value="12345" onchange="updateSeed()">
+                <div class="seed-controls">
+                    <button class="button secondary" onclick="previousSeed()">← Prev</button>
+                    <button class="button secondary" onclick="nextSeed()">Next →</button>
+                </div>
+                <button class="button tertiary regen-button" onclick="randomSeedAndUpdate()">↻ Random</button>
+            </div>
+
+            <!-- Parameters Section -->
+            <div class="control-section">
+                <h3>Flow Parameters</h3>
+
+                <!-- Particle Count -->
+                <div class="control-group">
+                    <label>Particle Count</label>
+                    <div class="slider-container">
+                        <input type="range" id="particleCount" min="1000" max="8000" step="500" value="3000" oninput="updateParam('particleCount', this.value)">
+                        <span class="value-display" id="particleCount-value">3000</span>
+                    </div>
+                </div>
+
+                <!-- Flow Speed -->
+                <div class="control-group">
+                    <label>Flow Speed</label>
+                    <div class="slider-container">
+                        <input type="range" id="flowSpeed" min="0.5" max="3.0" step="0.1" value="1.5" oninput="updateParam('flowSpeed', this.value)">
+                        <span class="value-display" id="flowSpeed-value">1.5</span>
+                    </div>
+                </div>
+
+                <!-- Noise Scale -->
+                <div class="control-group">
+                    <label>Noise Scale</label>
+                    <div class="slider-container">
+                        <input type="range" id="noiseScale" min="0.0005" max="0.008" step="0.0005" value="0.003" oninput="updateParam('noiseScale', this.value)">
+                        <span class="value-display" id="noiseScale-value">0.003</span>
+                    </div>
+                </div>
+
+                <!-- Field Evolution -->
+                <div class="control-group">
+                    <label>Field Evolution</label>
+                    <div class="slider-container">
+                        <input type="range" id="fieldEvolution" min="0.0" max="0.01" step="0.001" value="0.002" oninput="updateParam('fieldEvolution', this.value)">
+                        <span class="value-display" id="fieldEvolution-value">0.002</span>
+                    </div>
+                </div>
+
+                <!-- Trail Fade -->
+                <div class="control-group">
+                    <label>Trail Fade</label>
+                    <div class="slider-container">
+                        <input type="range" id="trailFade" min="1" max="30" step="1" value="8" oninput="updateParam('trailFade', this.value)">
+                        <span class="value-display" id="trailFade-value">8</span>
+                    </div>
+                </div>
+
+                <!-- Stroke Weight -->
+                <div class="control-group">
+                    <label>Stroke Weight</label>
+                    <div class="slider-container">
+                        <input type="range" id="strokeWeight" min="0.3" max="2.0" step="0.1" value="0.8" oninput="updateParam('strokeWeight', this.value)">
+                        <span class="value-display" id="strokeWeight-value">0.8</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Colors Section -->
+            <div class="control-section">
+                <h3>Color Palette</h3>
+
+                <!-- Color 1 - Warm (high velocity) -->
+                <div class="color-group">
+                    <label>High Velocity</label>
+                    <div class="color-picker-container">
+                        <input type="color" id="color1" value="#d97757" onchange="updateColor('color1', this.value)">
+                        <span class="color-value" id="color1-value">#d97757</span>
+                    </div>
+                </div>
+
+                <!-- Color 2 - Cool (medium velocity) -->
+                <div class="color-group">
+                    <label>Medium Velocity</label>
+                    <div class="color-picker-container">
+                        <input type="color" id="color2" value="#6a9bcc" onchange="updateColor('color2', this.value)">
+                        <span class="color-value" id="color2-value">#6a9bcc</span>
+                    </div>
+                </div>
+
+                <!-- Color 3 - Calm (low velocity) -->
+                <div class="color-group">
+                    <label>Low Velocity</label>
+                    <div class="color-picker-container">
+                        <input type="color" id="color3" value="#788c5d" onchange="updateColor('color3', this.value)">
+                        <span class="color-value" id="color3-value">#788c5d</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Actions Section -->
+            <div class="control-section">
+                <h3>Actions</h3>
+                <div class="button-row">
+                    <button class="button" onclick="resetParameters()">Reset</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Canvas Area -->
+        <div class="canvas-area">
+            <div id="canvas-container">
+                <div class="loading">Generating flow field...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ═══════════════════════════════════════════════════════════════════════
+        // GENERATIVE ART PARAMETERS
+        // ═══════════════════════════════════════════════════════════════════════
+
+        let params = {
+            seed: 12345,
+            particleCount: 3000,
+            flowSpeed: 1.5,
+            noiseScale: 0.003,
+            fieldEvolution: 0.002,
+            trailFade: 8,
+            strokeWeight: 0.8,
+            colorPalette: ['#d97757', '#6a9bcc', '#788c5d']
+        };
+
+        let defaultParams = {...params}; // Store defaults for reset
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // P5.JS FLOW FIELD ALGORITHM
+        // ═══════════════════════════════════════════════════════════════════════
+
+        let particles = [];
+        let flowField = [];
+        let cols, rows;
+        let scl = 10; // Flow field resolution
+        let zOffset = 0; // For evolving the field over time
+
+        function setup() {
+            let canvas = createCanvas(1200, 1200);
+            canvas.parent('canvas-container');
+
+            initializeSystem();
+
+            // Remove loading message
+            document.querySelector('.loading').style.display = 'none';
+        }
+
+        function initializeSystem() {
+            // Seed the randomness for reproducibility
+            randomSeed(params.seed);
+            noiseSeed(params.seed);
+
+            // Clear and recreate particles
+            particles = [];
+            for (let i = 0; i < params.particleCount; i++) {
+                particles.push(new Particle());
+            }
+
+            // Calculate flow field dimensions
+            cols = floor(width / scl);
+            rows = floor(height / scl);
+
+            // Initialize flow field array
+            flowField = new Array(cols * rows);
+
+            // Reset z offset for field evolution
+            zOffset = 0;
+
+            // Clear background with subtle warm tone
+            background(250, 249, 245);
+        }
+
+        function generateFlowField() {
+            // Multi-octave Perlin noise for organic flow patterns
+            for (let y = 0; y < rows; y++) {
+                for (let x = 0; x < cols; x++) {
+                    let index = x + y * cols;
+
+                    // Layer multiple noise octaves for rich field dynamics
+                    let xOff = x * params.noiseScale;
+                    let yOff = y * params.noiseScale;
+
+                    // Primary flow - large scale currents
+                    let angle1 = noise(xOff, yOff, zOffset) * TWO_PI * 2;
+
+                    // Secondary flow - medium scale variation
+                    let angle2 = noise(xOff * 2, yOff * 2, zOffset * 1.5) * TWO_PI;
+
+                    // Tertiary flow - fine turbulence
+                    let angle3 = noise(xOff * 4, yOff * 4, zOffset * 0.5) * TWO_PI * 0.5;
+
+                    // Combine angles with weighted contribution
+                    let angle = angle1 * 0.6 + angle2 * 0.3 + angle3 * 0.1;
+
+                    // Create vector from angle
+                    let v = p5.Vector.fromAngle(angle);
+                    v.setMag(0.5); // Base magnitude
+
+                    flowField[index] = v;
+                }
+            }
+
+            // Evolve field over time
+            zOffset += params.fieldEvolution;
+        }
+
+        function draw() {
+            // Subtle fade effect for trail accumulation
+            fill(250, 249, 245, params.trailFade);
+            noStroke();
+            rect(0, 0, width, height);
+
+            // Regenerate flow field each frame for evolution
+            generateFlowField();
+
+            // Update and display all particles
+            for (let particle of particles) {
+                particle.follow(flowField);
+                particle.update();
+                particle.show();
+                particle.edges();
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // PARTICLE SYSTEM
+        // ═══════════════════════════════════════════════════════════════════════
+
+        class Particle {
+            constructor() {
+                this.pos = createVector(random(width), random(height));
+                this.vel = createVector(0, 0);
+                this.acc = createVector(0, 0);
+                this.maxSpeed = params.flowSpeed;
+                this.prevPos = this.pos.copy();
+                this.age = 0;
+                this.maxAge = random(100, 500);
+            }
+
+            follow(vectors) {
+                // Determine which cell this particle is in
+                let x = floor(this.pos.x / scl);
+                let y = floor(this.pos.y / scl);
+
+                // Constrain to field bounds
+                x = constrain(x, 0, cols - 1);
+                y = constrain(y, 0, rows - 1);
+
+                let index = x + y * cols;
+                let force = vectors[index];
+
+                if (force) {
+                    this.applyForce(force);
+                }
+            }
+
+            applyForce(force) {
+                this.acc.add(force);
+            }
+
+            update() {
+                this.vel.add(this.acc);
+                this.vel.limit(this.maxSpeed);
+                this.pos.add(this.vel);
+                this.acc.mult(0);
+
+                this.age++;
+
+                // Respawn if too old
+                if (this.age > this.maxAge) {
+                    this.pos = createVector(random(width), random(height));
+                    this.prevPos = this.pos.copy();
+                    this.age = 0;
+                    this.maxAge = random(100, 500);
+                }
+            }
+
+            show() {
+                // Color based on velocity magnitude
+                let speed = this.vel.mag();
+                let normalizedSpeed = map(speed, 0, this.maxSpeed, 0, 1);
+
+                // Interpolate between colors based on velocity
+                let c;
+                if (normalizedSpeed < 0.33) {
+                    // Low velocity - lerp between color3 and color2
+                    let t = map(normalizedSpeed, 0, 0.33, 0, 1);
+                    c = lerpColor(color(params.colorPalette[2]), color(params.colorPalette[1]), t);
+                } else if (normalizedSpeed < 0.67) {
+                    // Medium velocity - lerp between color2 and color1
+                    let t = map(normalizedSpeed, 0.33, 0.67, 0, 1);
+                    c = lerpColor(color(params.colorPalette[1]), color(params.colorPalette[0]), t);
+                } else {
+                    // High velocity - saturated color1
+                    c = color(params.colorPalette[0]);
+                }
+
+                // Apply alpha based on age for fade effect
+                let alpha = map(this.age, 0, this.maxAge, 150, 20);
+                c.setAlpha(alpha);
+
+                stroke(c);
+                strokeWeight(params.strokeWeight);
+                line(this.pos.x, this.pos.y, this.prevPos.x, this.prevPos.y);
+
+                this.updatePrev();
+            }
+
+            updatePrev() {
+                this.prevPos.x = this.pos.x;
+                this.prevPos.y = this.pos.y;
+            }
+
+            edges() {
+                // Wrap around edges
+                if (this.pos.x > width) {
+                    this.pos.x = 0;
+                    this.updatePrev();
+                }
+                if (this.pos.x < 0) {
+                    this.pos.x = width;
+                    this.updatePrev();
+                }
+                if (this.pos.y > height) {
+                    this.pos.y = 0;
+                    this.updatePrev();
+                }
+                if (this.pos.y < 0) {
+                    this.pos.y = height;
+                    this.updatePrev();
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // UI CONTROL HANDLERS
+        // ═══════════════════════════════════════════════════════════════════════
+
+        function updateParam(paramName, value) {
+            // Convert to appropriate type
+            value = parseFloat(value);
+            params[paramName] = value;
+
+            // Update display
+            document.getElementById(paramName + '-value').textContent = value;
+
+            // Handle special cases that need reinitialization
+            if (paramName === 'particleCount') {
+                initializeSystem();
+            } else if (paramName === 'flowSpeed') {
+                // Update max speed for all particles
+                for (let particle of particles) {
+                    particle.maxSpeed = value;
+                }
+            }
+        }
+
+        function updateColor(colorId, value) {
+            // Update color value display
+            document.getElementById(colorId + '-value').textContent = value;
+
+            // Update in params
+            let index = parseInt(colorId.replace('color', '')) - 1;
+            params.colorPalette[index] = value;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // SEED CONTROL FUNCTIONS
+        // ═══════════════════════════════════════════════════════════════════════
+
+        function updateSeedDisplay() {
+            document.getElementById('seed-input').value = params.seed;
+        }
+
+        function updateSeed() {
+            let input = document.getElementById('seed-input');
+            let newSeed = parseInt(input.value);
+            if (newSeed && newSeed > 0) {
+                params.seed = newSeed;
+                initializeSystem();
+            } else {
+                updateSeedDisplay();
+            }
+        }
+
+        function previousSeed() {
+            params.seed = Math.max(1, params.seed - 1);
+            updateSeedDisplay();
+            initializeSystem();
+        }
+
+        function nextSeed() {
+            params.seed = params.seed + 1;
+            updateSeedDisplay();
+            initializeSystem();
+        }
+
+        function randomSeedAndUpdate() {
+            params.seed = Math.floor(Math.random() * 999999) + 1;
+            updateSeedDisplay();
+            initializeSystem();
+        }
+
+        function resetParameters() {
+            params = {...defaultParams};
+
+            // Update UI elements
+            document.getElementById('particleCount').value = params.particleCount;
+            document.getElementById('particleCount-value').textContent = params.particleCount;
+            document.getElementById('flowSpeed').value = params.flowSpeed;
+            document.getElementById('flowSpeed-value').textContent = params.flowSpeed;
+            document.getElementById('noiseScale').value = params.noiseScale;
+            document.getElementById('noiseScale-value').textContent = params.noiseScale;
+            document.getElementById('fieldEvolution').value = params.fieldEvolution;
+            document.getElementById('fieldEvolution-value').textContent = params.fieldEvolution;
+            document.getElementById('trailFade').value = params.trailFade;
+            document.getElementById('trailFade-value').textContent = params.trailFade;
+            document.getElementById('strokeWeight').value = params.strokeWeight;
+            document.getElementById('strokeWeight-value').textContent = params.strokeWeight;
+
+            // Reset colors
+            document.getElementById('color1').value = params.colorPalette[0];
+            document.getElementById('color1-value').textContent = params.colorPalette[0];
+            document.getElementById('color2').value = params.colorPalette[1];
+            document.getElementById('color2-value').textContent = params.colorPalette[1];
+            document.getElementById('color3').value = params.colorPalette[2];
+            document.getElementById('color3-value').textContent = params.colorPalette[2];
+
+            updateSeedDisplay();
+            initializeSystem();
+        }
+
+        // Initialize UI on load
+        window.addEventListener('load', function() {
+            updateSeedDisplay();
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,184 @@
+================================================================================
+LIGHTER WEBSOCKET COMPREHENSIVE LOGGING - IMPLEMENTATION SUMMARY
+================================================================================
+
+FILE MODIFIED:
+  f:/Dropbox/dexbot/perpdex/hedge/hedge_mode_bp.py
+
+FUNCTION:
+  handle_lighter_ws() - Lines 588-760
+
+CHANGES ADDED:
+  ✅ Lines 637-672: Universal message logging block
+  ✅ Lines 741-750: Enhanced account_orders handling
+
+================================================================================
+WHAT WAS ADDED
+================================================================================
+
+1. UNIVERSAL MESSAGE TYPE LOGGING (Immediately after message receipt)
+
+   Every WebSocket message now logs:
+   • Message type (e.g., "update/account_orders", "subscribed/order_book")
+   • Message-specific details (order counts, offsets, order details)
+
+   Log Marker: 📨 [LIGHTER WS]
+
+2. MESSAGE-TYPE-SPECIFIC HANDLERS
+
+   subscribed/order_book
+   └─ Logs subscription confirmation
+
+   subscribed/account_orders
+   └─ Logs subscription confirmation (verifies auth token worked)
+
+   update/order_book
+   └─ Logs: offset position, number of bids, number of asks
+
+   update/account_orders *** CRITICAL FOR DEBUGGING ***
+   ├─ Logs: which markets have orders
+   ├─ For each market:
+   │  └─ Logs: total order count
+   │     └─ For each order:
+   │        ├─ Order ID
+   │        ├─ Status (filled, pending, open, etc.)
+   │        ├─ Side (buy/sell)
+   │        ├─ Size
+   │        └─ Price
+
+   ping
+   └─ Logs ping received (pong will be sent)
+
+   [UNEXPECTED TYPES]
+   └─ Logs any unknown message types with full payload
+      (to discover if Lighter sends different message types)
+
+3. ENHANCED ACCOUNT ORDERS PROCESSING
+
+   When processing orders:
+   • Logs how many orders being processed
+   • For each order:
+     - Logs the order ID and current status
+     - If filled: INFO log ✅ [LIGHTER WS] Order FILLED: id=...
+     - If not filled: DEBUG log explaining why skipped
+
+================================================================================
+KEY INSIGHT: WHAT THIS WILL REVEAL
+================================================================================
+
+Before (Previous Code):
+  - No visibility into messages being received
+  - Account orders debug logs weren't showing
+  - Impossible to know what Lighter is actually sending
+  - Result: Can't diagnose why fills aren't detected
+
+After (New Code):
+  - SEE EVERY MESSAGE TYPE received
+  - See EVERY ORDER with its complete details
+  - See EVERY STATUS CHANGE including fills
+  - Immediate visibility of problems:
+    • Is WebSocket connecting?
+    • Is account orders subscription working?
+    • What message types are actually being sent?
+    • Are orders filling but status not updating?
+    • Is there an unknown message type we need to handle?
+
+================================================================================
+EXPECTED LOG OUTPUT DURING TEST
+================================================================================
+
+Connection & Subscription:
+  📨 [LIGHTER WS] Received message type: subscribed/order_book
+  📨 [LIGHTER WS] Subscription confirmation: subscribed to order book
+  📨 [LIGHTER WS] Received message type: subscribed/account_orders
+  📨 [LIGHTER WS] Subscription confirmation: subscribed to account orders
+
+Order Book Updates (periodic):
+  📨 [LIGHTER WS] Received message type: update/order_book
+  📨 [LIGHTER WS] Order book update - offset: 12345, bids: 50, asks: 48
+
+Order Fills (THE CRITICAL PART):
+  📨 [LIGHTER WS] Received message type: update/account_orders
+  📨 [LIGHTER WS] Account orders update received - Markets: ['0']
+  📨 [LIGHTER WS] Market 0: 1 orders
+  📨 [LIGHTER WS]   Order 0: id=ABC123, status=filled, side=buy, size=0.5, price=19.50
+  ✅ [LIGHTER WS] Order FILLED: id=ABC123
+
+Unexpected Messages (if any):
+  ⚠️  [LIGHTER WS] UNEXPECTED MESSAGE TYPE: unknown_type_xyz
+  ⚠️  [LIGHTER WS] Payload: {"type": "unknown_type_xyz", ...}
+
+================================================================================
+HOW TO USE FOR DEBUGGING
+================================================================================
+
+Test Scenario: Submit test order and watch logs
+
+Command to monitor:
+  tail -f hedge_mode_bp.log | grep "LIGHTER WS"
+
+What to look for:
+  1. Are ANY messages showing? (If not: connection problem)
+  2. Do you see "subscribed/account_orders"? (If not: auth problem)
+  3. Do you see "update/account_orders"? (If not: subscription problem)
+  4. When order fills, do you see "Order FILLED"? (If yes: working!)
+
+If order fills DON'T show:
+  grep "update/account_orders" hedge_mode_bp.log
+  └─ Check what status the order shows instead of "filled"
+  └─ May indicate order not matching or cancelled
+
+If NO "update/account_orders" messages appear:
+  grep "subscribed/account_orders" hedge_mode_bp.log
+  └─ If not found: Authentication failed
+  └─ Check for auth token errors in logs
+
+================================================================================
+TECHNICAL DETAILS
+================================================================================
+
+Log Levels:
+  📨 DEBUG: Every message type, low-importance updates
+  ℹ️  INFO: Subscription confirmations, order fills
+  ⚠️  WARNING: Unexpected message types, errors
+
+Message Extraction Points:
+  Line 638: Extract message type
+  Line 652-663: Extract order details from account_orders
+  Line 657-663: Log each individual order with all details
+
+Performance Impact:
+  Minimal - logging is synchronous
+  Only adds JSON serialization for unexpected types
+  No additional network calls
+
+Compatibility:
+  ✅ Verified syntax with py_compile
+  ✅ No changes to business logic
+  ✅ No changes to WebSocket protocol
+  ✅ Backward compatible with existing code
+
+================================================================================
+NEXT STEPS AFTER IMPLEMENTING
+================================================================================
+
+1. Run bot with new code
+2. Submit a test order
+3. Monitor logs: tail -f hedge_mode_bp.log | grep "LIGHTER WS"
+4. Check which scenario your logs match (see DIAGNOSTIC_GUIDE.md)
+5. Follow recommended actions for that scenario
+
+================================================================================
+FILES CREATED
+================================================================================
+
+1. LIGHTER_WS_LOGGING_CHANGES.md
+   └─ Detailed explanation of what was changed and why
+
+2. LIGHTER_WS_DIAGNOSTIC_GUIDE.md
+   └─ Troubleshooting guide for interpreting the new logging
+
+3. LIGHTER_WS_LOGGING_SUMMARY.txt (this file)
+   └─ Quick reference of changes and usage
+
+================================================================================

@@ -1,0 +1,7 @@
+{
+  "active": true,
+  "started_at": "2026-01-26T16:07:51.333Z",
+  "original_prompt": "/oh-my-claudecode:ultrawork 1. 문제점, 솔루션, 테스트 결과 문서화. 2. 커밋=로컬, 리모트, 1번 문서까지. 3. ETH, 1, 20회",
+  "reinforcement_count": 10,
+  "last_checked_at": "2026-01-27T02:03:29.189Z"
+}

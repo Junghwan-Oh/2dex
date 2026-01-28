@@ -1,0 +1,32 @@
+# C 드라이브 전체 차단
+C:\Users\crypto quant\.claude\**
+
+# 프로젝트 내 SuperClaude Framework 제거
+.claude/BUSINESS_*.md
+.claude/FLAGS.md
+.claude/RESEARCH_CONFIG.md
+
+# 불필요한 MODE 문서들 (hedge bot과 무관)
+.claude/MODE_Business_Panel.md
+.claude/MODE_Brainstorming.md
+.claude/MODE_DeepResearch.md
+.claude/MODE_Introspection.md
+.claude/MODE_Orchestration.md
+.claude/MODE_Token_Efficiency.md
+
+# 사용하지 않는 MCP 문서들
+.claude/MCP_Magic.md
+.claude/MCP_Morphllm.md
+.claude/MCP_Context7.md
+.claude/MCP_Playwright.md
+.claude/MCP_Tavily.md
+
+# E2E 테스트 가이드 (현재 작업과 무관)
+.claude/CLAUDE.md
+
+# 유지할 파일 (명시)
+# CLAUDE.md (프로젝트 루트) - Alfred 가이드
+# .claude/RULES.md
+# .claude/PRINCIPLES.md
+# .claude/MODE_Task_Management.md
+# .claude/MCP_Serena.md
