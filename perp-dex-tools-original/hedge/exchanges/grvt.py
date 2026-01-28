@@ -1273,11 +1273,11 @@ class GrvtClient(BaseExchangeClient):
             self.logger.warning(
                 f"[SMART_ROUTING] Order book analysis failed, using direct market order: {e}"
             )
-            # Use old method as fallback
+            # Use old method as fallback (simpler iterative approach)
             import time
-            start_time = time.time()
             total_filled = Decimal('0')
             iteration = 0
+            tick_offset = 0
 
             while total_filled < target_quantity:
                 iteration += 1
@@ -1287,20 +1287,15 @@ class GrvtClient(BaseExchangeClient):
                 remaining = target_quantity - total_filled
                 best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
-                tick_size = Decimal("0.01")
-                if side == "buy":
-                    base_price = best_ask
-                else:
-                    base_price = best_bid
-
-                adjusted_price = base_price + (tick_offset * tick_size) if side == "buy" else base_price - (tick_offset * tick_size)
+                # Use market price for fallback (no tick offset)
+                base_price = best_ask if side == "buy" else best_bid
 
                 order_result = await self._ws_rpc_submit_order(
                     symbol=contract_id,
                     order_type='market',
                     side=side,
                     amount=remaining,
-                    price=adjusted_price,
+                    price=base_price,
                     verify_with_rest=True
                 )
 
@@ -1328,8 +1323,6 @@ class GrvtClient(BaseExchangeClient):
                             'success': True
                         }
 
-                    tick_offset += 1
-
             return {
                 'total_filled': total_filled,
                 'total_fees': Decimal('0'),
@@ -1353,9 +1346,9 @@ class GrvtClient(BaseExchangeClient):
                 current_price = price_levels[level_index]['price']
             except Exception as e:
                 self.logger.warning(f"[SMART_ROUTING] Market data refresh failed: {e}")
-                # Continue with last known data if refresh fails
-                current_level_size = price_levels[level_index]['size']
-                current_price = price_levels[level_index]['price']
+                # Use BBO price directly as fallback
+                current_price = bbo['best_ask_price'] if side == 'buy' else bbo['best_bid_price']
+                current_level_size = bbo['best_ask_size'] if side == 'buy' else bbo['best_bid_size']
 
             # Try to fill ALL remaining quantity at current level
             if current_level_size >= remaining:
