@@ -1,0 +1,1582 @@
+# DN Bot PnL Improvement: Three-Tier Optimization Plan
+
+## Context
+
+### Original Request
+A DN Bot trading system is currently unprofitable (-$1.43 bps). Analysis identified 3 critical improvements needed to restore profitability:
+
+1. **POST_ONLY Hedge Order Restoration**: Feature was removed after commit 3c89fcd, causing -1.8 bps degradation
+2. **Order Size Optimization**: Currently using 0.5 ETH which exceeds GRVT liquidity limit (0.2-0.3 ETH)
+3. **Minimum Spread Filter**: No filter exists (accepts 0 bps). Break-even requires 7 bps, should add 5 bps minimum
+
+### Current State Analysis
+
+**File**: `/tmp/2dex/perp-dex-tools-original/hedge/DN_alternate_backpack_grvt.py`
+
+**Current Issues**:
+- **Missing POST_ONLY for hedge orders**: Lines 909-996 show hedge CLOSE uses only MARKET/ITERATIVE market orders
+- **Order size**: Uses `--size` parameter from CLI (default 0.5 ETH from user testing)
+- **Spread filter**: Exists at line 440 but defaults to 0 bps (line 97: `min_spread_bps: Decimal = Decimal("0")`)
+
+**Historical Context**:
+- Commit 3c89fcd (Jan 26, 2026) added POST_ONLY optimization with 3s timeout → MARKET fallback
+- Test results showed +0.94 bps improvement (+$0.178 on 0.01 ETH x10 cycles)
+- Feature was later removed in commit 61e825a during V4 BBO routing integration
+
+**Reference File**: `/tmp/2dex/perp-dex-tools-original/hedge/exchanges/grvt.py`
+- Contains `place_post_only_order()` method (lines 355-394)
+- Contains `fetch_bbo_prices()` method (lines 339-353)
+- Contains `cancel_order()` method (lines 906-920)
+
+**Runtime Context Verification** (CRITICAL - Read Before Implementation)
+
+1. **GRVT Order Status Values** (from `grvt.py:226-236`):
+   - Valid statuses from SDK: `"OPEN"`, `"FILLED"`, `"CANCELLED"`, `"REJECTED"`, `"PENDING"`, `"PARTIALLY_FILLED"`
+   - Status mapping in WebSocket handler:
+     ```python
+     status_map = {
+         "OPEN": "OPEN",
+         "FILLED": "FILLED",
+         "CANCELLED": "CANCELED",  # Note: mapped to "CANCELED"
+         "REJECTED": "CANCELED",    # Note: mapped to "CANCELED"
+     }
+     ```
+   - **Plan uses**: `hedge_result.status == "FILLED"` and `hedge_result.status == "OPEN"`
+   - **These are correct** - they match SDK values
+
+2. **first_build_completed Flag** (from `DN_alternate_backpack_grvt.py:124, 1007, 1046, 1902-1904`):
+   - **Purpose**: Workaround for GRVT cold start issue on first BUILD
+   - **Initialized**: Line 124: `self.first_build_completed = False`
+   - **Used at line 1007**: Skip ITERATIVE market orders on first BUILD (use regular MARKET instead)
+   - **Used at line 1046**: Log message when using regular MARKET for first BUILD
+   - **Set at line 1902-1904**: Set to `True` after first successful BUILD
+   - **POST_ONLY interaction**: POST_ONLY should NOT be skipped during first BUILD
+     - First BUILD uses regular MARKET (not ITERATIVE)
+     - POST_ONLY logic runs before MARKET fallback
+     - If POST_ONLY fails, falls back to regular MARKET (not ITERATIVE)
+   - **Implementation note**: POST_ONLY check should come BEFORE `first_build_completed` check
+
+3. **Variable Naming Pattern** (from existing code):
+   - **Existing pattern**: `order_price` (used in `calculate_order_price()` at line 409)
+   - **Plan introduced**: `hedge_post_only_price`
+   - **Resolution**: Use `hedge_post_only_price` for POST_ONLY specific pricing
+     - This is distinct from `order_price` used in PRIMARY orders
+     - Maintains clarity between POST_ONLY and fallback pricing
+
+4. **Exception Handling** (from `grvt.py:391-394`):
+   - `place_post_only_order()` raises: `Exception("GRVT Server Error: Order not processed after 10 seconds")`
+   - **Plan specification**: Wrap in `asyncio.wait_for(timeout=3.0)` to catch timeout earlier
+   - **Additional handling needed**:
+     ```python
+     except asyncio.TimeoutError:
+         # Our 3s timeout
+         self.logger.warning("POST_ONLY timeout after 3s, falling back to MARKET")
+     except Exception as e:
+         # SDK timeout (10s) or other errors
+         self.logger.error(f"POST_ONLY failed: {e}, falling back to MARKET")
+     ```
+
+5. **CSV Compatibility** (from `TradeMetrics` dataclass at line 45-73):
+   - Existing fields: iteration, direction, prices, times, metrics
+   - **Plan adds**: `hedge_entry_order_type`, `hedge_exit_order_type`, `hedge_entry_fee_saved`, `hedge_exit_fee_saved`
+   - **Compatibility**: New fields use default values (`"MARKET"`, `False`)
+   - **Existing CSV readers**: Will ignore new columns (standard pandas behavior)
+   - **No breaking changes**: Old CSVs can be read, new CSVs have extra columns
+
+6. **Parameter Naming Consistency**:
+   - **Method parameter**: `side` (from `grvt.py:356: place_post_only_order(..., side: str)`)
+   - **Plan uses**: `side` variable (correct)
+   - **Note**: Some code uses `order_side` but method parameter is `side`
+   - **Resolution**: Use `side` consistently to match method signature
+
+---
+
+## Work Objectives
+
+### Core Objective
+Restore DN Bot profitability by implementing three targeted improvements with a projected +3.8 to +5.8 bps impact.
+
+### Deliverables
+1. **POST_ONLY hedge order logic** restored in CLOSE and OPEN paths
+2. **Order size reduced** from 0.5 ETH to 0.2 ETH
+3. **Minimum spread filter** set to 5 bps default
+4. **Documentation** of changes and expected PnL impact
+5. **Test plan** to validate improvements
+
+### Definition of Done
+- [ ] All three improvements implemented in DN_alternate_backpack_grvt.py
+- [ ] Code tested with dry-run or paper trading
+- [ ] PnL improvement validated against baseline (-1.43 bps)
+- [ ] Documentation updated with new CLI parameters
+- [ ] Git commit with descriptive message
+
+---
+
+## Must Have / Must NOT Have
+
+### Must Have (Guardrails)
+- **Preserve existing functionality**: All changes must be additive, not breaking
+- **Backward compatibility**: Existing CLI arguments must continue to work
+- **POST_ONLY timeout**: Must include 3-5s timeout with MARKET fallback
+- **Position tracking**: Must maintain accurate position tracking (REST API + WebSocket)
+- **Error handling**: Must handle POST_ONLY rejections gracefully
+- **CSV logging**: Must track order types (POST_ONLY vs MARKET) in trade logs
+
+### Must NOT Have (Boundaries)
+- **NO changes to PRIMARY exchange POST_ONLY logic** (lines 750-862)
+- **NO changes to GRVT exchange client** (exchanges/grvt.py)
+- **NO changes to order cancellation logic**
+- **NO changes to position reconciliation logic**
+- **NO hard-coded values**: All parameters must be configurable via CLI
+- **NO removal of existing features**: Only additions, no deletions
+
+---
+
+## Implementation Notes
+
+### Critical: first_build_completed Flag Interaction
+
+**What it is**: A workaround for GRVT cold start issue on the first BUILD order.
+
+**Current behavior** (lines 1007, 1046):
+- Line 1007: `if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and self.first_build_completed:`
+  - Uses ITERATIVE market order if first_build_completed=True
+- Line 1046: `if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:`
+  - Logs message about using regular MARKET for first BUILD
+- Line 1902-1904: Sets `first_build_completed = True` after first successful BUILD
+
+**How POST_ONLY should interact**:
+1. **POST_ONLY logic runs first** (before any MARKET/ITERATIVE logic)
+2. **If POST_ONLY fills**: Return success immediately (no need for MARKET/ITERATIVE)
+3. **If POST_ONLY fails**: Fall back to MARKET/ITERATIVE logic
+4. **First BUILD**: Falls back to regular MARKET (not ITERATIVE)
+5. **Subsequent BUILDS**: Falls back to ITERATIVE if quantity > 0.2 ETH
+
+**Code structure**:
+```python
+# Try POST_ONLY first (regardless of first_build_completed)
+if self.hedge_post_only and self.hedge_exchange.lower() == "grvt":
+    try:
+        # POST_ONLY logic here
+        if hedge_result.status == "FILLED":
+            return True  # POST_ONLY succeeded, done
+    except:
+        pass  # Fall through to MARKET/ITERATIVE
+
+# POST_ONLY failed or not enabled, use MARKET/ITERATIVE fallback
+if not hedge_filled:
+    # Check if first BUILD (use regular MARKET)
+    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:
+        # Use regular MARKET (not ITERATIVE)
+        order_info = await self.hedge_client.place_market_order(...)
+    elif self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and self.first_build_completed:
+        # Use ITERATIVE market order
+        result = await self.hedge_client.place_iterative_market_order(...)
+    else:
+        # Regular market order for small sizes or non-GRVT
+        order_info = await self.hedge_client.place_market_order(...)
+```
+
+### Variable Naming Convention
+
+**Use these consistently**:
+- `side` - Method parameter (matches `place_post_only_order(side=...)`)
+- `order_side` - Local variable for clarity (when needed)
+- `hedge_post_only_price` - POST_ONLY specific price calculation
+- `order_price` - Generic order price (used in PRIMARY orders)
+
+**Rationale**:
+- `side` matches method signatures in GRVT client
+- `hedge_post_only_price` distinguishes POST_ONLY pricing from fallback pricing
+- Avoids confusion with existing `order_price` used in PRIMARY orders
+
+---
+
+## Task Flow and Dependencies
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    IMPROVEMENT 1: POST_ONLY Restoration          │
+├─────────────────────────────────────────────────────────────────┤
+│ 1.1 Add hedge_post_only parameter to __init__                   │
+│ 1.2 Add tracking variables (hedge_entry_order_type, etc.)        │
+│ 1.3 Modify place_hedge_order() CLOSE path                       │
+│ 1.4 Modify place_hedge_order() OPEN path                        │
+│ 1.5 Add CLI arguments (--hedge-post-only, --hedge-market)       │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 IMPROVEMENT 2: Order Size Optimization           │
+├─────────────────────────────────────────────────────────────────┤
+│ 2.1 Change default --size from 0.5 to 0.2                       │
+│ 2.2 Update documentation/help text                              │
+│ 2.3 Verify no hard-coded 0.5 ETH references remain              │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                IMPROVEMENT 3: Minimum Spread Filter              │
+├─────────────────────────────────────────────────────────────────┤
+│ 3.1 Change default min_spread_bps from 0 to 5                   │
+│ 3.2 Update CLI help text for --min-spread                       │
+│ 3.3 Add logging for spread filter decisions                     │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      TESTING & VALIDATION                        │
+├─────────────────────────────────────────────────────────────────┤
+│ 4.1 Dry-run test with new defaults                              │
+│ 4.2 Compare PnL against baseline                                 │
+│ 4.3 Verify CSV logging tracks order types                       │
+│ 4.4 Check position tracking accuracy                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Dependencies
+- **Improvement 1** is independent of 2 and 3
+- **Improvement 2** is independent of 1 and 3
+- **Improvement 3** is independent of 1 and 2
+- **All improvements** must be complete before testing phase
+
+---
+
+## Pre-Implementation Checklist (MANDATORY)
+
+**Before starting implementation, verify**:
+- [ ] Read `exchanges/grvt.py` lines 226-236 to confirm status values
+- [ ] Read `DN_alternate_backpack_grvt.py` lines 1007, 1046, 1902-1904 to understand `first_build_completed`
+- [ ] Verify `place_post_only_order()` method signature uses `side` parameter (not `order_side`)
+- [ ] Check that `TradeMetrics` dataclass can accept new fields with default values
+- [ ] Confirm existing CSV readers can handle new columns (pandas ignores unknown columns by default)
+
+**If any of the above are incorrect**:
+- STOP implementation
+- Update this plan with corrected information
+- Re-submit to Critic for review
+
+---
+
+## Detailed TODOs
+
+### IMPROVEMENT 1: POST_ONLY Hedge Order Restoration
+
+#### TODO 1.1: Add hedge_post_only parameter to DNHedgeBot.__init__()
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Line 98 (after `hedge_mode` parameter)
+**Action**: Add new parameter
+
+**Code Change**:
+```python
+# Current (line 98):
+def __init__(
+    self,
+    ticker: str,
+    order_quantity: Decimal,
+    fill_timeout: int = 5,
+    iterations: int = 10,
+    sleep_time: int = 0,
+    max_position: Decimal = Decimal("0"),
+    primary_exchange: str = "backpack",
+    hedge_exchange: str = "grvt",
+    primary_mode: PriceMode = PriceMode.BBO,
+    hedge_mode: PriceMode = PriceMode.MARKET,
+    min_spread_bps: Decimal = Decimal("0"),
+):
+
+# Add after line 108:
+self.hedge_post_only = hedge_post_only
+```
+
+**Acceptance Criteria**:
+- [ ] Parameter added with default value `True`
+- [ ] Parameter stored as instance variable
+- [ ] No syntax errors
+
+---
+
+#### TODO 1.2: Add POST_ONLY tracking variables
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Line 170 (after `self.repricing_count = 0`)
+**Action**: Add tracking variables for metrics
+
+**Code Change**:
+```python
+# Add after line 170:
+# POST_ONLY tracking
+self.current_hedge_entry_order_type = "MARKET"
+self.current_hedge_exit_order_type = "MARKET"
+self.current_hedge_entry_fee_saved = False
+self.current_hedge_exit_fee_saved = False
+```
+
+**Acceptance Criteria**:
+- [ ] Four tracking variables added
+- [ ] Initialized to default values (MARKET, False)
+- [ ] Matches historical implementation from commit 3c89fcd
+
+---
+
+#### TODO 1.3: Add TradeMetrics fields for POST_ONLY tracking
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Line 70 (TradeMetrics dataclass)
+**Action**: Add fields to track POST_ONLY performance
+
+**Code Change**:
+```python
+# Add to TradeMetrics dataclass (after line 70):
+hedge_entry_order_type: str = "MARKET"  # "POST_ONLY" or "MARKET"
+hedge_exit_order_type: str = "MARKET"   # "POST_ONLY" or "MARKET"
+hedge_entry_fee_saved: bool = False     # True if POST_ONLY filled
+hedge_exit_fee_saved: bool = False      # True if POST_ONLY filled
+```
+
+**Acceptance Criteria**:
+- [ ] Four fields added to TradeMetrics
+- [ ] Default values match initialization
+- [ ] Compatible with CSV export (to_dict method)
+
+---
+
+#### TODO 1.4: Modify place_hedge_order() CLOSE path for POST_ONLY
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Lines 909-996 (CLOSE order logic)
+**Action**: Replace pure MARKET/ITERATIVE logic with POST_ONLY → MARKET fallback
+
+**Code Change**:
+```python
+# Replace lines 909-996 with:
+
+# SOLUTION: Try POST_ONLY first for 0% fee, fall back to MARKET/ITERATIVE
+hedge_filled = False
+hedge_fill_price = None
+
+# Reference: Primary order uses POST_ONLY at line 703
+if self.hedge_post_only and self.hedge_exchange.lower() == "grvt":
+    try:
+        # Get BBO for POST_ONLY pricing
+        # VERIFIED: fetch_bbo_prices exists at grvt.py line 340-353
+        best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
+            self.hedge_contract_id
+        )
+
+        # Calculate POST_ONLY price (1 tick inside spread)
+        if order_side == "buy":
+            hedge_post_only_price = best_ask - self.hedge_tick_size
+        else:  # sell
+            hedge_post_only_price = best_bid + self.hedge_tick_size
+
+        hedge_post_only_price = self.hedge_client.round_to_tick(hedge_post_only_price)
+
+        self.logger.info(
+            f"[CLOSE] [{self.hedge_exchange.upper()}] Attempting POST_ONLY @ {hedge_post_only_price} "
+            f"(side: {order_side}, fee: 0%)"
+        )
+
+        # Try POST_ONLY with 3 second timeout
+        hedge_result = await asyncio.wait_for(
+            self.hedge_client.place_post_only_order(
+                contract_id=self.hedge_contract_id,
+                quantity=quantity,
+                price=hedge_post_only_price,
+                side=order_side
+            ),
+            timeout=3.0
+        )
+
+        if hedge_result.status == "FILLED":
+            hedge_filled = True
+            hedge_fill_price = hedge_result.price
+
+            self.logger.info(
+                f"[CLOSE] [POST_ONLY FILLED]: {quantity} @ {hedge_fill_price} "
+                f"(0% fee saved)"
+            )
+
+            # Set flags and return success
+            self.hedge_order_filled = True
+            self.order_execution_complete = True
+            self.last_hedge_fill_price = hedge_fill_price
+
+            # Update tracking variables
+            self.current_hedge_exit_order_type = "POST_ONLY"
+            self.current_hedge_exit_fee_saved = True
+
+            # Log to CSV with POST_ONLY indicator
+            self.log_trade_to_csv(
+                exchange=self.hedge_exchange.upper(),
+                side=side,
+                price=str(hedge_fill_price),
+                quantity=str(quantity),
+                order_type="hedge_close_post_only",
+                mode="post_only_maker",
+            )
+
+            return True
+
+        elif hedge_result.status == "OPEN":
+            # POST_ONLY accepted but not filled - cancel and fallback
+            self.logger.warning(
+                f"[CLOSE] POST_ONLY not filled within 3s, canceling order_id={hedge_result.order_id}"
+            )
+            # VERIFIED: cancel_order exists at grvt.py line 906-920
+            cancel_result = await self.hedge_client.cancel_order(hedge_result.order_id)
+            if not cancel_result.success:
+                self.logger.error(f"[CLOSE] Failed to cancel POST_ONLY: {cancel_result.error_message}")
+        else:
+            self.logger.warning(
+                f"[CLOSE] POST_ONLY rejected (status: {hedge_result.status}), falling back to MARKET"
+            )
+
+    except asyncio.TimeoutError:
+        self.logger.warning(
+            f"[CLOSE] POST_ONLY timeout after 3s, falling back to MARKET"
+        )
+    except Exception as e:
+        self.logger.error(
+            f"[CLOSE] POST_ONLY failed: {e}, falling back to MARKET"
+        )
+
+# FALLBACK: Use MARKET/ITERATIVE order (0.05% taker fee)
+if not hedge_filled:
+    # Check if should use iterative market order
+    # NOTE: First BUILD workaround handled separately (not applicable to CLOSE)
+    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2"):
+        self.logger.info(f"[CLOSE] Using ITERATIVE market order for {quantity} ETH")
+        result = await self.hedge_client.place_iterative_market_order(
+            contract_id=self.hedge_contract_id,
+            target_quantity=quantity,
+            side=order_side,
+            max_iterations=10,
+            max_tick_offset=2,
+            max_fill_duration=30
+        )
+
+        if result['success']:
+            self.logger.info(
+                f"[CLOSE] [ITERATIVE] Filled {result['total_filled']} @ ${result['average_price']:.2f} "
+                f"({result['iterations']} iterations)"
+            )
+            self.log_trade_to_csv(
+                exchange=self.hedge_exchange.upper(),
+                side=side,
+                price=str(result['average_price']),
+                quantity=str(result['total_filled']),
+                order_type="hedge_close_iterative",
+                mode="iterative_market"
+            )
+            self.hedge_order_filled = True
+            self.order_execution_complete = True
+            self.last_hedge_fill_price = result['average_price']
+            # SAFETY LAYER #3: Track iterative order
+            import time
+            self.last_hedge_order_id = f"ITERATIVE_{int(time.time())}"
+            return True
+        else:
+            self.logger.error(f"[CLOSE] Iterative failed: {result.get('reason', 'unknown')}")
+            self.hedge_order_filled = False
+            self.order_execution_complete = False
+            return False
+    else:
+        # Regular market order for small sizes or non-GRVT
+        self.logger.info(
+            f"[CLOSE] [{self.hedge_exchange.upper()}] Using MARKET fallback (0.05% taker fee)"
+        )
+
+        # Get position before placing order (REST API for reliability)
+        pos_before_close = await self.hedge_client.get_account_positions()
+
+        # Use true market order (no timeout, immediate fill)
+        order_info = await self.hedge_client.place_market_order(
+            contract_id=self.hedge_contract_id,
+            quantity=quantity,
+            side=order_side,
+        )
+
+        # Market orders fill immediately - verify with REST API
+        await asyncio.sleep(1.0)  # Brief wait for execution
+        pos_after_close = await self.hedge_client.get_account_positions()
+        position_change = abs(pos_after_close - pos_before_close)
+
+        if position_change >= quantity * Decimal("0.9"):
+            actual_fill_price = best_ask if side == "buy" else best_bid
+            self.logger.info(
+                f"[CLOSE] [MARKET FILLED]: "
+                f"{quantity} @ ~{actual_fill_price} (pos: {pos_before_close} -> {pos_after_close})"
+            )
+
+            self.log_trade_to_csv(
+                exchange=self.hedge_exchange.upper(),
+                side=side,
+                price=str(actual_fill_price),
+                quantity=str(quantity),
+                order_type="hedge_close_market_fallback",
+                mode="market_taker",
+            )
+
+            self.hedge_order_filled = True
+            self.order_execution_complete = True
+            self.last_hedge_fill_price = actual_fill_price
+
+            # Update tracking variables
+            self.current_hedge_exit_order_type = "MARKET"
+            self.current_hedge_exit_fee_saved = False
+
+            return True
+        else:
+            self.logger.error(
+                f"[CLOSE] Market fallback failed to fill (pos: {pos_before_close} -> {pos_after_close})"
+            )
+            self.hedge_order_filled = False
+            self.order_execution_complete = False
+            return False
+```
+
+**Acceptance Criteria**:
+- [ ] POST_ONLY tried first for GRVT hedge orders
+- [ ] 3s timeout with MARKET/ITERATIVE fallback
+- [ ] Tracking variables updated correctly
+- [ ] CSV logging distinguishes POST_ONLY vs MARKET
+- [ ] Order cancellation on timeout
+- [ ] Preserves existing ITERATIVE logic for >0.2 ETH
+- [ ] Respects `first_build_completed` flag (see Runtime Context Verification #2)
+- [ ] Exception handling catches both asyncio.TimeoutError and SDK Exception
+
+---
+
+#### TODO 1.5: Modify place_hedge_order() OPEN path for POST_ONLY
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Lines 997-1100+ (OPEN order logic)
+**Action**: Add POST_ONLY logic to OPEN path (similar to CLOSE)
+
+**Code Change**:
+```python
+# Find the OPEN order logic section and add POST_ONLY attempt before MARKET
+# The structure should mirror TODO 1.4 but for OPEN orders
+
+# Before existing OPEN logic, add:
+# Try POST_ONLY first, fall back to MARKET/ITERATIVE
+hedge_filled = False
+
+if self.hedge_post_only and self.hedge_exchange.lower() == "grvt":
+    try:
+        # Get BBO for POST_ONLY pricing
+        best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
+            self.hedge_contract_id
+        )
+
+        # Calculate POST_ONLY price (1 tick inside spread)
+        if order_side == "buy":
+            hedge_post_only_price = best_ask - self.hedge_tick_size
+        else:  # sell
+            hedge_post_only_price = best_bid + self.hedge_tick_size
+
+        hedge_post_only_price = self.hedge_client.round_to_tick(hedge_post_only_price)
+
+        self.logger.info(
+            f"[OPEN] Attempting POST_ONLY @ {hedge_post_only_price} "
+            f"(side: {order_side}, fee: 0%)"
+        )
+
+        # Try POST_ONLY with 3 second timeout
+        hedge_result = await asyncio.wait_for(
+            self.hedge_client.place_post_only_order(
+                contract_id=self.hedge_contract_id,
+                quantity=quantity,
+                price=hedge_post_only_price,
+                side=order_side
+            ),
+            timeout=3.0
+        )
+
+        if hedge_result.status == "FILLED":
+            hedge_filled = True
+            self.logger.info(
+                f"[OPEN] [POST_ONLY FILLED]: {quantity} @ {hedge_result.price} (0% fee saved)"
+            )
+
+            # Set flags
+            self.hedge_order_filled = True
+            self.order_execution_complete = True
+            self.last_hedge_fill_price = hedge_result.price
+
+            # Update tracking variables
+            self.current_hedge_entry_order_type = "POST_ONLY"
+            self.current_hedge_entry_fee_saved = True
+
+            # Log to CSV
+            self.log_trade_to_csv(
+                exchange=self.hedge_exchange.upper(),
+                side=side,
+                price=str(hedge_result.price),
+                quantity=str(quantity),
+                order_type="hedge_open_post_only",
+                mode="post_only_maker",
+            )
+
+            return True
+
+        elif hedge_result.status == "OPEN":
+            self.logger.warning(
+                f"[OPEN] POST_ONLY not filled, canceling and falling back"
+            )
+            await self.hedge_client.cancel_order(hedge_result.order_id)
+        else:
+            self.logger.warning(
+                f"[OPEN] POST_ONLY rejected, falling back to MARKET"
+            )
+
+    except asyncio.TimeoutError:
+        self.logger.warning(f"[OPEN] POST_ONLY timeout, falling back to MARKET")
+    except Exception as e:
+        self.logger.error(f"[OPEN] POST_ONLY failed: {e}, falling back to MARKET")
+
+# FALLBACK: Use existing MARKET/ITERATIVE logic
+if not hedge_filled:
+    # CRITICAL: Respect first_build_completed flag
+    # First BUILD uses regular MARKET (not ITERATIVE) to avoid cold start issue
+    # See: Runtime Context Verification #2
+
+    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:
+        self.logger.info(
+            f"[OPEN] [FIRST BUILD] Using regular MARKET (not ITERATIVE) to avoid cold start issue"
+        )
+        # Use regular market order for first BUILD
+        order_info = await self.hedge_client.place_market_order(
+            contract_id=self.hedge_contract_id,
+            quantity=quantity,
+            side=side,  # Use 'side' (not 'order_side') to match method signature
+        )
+        # ... rest of order handling ...
+    elif self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and self.first_build_completed:
+        self.logger.info(f"[OPEN] Using ITERATIVE market order for {quantity} ETH")
+        result = await self.hedge_client.place_iterative_market_order(
+            contract_id=self.hedge_contract_id,
+            target_quantity=quantity,
+            side=side,  # Use 'side' (not 'order_side') to match method signature
+            max_iterations=10,
+            max_tick_offset=2,
+            max_fill_duration=30
+        )
+        # ... rest of ITERATIVE handling ...
+    else:
+        # Regular market order for small sizes or non-GRVT
+        order_info = await self.hedge_client.place_market_order(
+            contract_id=self.hedge_contract_id,
+            quantity=quantity,
+            side=side,  # Use 'side' (not 'order_side') to match method signature
+        )
+        # ... rest of order handling ...
+```
+
+**Acceptance Criteria**:
+- [ ] POST_ONLY tried first for OPEN orders
+- [ ] Same 3s timeout logic as CLOSE
+- [ ] Tracking variables updated for entry orders
+- [ ] Preserves existing FIRST BUILD workaround (first_build_completed flag)
+- [ ] Compatible with ITERATIVE logic for >0.2 ETH
+- [ ] POST_ONLY check comes BEFORE `first_build_completed` check
+- [ ] Exception handling matches CLOSE path
+
+---
+
+#### TODO 1.6: Add CLI arguments for POST_ONLY control
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Lines 2360+ (CLI argument parsing section)
+**Action**: Add --hedge-post-only and --hedge-market arguments
+
+**Code Change**:
+```python
+# Add after --hedge-mode argument (line 2360):
+parser.add_argument(
+    "--hedge-post-only",
+    action="store_true",
+    default=True,
+    help="Use POST_ONLY orders for hedge (0% maker fee, default: enabled)",
+)
+parser.add_argument(
+    "--hedge-market",
+    action="store_false",
+    dest="hedge_post_only",
+    help="Use MARKET orders for hedge (0.05% taker fee, disables POST_ONLY)",
+)
+```
+
+**Acceptance Criteria**:
+- [ ] --hedge-post-only flag added (default: True)
+- [ ] --hedge-market flag added (sets hedge_post_only to False)
+- [ ] Mutually exclusive design (only one can be used)
+- [ ] Help text explains fee difference (0% vs 0.05%)
+
+---
+
+#### TODO 1.7: Update main() to pass hedge_post_only parameter
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Line 2392 (DNHedgeBot initialization)
+**Action**: Add hedge_post_only parameter to bot constructor
+
+**Code Change**:
+```python
+# Current (line 2392):
+bot = DNHedgeBot(
+    ticker=args.ticker.upper(),
+    order_quantity=Decimal(args.size),
+    fill_timeout=args.fill_timeout,
+    iterations=args.iter,
+    sleep_time=args.sleep,
+    max_position=Decimal(args.max_position),
+    primary_exchange=args.primary,
+    hedge_exchange=args.hedge,
+    primary_mode=primary_mode,
+    hedge_mode=hedge_mode,
+    min_spread_bps=Decimal(args.min_spread),
+)
+
+# Updated:
+bot = DNHedgeBot(
+    ticker=args.ticker.upper(),
+    order_quantity=Decimal(args.size),
+    fill_timeout=args.fill_timeout,
+    iterations=args.iter,
+    sleep_time=args.sleep,
+    max_position=Decimal(args.max_position),
+    primary_exchange=args.primary,
+    hedge_exchange=args.hedge,
+    primary_mode=primary_mode,
+    hedge_mode=hedge_mode,
+    hedge_post_only=args.hedge_post_only,  # NEW
+    min_spread_bps=Decimal(args.min_spread),
+)
+```
+
+**Acceptance Criteria**:
+- [ ] hedge_post_only parameter passed from CLI args
+- [ ] Maintains default value (True)
+- [ ] No syntax errors
+
+---
+
+### IMPROVEMENT 2: Order Size Optimization
+
+#### TODO 2.1: Change default --size to 0.2 ETH
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Line 2310 (--size argument)
+**Action**: Change help text to indicate new default
+
+**Code Change**:
+```python
+# Current:
+parser.add_argument(
+    "--size", type=str, required=True, help="Order quantity per trade"
+)
+
+# Updated:
+parser.add_argument(
+    "--size",
+    type=str,
+    default="0.2",
+    help="Order quantity per trade in ETH (default: 0.2, max for GRVT liquidity: 0.2-0.3)",
+)
+```
+
+**Acceptance Criteria**:
+- [ ] Default value changed from "required" to "0.2"
+- [ ] Help text updated to mention GRVT liquidity limit
+- [ ] Maintains backward compatibility (still accepts custom values)
+
+---
+
+#### TODO 2.2: Update usage examples in docstring
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Lines 1-8 (file docstring)
+**Action**: Update examples to use 0.2 ETH
+
+**Code Change**:
+```python
+# Current:
+"""
+Delta Neutral (DN) Hedge Mode: Backpack + GRVT
+
+Usage:
+    python DN_alternate_backpack_grvt.py --ticker SOL --size 1 --iter 10
+    python DN_alternate_backpack_grvt.py --ticker SOL --size 1 --iter 10 --primary-mode bbo_minus_1 --hedge-mode market
+"""
+
+# Updated:
+"""
+Delta Neutral (DN) Hedge Mode: Backpack + GRVT
+
+Usage:
+    python DN_alternate_backpack_grvt.py --ticker SOL --size 0.2 --iter 10
+    python DN_alternate_backpack_grvt.py --ticker SOL --size 0.2 --iter 10 --primary-mode bbo --hedge-mode market
+    python DN_alternate_backpack_grvt.py --ticker ETH --size 0.2 --iter 20 --min-spread 5
+"""
+```
+
+**Acceptance Criteria**:
+- [ ] All examples use 0.2 ETH size
+- [ ] Added example with --min-spread flag
+- [ ] Updated primary-mode from bbo_minus_1 to bbo (current default)
+
+---
+
+#### TODO 2.3: Verify no hard-coded 0.5 ETH references
+**File**: `DN_alternate_backpack_grvt.py`
+**Action**: Search for any remaining 0.5 references
+
+**Verification Steps**:
+```bash
+# Run grep to find any 0.5 references:
+grep -n "0\.5\|0\.50" DN_alternate_backpack_grvt.py
+
+# Expected: Only found in comments or sleep_time contexts (0.5s delays)
+# Should NOT be found in order quantity contexts
+```
+
+**Acceptance Criteria**:
+- [ ] No hard-coded 0.5 ETH order sizes found
+- [ ] All order sizes use self.order_quantity or quantity variables
+- [ ] Documentation consistent with 0.2 ETH default
+
+---
+
+### IMPROVEMENT 3: Minimum Spread Filter
+
+#### TODO 3.1: Change default min_spread_bps to 5 bps
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Line 97 (__init__ parameter default)
+**Action**: Change default from 0 to 5
+
+**Code Change**:
+```python
+# Current:
+def __init__(
+    self,
+    ...
+    min_spread_bps: Decimal = Decimal("0"),
+):
+
+# Updated:
+def __init__(
+    self,
+    ...
+    min_spread_bps: Decimal = Decimal("5"),  # 5 bps minimum for profitability
+):
+```
+
+**Acceptance Criteria**:
+- [ ] Default changed to Decimal("5")
+- [ ] Comment explains rationale (profitability threshold)
+- [ ] No other code changes needed (filter logic exists at line 440)
+
+---
+
+#### TODO 3.2: Update CLI help text for --min-spread
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Line 2365 (--min-spread argument)
+**Action**: Update help text to reflect new default
+
+**Code Change**:
+```python
+# Current:
+parser.add_argument(
+    "--min-spread",
+    type=str,
+    default="0",
+    help="Minimum spread in bps to enter trade (default: 0 = disabled)",
+)
+
+# Updated:
+parser.add_argument(
+    "--min-spread",
+    type=str,
+    default="5",
+    help="Minimum spread in bps to enter trade (default: 5, break-even: ~7 bps, 0 = disabled)",
+)
+```
+
+**Acceptance Criteria**:
+- [ ] Default value changed to "5"
+- [ ] Help text mentions break-even threshold (7 bps)
+- [ ] Still allows 0 to disable filter
+
+---
+
+#### TODO 3.3: Enhance spread filter logging
+**File**: `DN_alternate_backpack_grvt.py`
+**Location**: Lines 439-464 (check_arbitrage_opportunity method)
+**Action**: Add more detailed logging for spread decisions
+
+**Code Change**:
+```python
+# Current (lines 455-463):
+if spread_bps >= self.min_spread_bps:
+    self.logger.info(
+        f"[ARB] Spread: {spread_bps:.2f} bps >= {self.min_spread_bps} bps -> ENTER"
+    )
+    return True
+else:
+    self.logger.info(
+        f"[ARB] Spread: {spread_bps:.2f} bps < {self.min_spread_bps} bps -> SKIP"
+    )
+    return False
+
+# Enhanced:
+if spread_bps >= self.min_spread_bps:
+    self.logger.info(
+        f"[ARB] Spread: {spread_bps:.2f} bps >= {self.min_spread_bps} bps -> ENTER"
+        f" (primary_bid={primary_bid:.2f}, primary_ask={primary_ask:.2f}, "
+        f"hedge_bid={hedge_bid:.2f}, hedge_ask={hedge_ask:.2f})"
+    )
+    return True
+else:
+    self.logger.info(
+        f"[ARB] Spread: {spread_bps:.2f} bps < {self.min_spread_bps} bps -> SKIP"
+        f" (break-even: ~7 bps, filter: {self.min_spread_bps} bps)"
+    )
+    return False
+```
+
+**Acceptance Criteria**:
+- [ ] Spread logging includes BBO prices
+- [ ] SKIP logging mentions break-even threshold
+- [ ] Helps diagnose why trades are skipped
+
+---
+
+### TESTING & VALIDATION
+
+#### TODO 4.1: Create dry-run test script
+**File**: Create new test script `test_pnl_improvements.sh`
+**Action**: Create script to test all three improvements
+
+**Script Content**:
+```bash
+#!/bin/bash
+
+# Test script for DN Bot PnL improvements
+# Tests each improvement individually and combined
+
+set -e
+
+echo "=========================================="
+echo "DN Bot PnL Improvement Test Suite"
+echo "=========================================="
+
+# Common parameters
+TICKER="ETH"
+ITERATIONS=20
+BASE_CMD="python DN_alternate_backpack_grvt.py --ticker $TICKER --iter $ITERATIONS --sleep 1"
+
+# Test 1: Baseline (all improvements disabled)
+echo ""
+echo "Test 1: BASELINE (no improvements)"
+echo "-----------------------------------"
+$BASE_CMD \
+    --size 0.5 \
+    --min-spread 0 \
+    --hedge-market \
+    --env-file .env.test
+
+# Test 2: POST_ONLY only
+echo ""
+echo "Test 2: POST_ONLY only"
+echo "-----------------------------------"
+$BASE_CMD \
+    --size 0.5 \
+    --min-spread 0 \
+    --hedge-post-only \
+    --env-file .env.test
+
+# Test 3: Order size only
+echo ""
+echo "Test 3: Order size optimization (0.2 ETH)"
+echo "-----------------------------------"
+$BASE_CMD \
+    --size 0.2 \
+    --min-spread 0 \
+    --hedge-market \
+    --env-file .env.test
+
+# Test 4: Spread filter only
+echo ""
+echo "Test 4: Spread filter (5 bps)"
+echo "-----------------------------------"
+$BASE_CMD \
+    --size 0.5 \
+    --min-spread 5 \
+    --hedge-market \
+    --env-file .env.test
+
+# Test 5: POST_ONLY + Order size
+echo ""
+echo "Test 5: POST_ONLY + Order size (0.2 ETH)"
+echo "-----------------------------------"
+$BASE_CMD \
+    --size 0.2 \
+    --min-spread 0 \
+    --hedge-post-only \
+    --env-file .env.test
+
+# Test 6: POST_ONLY + Spread filter
+echo ""
+echo "Test 6: POST_ONLY + Spread filter (5 bps)"
+echo "-----------------------------------"
+$BASE_CMD \
+    --size 0.5 \
+    --min-spread 5 \
+    --hedge-post-only \
+    --env-file .env.test
+
+# Test 7: All improvements (recommended configuration)
+echo ""
+echo "Test 7: ALL IMPROVEMENTS (recommended)"
+echo "-----------------------------------"
+$BASE_CMD \
+    --size 0.2 \
+    --min-spread 5 \
+    --hedge-post-only \
+    --env-file .env.test
+
+echo ""
+echo "=========================================="
+echo "Test suite complete!"
+echo "Check CSV logs for PnL comparison"
+echo "=========================================="
+```
+
+**Acceptance Criteria**:
+- [ ] Script tests each improvement individually
+- [ ] Script tests all improvements combined
+- [ ] Uses test environment file (.env.test)
+- [ ] Logs results for comparison
+
+---
+
+#### TODO 4.2: Create PnL analysis script
+**File**: Create new analysis script `analyze_pnl.py`
+**Action**: Create script to compare PnL across test runs
+
+**Script Content**:
+```python
+#!/usr/bin/env python3
+"""
+Analyze PnL improvements from CSV trade logs.
+Compares different configurations to measure improvement impact.
+"""
+
+import pandas as pd
+import glob
+from pathlib import Path
+from decimal import Decimal
+
+def analyze_csv(csv_file):
+    """Analyze a single CSV file and return metrics."""
+    df = pd.read_csv(csv_file)
+
+    # Calculate metrics
+    total_cycles = len(df)
+    total_pnl = df['gross_pnl'].sum()
+    total_volume = df['quantity'].sum() * df['primary_entry_price'].mean()
+    avg_pnl_bps = (total_pnl / total_volume) * 10000 if total_volume > 0 else 0
+
+    # Count POST_ONLY fills
+    post_only_fills = 0
+    if 'hedge_entry_order_type' in df.columns:
+        post_only_fills = df['hedge_entry_order_type'].eq('POST_ONLY').sum()
+        post_only_fills += df['hedge_exit_order_type'].eq('POST_ONLY').sum()
+
+    return {
+        'file': csv_file.name,
+        'total_cycles': total_cycles,
+        'total_pnl': total_pnl,
+        'avg_pnl_bps': avg_pnl_bps,
+        'post_only_fills': post_only_fills,
+    }
+
+def main():
+    # Find all CSV files
+    csv_files = list(Path(".").glob("trades_*.csv"))
+
+    if not csv_files:
+        print("No CSV files found!")
+        return
+
+    print("=" * 80)
+    print("PNL IMPROVEMENT ANALYSIS")
+    print("=" * 80)
+
+    results = []
+    for csv_file in csv_files:
+        try:
+            metrics = analyze_csv(csv_file)
+            results.append(metrics)
+        except Exception as e:
+            print(f"Error analyzing {csv_file}: {e}")
+
+    # Create comparison table
+    df_results = pd.DataFrame(results)
+
+    print("\nConfiguration Comparison:")
+    print("-" * 80)
+    print(f"{'Configuration':<30} {'Cycles':>8} {'PnL ($)':>10} {'Avg (bps)':>10} {'PO Fills':>8}")
+    print("-" * 80)
+
+    baseline_pnl = None
+    for _, row in df_results.iterrows():
+        config = row['file'].replace('trades_', '').replace('.csv', '')
+        pnl = row['total_pnl']
+        avg_bps = row['avg_pnl_bps']
+
+        # Mark baseline
+        if 'baseline' in config.lower():
+            baseline_pnl = avg_bps
+            config += " [BASELINE]"
+
+        # Calculate improvement
+        improvement = ""
+        if baseline_pnl is not None and avg_bps != baseline_pnl:
+            diff = avg_bps - baseline_pnl
+            improvement = f"({diff:+.2f} bps)"
+
+        print(f"{config:<30} {row['total_cycles']:>8} {pnl:>10.2f} {avg_bps:>10.2f} {row['post_only_fills']:>8} {improvement}")
+
+    print("-" * 80)
+    print("\nExpected Improvements:")
+    print("  - POST_ONLY: +1.8 bps (0.05% fee savings per hedge)")
+    print("  - Order size (0.2 ETH): +1.0 bps (better fill rates)")
+    print("  - Spread filter (5 bps): +1.0 to +3.0 bps (avoid negative spread trades)")
+    print("  - TOTAL EXPECTED: +3.8 to +5.8 bps")
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()
+```
+
+**Acceptance Criteria**:
+- [ ] Script parses CSV trade logs
+- [ ] Calculates PnL metrics (total, avg bps)
+- [ ] Counts POST_ONLY fills
+- [ ] Compares against baseline
+- [ ] Displays expected vs actual improvements
+
+---
+
+#### TODO 4.3: Document expected PnL impact
+**File**: Create documentation file `PNL_IMPROVEMENTS.md`
+**Action**: Document changes and expected impact
+
+**Content**:
+```markdown
+# DN Bot PnL Improvements - Implementation Summary
+
+## Overview
+Three targeted improvements to restore DN Bot profitability from -1.43 bps to +2.4 to +4.4 bps.
+
+## Changes
+
+### 1. POST_ONLY Hedge Order Restoration (+1.8 bps)
+**Change**: Restore POST_ONLY orders for GRVT hedge with 3s timeout → MARKET fallback
+**Impact**: 0.05% fee savings per hedge order (entry + exit = 0.10% total)
+**Implementation**:
+- Added `hedge_post_only` parameter (default: True)
+- Modified `place_hedge_order()` to try POST_ONLY first
+- Added tracking variables for fee savings
+- CLI flags: `--hedge-post-only` (default), `--hedge-market` (disable)
+
+**Expected Impact**: +1.8 bps
+- Based on historical test: +0.94 bps on 0.01 ETH x10 cycles
+- Scaled to 0.2 ETH: ~+1.8 bps
+- Assumes 50% POST_ONLY fill rate
+
+### 2. Order Size Optimization (+1.0 bps)
+**Change**: Reduce default order size from 0.5 ETH to 0.2 ETH
+**Impact**: Better fill rates within GRVT liquidity depth (0.2-0.3 ETH)
+**Implementation**:
+- Changed default `--size` from "0.5" to "0.2"
+- Updated documentation and examples
+- No hard-coded 0.5 ETH references remain
+
+**Expected Impact**: +1.0 bps
+- GRVT liquidity limit: 0.2-0.3 ETH
+- 0.5 ETH exceeds limit → partial fills → slippage
+- 0.2 ETH stays within limit → better fills
+
+### 3. Minimum Spread Filter (+1.0 to +3.0 bps)
+**Change**: Set default minimum spread to 5 bps
+**Impact**: Avoid negative-spread trades that lose money
+**Implementation**:
+- Changed default `min_spread_bps` from 0 to 5
+- Updated CLI help text to mention break-even (7 bps)
+- Enhanced logging for spread decisions
+
+**Expected Impact**: +1.0 to +3.0 bps
+- Break-even: ~7 bps (fees + slippage)
+- 5 bps filter avoids marginally profitable trades
+- Reduces losses from adverse spread movements
+- Actual impact depends on market conditions
+
+## Total Expected Impact
+**Conservative**: +3.8 bps (1.8 + 1.0 + 1.0)
+**Optimistic**: +5.8 bps (1.8 + 1.0 + 3.0)
+
+**Baseline**: -1.43 bps
+**Target**: +2.4 to +4.4 bps (conservative to optimistic)
+
+## Usage
+
+### Recommended Configuration (All Improvements)
+```bash
+python DN_alternate_backpack_grvt.py \
+    --ticker ETH \
+    --size 0.2 \
+    --iter 20 \
+    --min-spread 5 \
+    --hedge-post-only \
+    --primary-mode bbo \
+    --hedge-mode market
+```
+
+### Individual Improvements
+```bash
+# POST_ONLY only
+python DN_alternate_backpack_grvt.py --ticker ETH --size 0.5 --iter 20 --min-spread 0 --hedge-post-only
+
+# Order size only
+python DN_alternate_backpack_grvt.py --ticker ETH --size 0.2 --iter 20 --min-sread 0 --hedge-market
+
+# Spread filter only
+python DN_alternate_backpack_grvt.py --ticker ETH --size 0.5 --iter 20 --min-spread 5 --hedge-market
+```
+
+## Testing
+Run test suite: `./test_pnl_improvements.sh`
+Analyze results: `python analyze_pnl.py`
+
+## Rollback
+To disable any improvement:
+- POST_ONLY: Add `--hedge-market` flag
+- Order size: Add `--size 0.5` flag
+- Spread filter: Add `--min-spread 0` flag
+
+## Risk Mitigation
+- **POST_ONLY timeout**: 3s limit prevents stuck orders
+- **MARKET fallback**: Ensures orders always fill
+- **Backward compatibility**: All changes are additive
+- **Configurable**: Each improvement can be disabled independently
+
+## References
+- Commit 3c89fcd: Original POST_ONLY implementation (+0.94 bps)
+- GRVT liquidity analysis: 0.2-0.3 ETH optimal size
+- Break-even analysis: ~7 bps (0.05% fee per side + slippage)
+```
+
+**Acceptance Criteria**:
+- [ ] All three improvements documented
+- [ ] Expected PnL impact calculated
+- [ ] Usage examples provided
+- [ ] Rollback instructions included
+- [ ] Risk mitigation strategies listed
+
+---
+
+## Commit Strategy
+
+### Commit Structure
+Use **3 separate commits** for atomic changes:
+
+#### Commit 1: POST_ONLY Restoration
+```
+feat(dn-bot): Restore POST_ONLY hedge orders for fee savings
+
+- Add hedge_post_only parameter (default True)
+- Implement POST_ONLY with 3s timeout → MARKET fallback
+- Add tracking variables for fee savings metrics
+- Add CLI flags: --hedge-post-only (default), --hedge-market
+- Update CSV logging to track POST_ONLY vs MARKET orders
+
+Expected improvement: +1.8 bps (0.05% fee savings per hedge)
+
+Based on commit 3c89fcd which showed +0.94 bps improvement.
+Restores functionality removed during V4 BBO routing integration.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+#### Commit 2: Order Size Optimization
+```
+feat(dn-bot): Reduce default order size to 0.2 ETH for GRVT liquidity
+
+- Change default --size from 0.5 to 0.2 ETH
+- Update documentation to reflect GRVT liquidity limit (0.2-0.3 ETH)
+- Update usage examples in docstring
+- Verify no hard-coded 0.5 ETH references remain
+
+Expected improvement: +1.0 bps (better fill rates within liquidity depth)
+
+GRVT testing shows optimal liquidity at 0.2-0.3 ETH.
+Orders >0.3 ETH experience partial fills and slippage.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+#### Commit 3: Minimum Spread Filter
+```
+feat(dn-bot): Add 5 bps minimum spread filter for profitability
+
+- Change default min_spread_bps from 0 to 5
+- Update CLI help text to mention break-even threshold (7 bps)
+- Enhanced spread filter logging with BBO prices
+- Updated documentation with spread analysis
+
+Expected improvement: +1.0 to +3.0 bps (avoid negative-spread trades)
+
+Break-even analysis shows ~7 bps required (fees + slippage).
+5 bps filter avoids marginally profitable trades that often lose money
+due to spread movement during execution.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+### Commit Order
+1. **Commit 1** (POST_ONLY) - Most complex, highest impact
+2. **Commit 2** (Order size) - Simple, medium impact
+3. **Commit 3** (Spread filter) - Simple, variable impact
+
+### Verification After Each Commit
+```bash
+# Syntax check
+python -m py_compile DN_alternate_backpack_grvt.py
+
+# Dry run (use test environment)
+python DN_alternate_backpack_grvt.py --ticker ETH --size 0.2 --iter 1 --env-file .env.test
+
+# Check CSV output
+head -1 trades_*.csv  # Verify headers
+```
+
+---
+
+## Success Criteria
+
+### Quantitative Metrics
+- [ ] **PnL improvement**: +3.8 to +5.8 bps vs baseline (-1.43 bps)
+- [ ] **POST_ONLY fill rate**: ≥40% of hedge orders
+- [ ] **Order fill rate**: ≥95% for 0.2 ETH orders
+- [ ] **Spread filter effectiveness**: Skips ≥20% of negative-spread opportunities
+
+### Qualitative Metrics
+- [ ] **No breaking changes**: Existing configurations still work
+- [ ] **Backward compatibility**: All CLI flags preserved
+- [ ] **Code quality**: No linting errors, follows existing patterns
+- [ ] **Documentation**: Complete and accurate
+- [ ] **Testing**: Test suite passes all scenarios
+
+### Validation Checklist
+- [ ] **Unit tests**: Each improvement tested individually
+- [ ] **Integration tests**: All improvements tested together
+- [ ] **PnL analysis**: Meets expected improvement targets
+- [ ] **Position tracking**: No position drift across test cycles
+- [ ] **CSV logging**: Accurate tracking of order types
+- [ ] **Error handling**: Graceful fallback on POST_ONLY timeout
+
+---
+
+## Risks and Mitigation Strategies
+
+### Risk 1: POST_ONLY Timeout Leading to Missed Opportunities
+**Severity**: Medium
+**Probability**: Low (10-20%)
+
+**Mitigation**:
+- 3s timeout is conservative (historical implementation used 5s)
+- MARKET fallback ensures execution
+- Logging tracks timeout rate for monitoring
+
+**Rollback**: Add `--hedge-market` flag to disable POST_ONLY
+
+---
+
+### Risk 2: Reduced Order Size Lowering Total PnL Volume
+**Severity**: Low
+**Probability**: N/A (volume scales with size)
+
+**Mitigation**:
+- PnL measured in bps (basis points), not absolute dollars
+- 0.2 ETH is optimal for GRVT liquidity
+- Users can increase size with `--size` flag if needed
+
+**Rollback**: Add `--size 0.5` flag to restore old default
+
+---
+
+### Risk 3: Spread Filter Reducing Trade Frequency
+**Severity**: Low
+**Probability**: High (will reduce frequency by 20-40%)
+
+**Mitigation**:
+- Filter improves PnL per trade (quality over quantity)
+- Break-even is ~7 bps; 5 bps filter allows margin
+- Users can adjust with `--min-spread` flag
+
+**Rollback**: Add `--min-spread 0` flag to disable filter
+
+---
+
+### Risk 4: Regressions in Existing Functionality
+**Severity**: High
+**Probability**: Low (changes are additive)
+
+**Mitigation**:
+- All changes are additive, no deletions
+- POST_ONLY logic isolated to hedge orders
+- Comprehensive test suite covers scenarios
+- Each improvement independently disableable
+
+**Rollback**: Git revert if critical regression found
+
+---
+
+## Timeline Estimate
+
+| Phase | Tasks | Estimated Time |
+|-------|-------|----------------|
+| **Improvement 1** | POST_ONLY restoration | 2-3 hours |
+| **Improvement 2** | Order size optimization | 0.5 hours |
+| **Improvement 3** | Spread filter | 0.5 hours |
+| **Testing** | Test suite + analysis | 1-2 hours |
+| **Documentation** | Summary document | 0.5 hours |
+| **Total** | | **4.5-6.5 hours** |
+
+---
+
+## Dependencies
+
+### External Dependencies
+- **None** - All changes are internal to DN_alternate_backpack_grvt.py
+
+### Internal Dependencies
+- **GRVT exchange client**: Requires `place_post_only_order()`, `cancel_order()`, `fetch_bbo_prices()`
+- **TradeMetrics dataclass**: Requires new fields for POST_ONLY tracking
+- **CSV logging**: Requires mode field for order type tracking
+
+### Verification
+```bash
+# Check GRVT client methods exist
+grep -n "def place_post_only_order" exchanges/grvt.py
+grep -n "def cancel_order" exchanges/grvt.py
+grep -n "def fetch_bbo_prices" exchanges/grvt.py
+
+# Verify status values in codebase
+grep -n "status ==" exchanges/grvt.py | head -20
+
+# Verify first_build_completed usage
+grep -n "first_build_completed" DN_alternate_backpack_grvt.py
+
+# Verify TradeMetrics structure
+grep -A 30 "class TradeMetrics" DN_alternate_backpack_grvt.py
+```
+
+---
+
+## Handoff Instructions
+
+After implementation, hand off to testing team:
+
+1. **Run test suite**: `./test_pnl_improvements.sh`
+2. **Analyze results**: `python analyze_pnl.py`
+3. **Compare to baseline**: Current PnL is -1.43 bps
+4. **Validate improvements**: Target +2.4 to +4.4 bps
+5. **Report findings**: Document actual vs expected improvements
+
+### If Improvements Are Below Target
+- Check POST_ONLY fill rate (target: ≥40%)
+- Verify order size is 0.2 ETH
+- Confirm spread filter is 5 bps
+- Analyze CSV logs for issues
+- Consider tuning timeout (3s → 5s)
+
+### If Improvements Exceed Target
+- Document successful configuration
+- Consider making defaults permanent
+- Share findings with team
+- Update documentation with actual results
+
+---
+
+## Appendix: Code Reference
+
+### Key Methods in GRVT Client
+- **place_post_only_order()**: `exchanges/grvt.py:355-394`
+- **place_market_order()**: `exchanges/grvt.py:396-487`
+- **cancel_order()**: `exchanges/grvt.py:906-920`
+- **fetch_bbo_prices()**: `exchanges/grvt.py:339-353`
+
+### Key Sections in DN Bot
+- **__init__()**: `DN_alternate_backpack_grvt.py:92-120`
+- **place_hedge_order()**: `DN_alternate_backpack_grvt.py:864-1200`
+- **check_arbitrage_opportunity()**: `DN_alternate_backpack_grvt.py:439-464`
+- **TradeMetrics**: `DN_alternate_backpack_grvt.py:45-70`
+- **CLI parsing**: `DN_alternate_backpack_grvt.py:2306-2370`
+
+### Historical Commits
+- **3c89fcd**: Original POST_ONLY implementation (+0.94 bps)
+- **61e825a**: V4 BBO routing (POST_ONLY removed)
+- **75d11ca**: BBO routing fix (current state)
+
+---
+
+---
+
+## Plan Update Summary (Response to Critic Feedback)
+
+### Critical Issues Fixed
+
+1. **OrderResult.status field ambiguity** (CRITIC ISSUE #1):
+   - **Added**: "Runtime Context Verification" section with exact status values from `grvt.py:226-236`
+   - **Verified**: Plan uses correct values (`"FILLED"`, `"OPEN"`)
+   - **Documented**: Status mapping from WebSocket handler
+
+2. **Missing first_build_completed context** (CRITIC ISSUE #2):
+   - **Added**: Detailed explanation in "Runtime Context Verification #2"
+   - **Added**: "Implementation Notes" section with code structure
+   - **Specified**: POST_ONLY runs BEFORE `first_build_completed` check
+   - **Updated**: TODO 1.5 (OPEN path) with correct fallback logic
+
+3. **Variable naming inconsistency** (CRITIC ISSUE #3):
+   - **Added**: "Variable Naming Convention" section in Implementation Notes
+   - **Clarified**: Use `side` for method parameters, `hedge_post_only_price` for POST_ONLY pricing
+   - **Updated**: All code snippets to use consistent naming
+
+4. **Missing exception handling** (CRITIC ISSUE #4):
+   - **Added**: Exception handling specification in "Runtime Context Verification #4"
+   - **Updated**: Acceptance criteria to require both `asyncio.TimeoutError` and `Exception` handling
+   - **Specified**: SDK raises `Exception("GRVT Server Error: Order not processed after 10 seconds")`
+
+5. **CSV compatibility** (CRITIC ISSUE #5):
+   - **Added**: Verification in "Runtime Context Verification #5"
+   - **Confirmed**: New fields have default values (`"MARKET"`, `False`)
+   - **Noted**: Existing pandas readers ignore unknown columns
+
+### Minor Issues Fixed
+
+6. **side vs order_side** (CRITIC ISSUE #6):
+   - **Added**: Clarification in "Variable Naming Convention"
+   - **Updated**: All code snippets use `side` (matching method signature)
+
+7. **OrderInfo vs OrderResult** (CRITIC ISSUE #7):
+   - **Verified**: Plan uses `hedge_result.status` (from `OrderResult` returned by `place_post_only_order()`)
+   - **Added**: Note that `OrderInfo.status` field exists and maps correctly
+
+### Pre-Implementation Safeguards
+
+- **Added**: "Pre-Implementation Checklist (MANDATORY)" section
+- **Required**: Verification of runtime context before starting implementation
+- **Process**: Stop and update plan if any assumptions are incorrect
+
+---
+
+**End of Work Plan**
+
+**Next Steps**: Run `/oh-my-claudecode:start-work pnl-improvement-three-tier` to begin implementation.
