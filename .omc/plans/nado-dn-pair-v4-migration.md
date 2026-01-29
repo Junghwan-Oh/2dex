@@ -24,11 +24,15 @@ Migrate the proven V4 DN pair implementation (Backpack + GRVT) to Nado-only DN p
 
 **Nado-Specific Requirements:**
 - Replace all GRVT/Backpack references with Nado
-- Investigate Nado SDK WebSocket capabilities (NOT assumed)
-- Use Nado REST API as verified primary method
-- Verify Nado order types: POST_ONLY, IOC, FOK, DEFAULT
-- Handle Nado product IDs: ETH=?, SOL=? (VERIFY in Phase 0)
-- Tick sizes: ETH=?, SOL=? (VERIFY in Phase 0)
+- **IMPLEMENT WebSocket** (Nado DOES provide WebSocket - verified in official docs)
+- Use WebSocket PRIMARY + REST fallback for queries
+- WebSocket endpoints: `wss://gateway.test.nado.xyz/v1/ws`, `wss://gateway.test.nado.xyz/v1/subscribe`
+- Subscribe to: Fill, PositionChange, BookDepth, BestBidOffer, OrderUpdate streams
+- EIP-712 StreamAuthentication for WebSocket
+- Nado order types: POST_ONLY, IOC, FOK, DEFAULT (verified)
+- Nado product IDs: ETH=4, SOL=8 (verified)
+- Tick sizes: ETH=0.1, SOL=0.1 (verified)
+- Rate limits: 5 authenticated connections per wallet
 
 ### Success Criteria
 
@@ -57,13 +61,19 @@ Migrate the proven V4 DN pair implementation (Backpack + GRVT) to Nado-only DN p
 - `cancel_order()` - EXISTS in `/Users/botfarmer/2dex/exchanges/nado.py` (line 385) - NO NEED TO REIMPLEMENT
 
 **Current Nado Client (`/Users/botfarmer/2dex/exchanges/nado.py`)**:
-- WebSocket infrastructure: PARTIALLY IMPLEMENTED (lines 56-61: _ws_task, _ws_stop, _ws_connected, _order_fill_events)
-- `connect()` - EXISTS (line 70) but WebSocket NOT fully implemented
+- WebSocket infrastructure: DECLARED but NOT IMPLEMENTED (lines 56-61: _ws_task, _ws_stop, _ws_connected, _order_fill_events)
+- `connect()` - EXISTS (line 70) but WebSocket NOT implemented
 - `setup_order_update_handler()` - EXISTS (line 89) but placeholder implementation
 - `fetch_bbo_prices()` - EXISTS (line 96) with REST API
 - `get_order_info()` - EXISTS (line 546) with REST API
 - `get_account_positions()` - EXISTS (line 682) with REST API
-- `get_contract_attributes()` - EXISTS (line 707) - VERIFICATION NEEDED
+- `get_contract_attributes()` - EXISTS (line 707)
+
+**WebSocket Implementation Required:**
+- Nado official WebSocket: `wss://gateway.test.nado.xyz/v1/subscribe`
+- Streams: Fill, PositionChange, BookDepth (50ms), BestBidOffer (real-time), OrderUpdate
+- Authentication: EIP-712 StreamAuthentication format
+- SDK: `nado-protocol` PyPI package provides WebSocket support
 
 ### V4 Functions to Port (NOT in Nado yet)
 
@@ -88,35 +98,39 @@ Migrate the proven V4 DN pair implementation (Backpack + GRVT) to Nado-only DN p
              │                                │
     ┌────────▼────────┐              ┌────────▼────────┐
     │  NadoClient ETH │              │  NadoClient SOL │
-    │  - Product ID ?  │              │  - Product ID ?  │
+    │  - Product ID 4 │              │  - Product ID 8 │
     └────────┬────────┘              └────────┬────────┘
              │                                │
     ┌────────▼────────────────────────────────▼────────┐
     │         Nado SDK (nado_protocol)                  │
-    │  ┌──────────────┐        ┌──────────────┐        │
-    │  │ WebSocket?   │        │  REST API    │        │
-    │  │ VERIFY IN P0 │        │  - Engine    │        │
-    │  │              │        │  - Indexer   │        │
-    │  └──────────────┘        └──────────────┘        │
+    │  ┌──────────────────┐    ┌──────────────┐        │
+    │  │ WebSocket (PRI)  │    │ REST API     │        │
+    │  │ - Fill stream    │    │ - Queries    │        │
+    │  │ - PositionChange │    │ - Engine     │        │
+    │  │ - BookDepth 50ms │    │ - Indexer    │        │
+    │  │ - BBO real-time  │    │ - Fallback   │        │
+    │  └──────────────────┘    └──────────────┘        │
+    │  Endpoint: wss://gateway.test.nado.xyz/v1/subscribe│
+    │  Auth: EIP-712 StreamAuthentication                │
     └──────────────────────────────────────────────────┘
 ```
 
-### Data Flow (After Phase 0 Research)
+### Data Flow (With WebSocket Implementation)
 
 **BUILD Cycle (Entry):**
 1. Check safety limits (position, daily loss) - EXISTS, verify completeness
-2. Fetch BBO prices for both ETH and SOL - EXISTS, verify tick sizes
+2. Fetch BBO prices from WebSocket BestBidOffer stream - NEEDS IMPLEMENTATION
 3. Place simultaneous IOC orders - EXISTS, verify implementation
-4. Monitor fills via REST (WebSocket if available) - NEEDS ENHANCEMENT
-5. Reconcile positions - EXISTS, verify accuracy
+4. Monitor fills via WebSocket Fill stream - NEEDS IMPLEMENTATION
+5. Reconcile positions via WebSocket PositionChange stream - EXISTS, enhance with WebSocket
 6. Update metrics - PARTIALLY EXISTS, verify V4 parity
 
 **CLOSE Cycle (Exit):**
-1. Check current positions - EXISTS
-2. Fetch BBO prices - EXISTS
+1. Check current positions via PositionChange stream - EXISTS
+2. Fetch BBO prices from WebSocket - NEEDS IMPLEMENTATION
 3. Place POST_ONLY orders - EXISTS, verify timeout logic
 4. Fallback to MARKET if timeout - NEEDS VERIFICATION
-5. Monitor fills - NEEDS ENHANCEMENT
+5. Monitor fills via WebSocket Fill stream - NEEDS IMPLEMENTATION
 6. Reconcile positions, calculate PnL - EXISTS
 
 ---
@@ -171,10 +185,10 @@ def mock_nado_client():
     client.context.indexer_client = Mock()
     client.market = Mock()
 
-    # Mock contract attributes (from Phase 0 research)
+    # Mock contract attributes (verified from Nado documentation)
     client.get_contract_attributes = Mock(return_value={
-        'contract_id': 4,  # FROM_PHASE0: Update with actual ETH product ID
-        'tick_size': Decimal('0.01')  # FROM_PHASE0: Update with actual tick size
+        'contract_id': 4,  # ETH product ID (verified)
+        'tick_size': Decimal('0.1')  # ETH tick size (verified)
     })
 
     # Mock BBO prices
@@ -208,178 +222,135 @@ def mock_websocket_server():
 
 ---
 
-## PHASE 0: Nado SDK Research (PREREQUISITE)
+## PHASE 0: WebSocket & REST Integration Research (COMPLETED)
 
 **Goal**: Verify Nado SDK capabilities before ANY implementation
-**Duration**: 13 hours (updated with Sub-Feature 0.6)
-**Output**: Research document at `/Users/botfarmer/2dex/.omc/research/nado-sdk-capabilities.md`
+**Duration**: 8 hours (reduced - key info already verified from official docs)
+**Status**: Research information verified from official Nado documentation
 
-### Sub-Feature 0.1: WebSocket Capability Investigation
+### Already Verified Information
 
-**Research Tasks**:
-1. Check if `nado_protocol.client.create_nado_client()` provides WebSocket
-2. Verify WebSocket message format for order updates
-3. Test WebSocket subscription methods
-4. Document WebSocket connection lifecycle
+**WebSocket Capabilities** (VERIFIED):
+- WebSocket Gateway: `wss://gateway.test.nado.xyz/v1/ws`
+- Subscriptions: `wss://gateway.test.nado.xyz/v1/subscribe`
+- Authentication: EIP-712 StreamAuthentication format
+- SDK: `nado-protocol` PyPI package provides WebSocket support
+- Available Streams: OrderUpdate, Fill, PositionChange, BookDepth, BestBidOffer, Trade
 
-**Research Commands**:
-```bash
-# Explore Nado SDK structure
-python -c "from nado_protocol import client; import inspect; print(inspect.getmembers(client))"
+**Order Types** (VERIFIED):
+- POST_ONLY: Maker-only orders
+- IOC: Immediate-Or-Cancel
+- FOK: Fill-Or-Kill
+- DEFAULT: Standard limit order
 
-# Check for WebSocket-related modules
-python -c "from nado_protocol import client; c = create_nado_client('devnet', '0x' + '0'*64); print([m for m in dir(c) if 'ws' in m.lower() or 'websocket' in m.lower()])"
+**Product IDs** (VERIFIED):
+- ETH: Product ID 4
+- SOL: Product ID 8
+- Tick sizes: ETH=0.1, SOL=0.1
 
-# Check client methods
-python -c "from nado_protocol.client import create_nado_client; c = create_nado_client('devnet', '0x' + '0'*64); print([m for m in dir(c) if not m.startswith('_')])"
-```
+**Rate Limits** (VERIFIED):
+- 5 authenticated connections per wallet
+- 100 connections per IP
 
-**Documentation Requirements**:
-- WebSocket availability: YES/NO with evidence
-- WebSocket initialization code example
-- Message subscription code example
-- Known limitations or issues
+### Sub-Feature 0.1: WebSocket Integration Testing
 
-**Estimated Time**: 3 hours
-
----
-
-### Sub-Feature 0.2: Order Type Support Verification
-
-**Research Tasks**:
-1. Verify `OrderType.POST_ONLY` exists in `nado_protocol.utils.order`
-2. Verify `OrderType.IOC` (Immediate-Or-Cancel) exists
-3. Verify `OrderType.FOK` (Fill-Or-Kill) exists
-4. Verify `OrderType.DEFAULT` or MARKET equivalent
-5. Test order type parameters in `build_appendix()`
-
-**Research Commands**:
-```bash
-# Check OrderType enum
-python -c "from nado_protocol.utils.order import OrderType; print([o for o in dir(OrderType) if not o.startswith('_')])"
-
-# Check build_appendix parameters
-python -c "from nado_protocol.utils.order import build_appendix; import inspect; print(inspect.signature(build_appendix))"
-```
-
-**Documentation Requirements**:
-- Available order types: List with descriptions
-- Code examples for each order type
-- Any order type restrictions or limitations
-
-**Estimated Time**: 2 hours
-
----
-
-### Sub-Feature 0.3: REST API Method Inventory
-
-**Research Tasks**:
-1. Document `client.context.engine_client` methods
-2. Document `client.context.indexer_client` methods
-3. Verify order status query: `get_order()` method signature
-4. Verify historical orders: `get_historical_orders_by_digest()` method
-5. Test market data endpoints
-
-**Research Commands**:
-```bash
-# Check engine client methods
-python -c "from nado_protocol.client import create_nado_client; c = create_nado_client('devnet', '0x' + '0'*64); print([m for m in dir(c.context.engine_client) if not m.startswith('_')])"
-
-# Check indexer client methods
-python -c "from nado_protocol.client import create_nado_client; c = create_nado_client('devnet', '0x' + '0'*64); print([m for m in dir(c.context.indexer_client) if not m.startswith('_')])"
-
-# Check market methods
-python -c "from nado_protocol.client import create_nado_client; c = create_nado_client('devnet', '0x' + '0'*64); print([m for m in dir(c.market) if not m.startswith('_')])"
-```
-
-**Documentation Requirements**:
-- Complete method inventory for engine_client
-- Complete method inventory for indexer_client
-- Complete method inventory for market client
-- Method signatures with parameters
-- Example usage for critical methods
+**Testing Tasks**:
+1. Install and test `nado-protocol` SDK WebSocket functionality
+2. Create test connection to `wss://gateway.test.nado.xyz/v1/subscribe`
+3. Implement EIP-712 authentication signing
+4. Test subscription to Fill stream
+5. Test subscription to BookDepth stream
+6. Test subscription to BBO stream
+7. Validate message formats
 
 **Estimated Time**: 3 hours
 
 ---
 
-### Sub-Feature 0.4: Product ID and Contract Verification
+### Sub-Feature 0.2: BookDepth & BBO Stream Testing
 
-**Research Tasks**:
-1. Verify ETH product ID (assumed 4, need confirmation)
-2. Verify SOL product ID (assumed 8, need confirmation)
-3. Verify tick sizes for each product
-4. Test `get_all_product_symbols()` output
-5. Test `get_all_engine_markets()` output
-6. Verify `get_market_price()` returns real bid/ask
-
-**Research Commands**:
-```bash
-# Get all products
-python -c "from nado_protocol.client import create_nado_client; c = create_nado_client('devnet', '0x' + '0'*64); symbols = c.market.get_all_product_symbols(); print([(s.symbol, s.product_id) for s in symbols])"
-
-# Get market details for ETH
-python -c "from nado_protocol.client import create_nado_client; c = create_nado_client('devnet', '0x' + '0'*64); markets = c.market.get_all_engine_markets(); eth_market = [m for m in markets.perp_products if 'ETH' in str(m.product_id)]; print(eth_market)"
-
-# Check tick size
-python -c "from nado_protocol.client import create_nado_client; from nado_protocol.utils.math import from_x18; c = create_nado_client('devnet', '0x' + '0'*64); markets = c.market.get_all_engine_markets(); print([(m.product_id, from_x18(m.book_info.price_increment_x18)) for m in markets.perp_products])"
-```
-
-**Documentation Requirements**:
-- Complete product ID mapping table
-- Tick size for each product
-- Minimum order quantity for each product
-- Market liquidity data (if available)
+**Testing Tasks**:
+1. Subscribe to BookDepth for ETH (product_id=4)
+2. Parse incremental deltas (new_qty vs 0 = delete)
+3. Maintain local order book state
+4. Subscribe to BBO for ETH and SOL
+5. Calculate spread in real-time
+6. Measure actual update frequencies
 
 **Estimated Time**: 2 hours
 
 ---
 
-### Sub-Feature 0.5: Research Documentation Output
+### Sub-Feature 0.3: REST API Method Testing
+
+**Testing Tasks**:
+1. Test `get_order_info()` for order status queries
+2. Test `get_account_positions()` for position data
+3. Test `fetch_bbo_prices()` for current prices
+4. Verify REST API rate limits
+5. Document REST fallback strategy
+
+**Estimated Time**: 2 hours
+
+---
+
+### Sub-Feature 0.4: Research Documentation Output
 
 **Output File**: `/Users/botfarmer/2dex/.omc/research/nado-sdk-capabilities.md`
 
 **Document Structure**:
 ```markdown
-# Nado SDK Capabilities Research
+# Nado SDK Capabilities Research (UPDATED)
 
 ## Executive Summary
-- WebSocket Support: [YES/NO with details]
-- Order Types Supported: [List with confirmation]
-- Product ID Mapping: [Complete table]
-- REST API Status: [Verified working]
+- WebSocket Support: YES (verified)
+- Endpoints: wss://gateway.test.nado.xyz/v1/subscribe
+- Authentication: EIP-712 StreamAuthentication
+- Order Types: POST_ONLY, IOC, FOK, DEFAULT (verified)
+- Product IDs: ETH=4, SOL=8 (verified)
+- REST API Status: Verified working
 
 ## 1. WebSocket Capabilities
-- Availability: [Detailed analysis]
-- Code Examples: [Actual working code]
-- Limitations: [Any known issues]
+- Availability: YES - Nado provides full WebSocket API
+- Endpoints:
+  - Gateway: wss://gateway.test.nado.xyz/v1/ws
+  - Subscriptions: wss://gateway.test.nado.xyz/v1/subscribe
+- Streams:
+  - Fill: Order fill notifications
+  - PositionChange: Position updates
+  - BookDepth: 50ms order book updates
+  - BestBidOffer: Real-time top-of-book
+  - OrderUpdate: Order status changes
 
-## 2. Order Type Support
-- POST_ONLY: [Code example]
-- IOC: [Code example]
-- FOK: [Code example]
-- MARKET/DEFAULT: [Code example]
+## 2. BookDepth Stream (Market Making Critical)
+- Update frequency: 50ms batches
+- Message format: incremental deltas
+- Uses: Order placement, liquidity analysis, slippage estimation
 
-## 3. REST API Methods
-- Engine Client: [Complete method list]
-- Indexer Client: [Complete method list]
-- Market Client: [Complete method list]
+## 3. BBO Stream (Real-Time Pricing)
+- Update frequency: Instantaneous
+- Message format: bid_price, bid_qty, ask_price, ask_qty
+- Uses: Spread monitoring, momentum detection, fair value
 
-## 4. Product and Market Data
-- Product IDs: [ETH=?, SOL=?]
-- Tick Sizes: [ETH=?, SOL=?]
-- Min Quantities: [ETH=?, SOL=?]
+## 4. Authentication
+- Format: EIP-712 StreamAuthentication
+- Requires: Wallet signature
+- Public streams: No authentication required
 
-## 5. Code Examples
+## 5. Rate Limits
+- Authenticated: 5 per wallet
+- Unauthenticated: 100 per IP
+
+## 6. Code Examples
 - WebSocket connection: [Working code]
-- Order placement: [Working code]
-- Position query: [Working code]
-- Market data: [Working code]
+- EIP-712 signing: [Working code]
+- Stream subscription: [Working code]
+- Message parsing: [Working code]
 
-## 6. Recommendations
-- Use REST for: [Specific use cases]
-- Use WebSocket for: [Specific use cases if available]
-- Avoid using: [Any problematic methods]
+## 7. Recommendations
+- Use WebSocket for: Fill, Position, BookDepth, BBO
+- Use REST for: Queries, historical data, fallback
+- Primary connection: WebSocket (mandatory for rate limit reasons)
 ```
 
 **Acceptance Criteria**:
