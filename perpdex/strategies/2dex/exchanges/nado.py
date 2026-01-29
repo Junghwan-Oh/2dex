@@ -22,6 +22,16 @@ from nado_protocol.engine_client.types.execute import CancelOrdersParams
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
 
+# WebSocket imports (optional - only if available)
+try:
+    from .nado_websocket_client import NadoWebSocketClient
+    from .nado_bbo_handler import BBOHandler
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    NadoWebSocketClient = None
+    BBOHandler = None
+
 
 class NadoClient(BaseExchangeClient):
     """Nado exchange client implementation."""
@@ -53,6 +63,13 @@ class NadoClient(BaseExchangeClient):
         # Initialize logger
         self.logger = TradingLogger(exchange="nado", ticker=self.config.ticker, log_to_console=False)
 
+        # WebSocket components (if available)
+        self._ws_client: Optional[NadoWebSocketClient] = None
+        self._bbo_handler: Optional[BBOHandler] = None
+        self._ws_connected = False
+        self._use_websocket = WEBSOCKET_AVAILABLE
+
+        # Legacy placeholder variables
         self._order_update_handler = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_stop = asyncio.Event()
@@ -65,13 +82,57 @@ class NadoClient(BaseExchangeClient):
             raise ValueError(f"Missing required environment variables: {missing_vars}")
 
     async def connect(self) -> None:
-        """Connect to Nado (setup WebSocket if needed)."""
-        # Nado SDK may handle WebSocket internally, but we'll set up order monitoring
-        # For now, we'll use polling for order updates if WebSocket is not available
+        """Connect to Nado (setup WebSocket for BBO if available)."""
+        try:
+            # Try to connect to WebSocket for real-time BBO data
+            if self._use_websocket and WEBSOCKET_AVAILABLE:
+                await self._connect_websocket()
+        except Exception as e:
+            self.logger.log(f"WebSocket connection failed: {e}, using REST fallback", "WARN")
+            self._use_websocket = False
+
         self.logger.log("Connected to Nado", "INFO")
+
+    async def _connect_websocket(self) -> None:
+        """Connect to WebSocket for real-time BBO data."""
+        if not WEBSOCKET_AVAILABLE:
+            raise ImportError("WebSocket modules not available")
+
+        # Get product ID for this ticker
+        product_id = self._get_product_id_from_contract(self.config.ticker)
+
+        # Create WebSocket client
+        self._ws_client = NadoWebSocketClient(
+            product_ids=[product_id],
+            auto_reconnect=True
+        )
+
+        # Create BBO handler
+        self._bbo_handler = BBOHandler(
+            product_id=product_id,
+            ws_client=self._ws_client,
+            logger=self.logger
+        )
+
+        # Connect and subscribe
+        await self._ws_client.connect()
+        await self._bbo_handler.start()
+
+        self._ws_connected = True
+        self.logger.log(f"WebSocket connected for {self.config.ticker} (product_id={product_id})", "INFO")
 
     async def disconnect(self) -> None:
         """Disconnect from Nado."""
+        # Disconnect WebSocket if connected
+        if self._ws_connected and self._ws_client:
+            try:
+                await self._ws_client.disconnect()
+                self._ws_connected = False
+                self.logger.log("WebSocket disconnected", "INFO")
+            except Exception as e:
+                self.logger.log(f"Error during WebSocket disconnect: {e}", "ERROR")
+
+        # Legacy cleanup
         try:
             self._ws_stop.set()
             if self._ws_task and not self._ws_task.done():
@@ -91,11 +152,23 @@ class NadoClient(BaseExchangeClient):
 
     @query_retry(default_return=(0, 0))
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
-        """Fetch best bid/offer prices from Nado."""
+        """
+        Fetch best bid/offer prices from Nado.
+
+        Uses WebSocket BBO if available, otherwise falls back to REST API.
+        """
+        # Try WebSocket first (real-time, no rate limit)
+        if self._ws_connected and self._bbo_handler:
+            bid_price, ask_price = self._bbo_handler.get_prices()
+            if bid_price is not None and bid_price > 0 and ask_price is not None and ask_price > 0:
+                # Got valid data from WebSocket
+                return bid_price, ask_price
+
+        # Fallback to REST API
         try:
             # Get order book depth
             order_book = self.client.context.engine_client.get_orderbook(ticker_id=contract_id, depth=1)
-            
+
             if not order_book:
                 return Decimal(0), Decimal(0)
 
