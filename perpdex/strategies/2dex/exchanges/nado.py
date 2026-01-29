@@ -26,11 +26,13 @@ from helpers.logger import TradingLogger
 try:
     from .nado_websocket_client import NadoWebSocketClient
     from .nado_bbo_handler import BBOHandler
+    from .nado_bookdepth_handler import BookDepthHandler
     WEBSOCKET_AVAILABLE = True
 except ImportError:
     WEBSOCKET_AVAILABLE = False
     NadoWebSocketClient = None
     BBOHandler = None
+    BookDepthHandler = None
 
 
 class NadoClient(BaseExchangeClient):
@@ -66,6 +68,7 @@ class NadoClient(BaseExchangeClient):
         # WebSocket components (if available)
         self._ws_client: Optional[NadoWebSocketClient] = None
         self._bbo_handler: Optional[BBOHandler] = None
+        self._bookdepth_handler: Optional['BookDepthHandler'] = None
         self._ws_connected = False
         self._use_websocket = WEBSOCKET_AVAILABLE
 
@@ -114,9 +117,17 @@ class NadoClient(BaseExchangeClient):
             logger=self.logger
         )
 
+        # Create BookDepth handler for slippage estimation
+        self._bookdepth_handler = BookDepthHandler(
+            product_id=product_id,
+            ws_client=self._ws_client,
+            logger=self.logger
+        )
+
         # Connect and subscribe
         await self._ws_client.connect()
         await self._bbo_handler.start()
+        await self._bookdepth_handler.start()
 
         self._ws_connected = True
         self.logger.log(f"WebSocket connected for {self.config.ticker} (product_id={product_id})", "INFO")
@@ -189,6 +200,75 @@ class NadoClient(BaseExchangeClient):
         except Exception as e:
             self.logger.log(f"Error fetching BBO prices: {e}", "ERROR")
             return Decimal(0), Decimal(0)
+
+    def get_bookdepth_handler(self) -> Optional['BookDepthHandler']:
+        """Get the BookDepth handler for this client (if WebSocket is connected)."""
+        return self._bookdepth_handler if self._ws_connected else None
+
+    async def estimate_slippage(
+        self,
+        side: str,
+        quantity: Decimal
+    ) -> Decimal:
+        """
+        Estimate slippage for a given order quantity using BookDepth data.
+
+        Args:
+            side: "buy" or "sell"
+            quantity: Order quantity
+
+        Returns:
+            Slippage in basis points, or 999999 if insufficient liquidity
+        """
+        handler = self.get_bookdepth_handler()
+        if handler is None:
+            # No WebSocket data - return high slippage to indicate unavailable
+            return Decimal(999999)
+
+        return handler.estimate_slippage(side, quantity)
+
+    async def check_exit_capacity(
+        self,
+        position: Decimal,
+        max_slippage_bps: int = 20
+    ) -> Tuple[bool, Decimal]:
+        """
+        Check if we can exit a position without excessive slippage.
+
+        Args:
+            position: Current position (positive = long, negative = short)
+            max_slippage_bps: Maximum acceptable slippage in bps
+
+        Returns:
+            Tuple of (can_exit, exitable_quantity)
+        """
+        handler = self.get_bookdepth_handler()
+        if handler is None:
+            # No WebSocket data - conservative assumption
+            return False, Decimal(0)
+
+        return handler.estimate_exit_capacity(position, max_slippage_bps)
+
+    async def get_available_liquidity(
+        self,
+        side: str,
+        max_depth: int = 20
+    ) -> Decimal:
+        """
+        Get total available liquidity up to specified depth.
+
+        Args:
+            side: "bid" or "ask"
+            max_depth: Maximum depth levels to consider
+
+        Returns:
+            Total liquidity quantity
+        """
+        handler = self.get_bookdepth_handler()
+        if handler is None:
+            return Decimal(0)
+
+        return handler.get_available_liquidity(side, max_depth)
 
     def _get_product_id_from_contract(self, contract_id: str) -> int:
         """Convert contract_id (ticker) to product_id."""

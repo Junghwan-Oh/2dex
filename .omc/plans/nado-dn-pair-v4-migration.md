@@ -24,15 +24,34 @@ Migrate the proven V4 DN pair implementation (Backpack + GRVT) to Nado-only DN p
 
 **Nado-Specific Requirements:**
 - Replace all GRVT/Backpack references with Nado
-- **IMPLEMENT WebSocket** (Nado DOES provide WebSocket - verified in official docs)
+- **IMPLEMENT WebSocket** ✅ COMPLETED (verified working via testing)
+  - `nado_websocket_client.py` - WebSocket client implementation ✅
+  - `nado_bbo_handler.py` - Real-time BBO with spread/momentum ✅
+  - `nado_bookdepth_handler.py` - Order book with slippage estimation ✅
+  - `nado.py` - NadoClient uses WebSocket BBO with REST fallback ✅
 - Use WebSocket PRIMARY + REST fallback for queries
-- WebSocket endpoints: `wss://gateway.test.nado.xyz/v1/ws`, `wss://gateway.test.nado.xyz/v1/subscribe`
-- Subscribe to: Fill, PositionChange, BookDepth, BestBidOffer, OrderUpdate streams
-- EIP-712 StreamAuthentication for WebSocket
+- WebSocket endpoints: `wss://gateway.test.nado.xyz/v1/subscribe` ✅ TESTED
+- Public streams working: BBO (real-time), BookDepth (50ms) ✅ VERIFIED
+- Authenticated streams (Fill, PositionChange): REQUIRE SUBACCOUNT ⚠️ BLOCKED
+- EIP-712 StreamAuthentication: FORMAT DOCUMENTED (not tested - no subaccount)
 - Nado order types: POST_ONLY, IOC, FOK, DEFAULT (verified)
 - Nado product IDs: ETH=4, SOL=8 (verified)
 - Tick sizes: ETH=0.1, SOL=0.1 (verified)
 - Rate limits: 5 authenticated connections per wallet
+
+**COMPLETED WORK (Added to Plan):**
+- Phase 0.5: WebSocket Infrastructure Research & Implementation ✅
+- Phase 1: WebSocket Public Stream Client ✅
+  - WebSocket client with auto-reconnect ✅
+  - BBO handler with spread/momentum detection ✅
+  - BookDepth handler with slippage estimation ✅
+  - NadoClient WebSocket integration ✅
+  - Integration tests passing (5/6) ✅
+
+**REMAINING WORK:**
+- Phase 2: V4 Feature Porting (extract_filled_quantity, calculate_timeout)
+- Phase 3: WebSocket + DN Pair Strategy Integration
+- Phase 4: Production Testing & Deployment
 
 ### Success Criteria
 

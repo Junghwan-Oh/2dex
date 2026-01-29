@@ -6,21 +6,18 @@ Tests for NadoClient with WebSocket BBO support.
 
 import pytest
 import asyncio
-from decimal import Decimal
-from unittest.mock import MagicMock, AsyncMock, patch
-
-# Mock imports
-ws_mock = MagicMock()
-ws_mock.connect = AsyncMock()
 import sys
-sys.modules['websockets'] = ws_mock
-sys.modules['websockets'].exceptions = MagicMock()
-sys.modules['websockets'].exceptions.ConnectionClosed = Exception
+from decimal import Decimal
+from unittest.mock import MagicMock, AsyncMock, patch, Mock
 
 # Add to path
 sys.path.insert(0, '/Users/botfarmer/2dex/perpdex/strategies/2dex/exchanges')
 
-import nado
+# We need to mock websockets but preserve it for web3's use
+# Mock the WebSocket client classes directly
+import nado_websocket_client
+import nado_bbo_handler
+import nado_bookdepth_handler
 
 
 @pytest.fixture
@@ -128,6 +125,114 @@ class TestNadoClientWebSocket:
             # Verify disconnect was called
             mock_ws_client.disconnect.assert_called_once()
             assert client._ws_connected == False
+
+    @pytest.mark.asyncio
+    async def test_get_bookdepth_handler(mock_config, mock_env):
+        """Test getting BookDepth handler."""
+        with patch('nado.WEBSOCKET_AVAILABLE', True):
+            client = nado.NadoClient(mock_config)
+
+            # Mock BookDepth handler
+            mock_bookdepth_handler = MagicMock()
+            client._bookdepth_handler = mock_bookdepth_handler
+            client._ws_connected = True
+
+            # Get handler
+            handler = client.get_bookdepth_handler()
+            assert handler == mock_bookdepth_handler
+
+            # When not connected, should return None
+            client._ws_connected = False
+            handler = client.get_bookdepth_handler()
+            assert handler is None
+
+    @pytest.mark.asyncio
+    async def test_estimate_slippage(mock_config, mock_env):
+        """Test slippage estimation."""
+        with patch('nado.WEBSOCKET_AVAILABLE', True):
+            client = nado.NadoClient(mock_config)
+
+            # Mock BookDepth handler
+            mock_bookdepth_handler = MagicMock()
+            mock_bookdepth_handler.estimate_slippage.return_value = Decimal("5.5")
+            client._bookdepth_handler = mock_bookdepth_handler
+            client._ws_connected = True
+
+            # Estimate slippage
+            slippage = await client.estimate_slippage("buy", Decimal("1.0"))
+            assert slippage == Decimal("5.5")
+            mock_bookdepth_handler.estimate_slippage.assert_called_once_with("buy", Decimal("1.0"))
+
+    @pytest.mark.asyncio
+    async def test_estimate_slippage_no_websocket(mock_config, mock_env):
+        """Test slippage estimation when WebSocket not connected."""
+        with patch('nado.WEBSOCKET_AVAILABLE', True):
+            client = nado.NadoClient(mock_config)
+            client._ws_connected = False
+
+            # Should return high slippage to indicate unavailable
+            slippage = await client.estimate_slippage("buy", Decimal("1.0"))
+            assert slippage == Decimal(999999)
+
+    @pytest.mark.asyncio
+    async def test_check_exit_capacity(mock_config, mock_env):
+        """Test checking exit capacity."""
+        with patch('nado.WEBSOCKET_AVAILABLE', True):
+            client = nado.NadoClient(mock_config)
+
+            # Mock BookDepth handler
+            mock_bookdepth_handler = MagicMock()
+            mock_bookdepth_handler.estimate_exit_capacity.return_value = (True, Decimal("1.0"))
+            client._bookdepth_handler = mock_bookdepth_handler
+            client._ws_connected = True
+
+            # Check exit capacity
+            can_exit, qty = await client.check_exit_capacity(Decimal("1.0"), max_slippage_bps=20)
+            assert can_exit == True
+            assert qty == Decimal("1.0")
+            mock_bookdepth_handler.estimate_exit_capacity.assert_called_once_with(Decimal("1.0"), 20)
+
+    @pytest.mark.asyncio
+    async def test_get_available_liquidity(mock_config, mock_env):
+        """Test getting available liquidity."""
+        with patch('nado.WEBSOCKET_AVAILABLE', True):
+            client = nado.NadoClient(mock_config)
+
+            # Mock BookDepth handler
+            mock_bookdepth_handler = MagicMock()
+            mock_bookdepth_handler.get_available_liquidity.return_value = Decimal("100.5")
+            client._bookdepth_handler = mock_bookdepth_handler
+            client._ws_connected = True
+
+            # Get liquidity
+            liquidity = await client.get_available_liquidity("ask", max_depth=20)
+            assert liquidity == Decimal("100.5")
+            mock_bookdepth_handler.get_available_liquidity.assert_called_once_with("ask", 20)
+
+    @pytest.mark.asyncio
+    async def test_connect_websocket_with_bookdepth(mock_config, mock_env):
+        """Test that WebSocket connection initializes BookDepth handler."""
+        with patch('nado.WEBSOCKET_AVAILABLE', True):
+            # Mock WebSocket client
+            mock_ws_client = MagicMock()
+            mock_ws_client.connect = AsyncMock()
+            mock_bbo_handler = MagicMock()
+            mock_bbo_handler.start = AsyncMock()
+            mock_bookdepth_handler = MagicMock()
+            mock_bookdepth_handler.start = AsyncMock()
+
+            with patch('nado.NadoWebSocketClient', return_value=mock_ws_client):
+                with patch('nado.BBOHandler', return_value=mock_bbo_handler):
+                    with patch('nado.BookDepthHandler', return_value=mock_bookdepth_handler):
+                        client = nado.NadoClient(mock_config)
+
+                        await client.connect()
+
+                        # Verify both handlers were initialized and started
+                        assert client._bbo_handler is not None
+                        assert client._bookdepth_handler is not None
+                        mock_bbo_handler.start.assert_called_once()
+                        mock_bookdepth_handler.start.assert_called_once()
 
 
 if __name__ == "__main__":
