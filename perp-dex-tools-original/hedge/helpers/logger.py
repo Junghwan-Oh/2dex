@@ -110,3 +110,19 @@ class TradingLogger:
 
         except Exception as e:
             self.log(f"Failed to log transaction: {e}", "ERROR")
+
+    def error(self, message: str) -> None:
+        """Log error message."""
+        self.log(message, "ERROR")
+
+    def warning(self, message: str) -> None:
+        """Log warning message."""
+        self.log(message, "WARNING")
+
+    def info(self, message: str) -> None:
+        """Log info message."""
+        self.log(message, "INFO")
+
+    def debug(self, message: str) -> None:
+        """Log debug message."""
+        self.log(message, "DEBUG")
