@@ -1,10 +1,9 @@
 """
 Nado WebSocket Client Implementation
 
-This module provides WebSocket client for Nado public streams:
-- Best Bid Offer (BBO) - Real-time top-of-book pricing
-- BookDepth - 50ms order book updates with incremental deltas
-- Trade - Public trade stream
+This module provides WebSocket client for Nado streams:
+- Public: BBO, BookDepth, Trade (no authentication required)
+- Private: Fill, PositionChange, OrderUpdate (EIP-712 authentication required)
 
 Note: Nado SDK does not provide WebSocket client, so this is custom implementation.
 """
@@ -22,6 +21,16 @@ try:
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
     websockets = None
+
+# EIP-712 signing support
+try:
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+    ETH_ACCOUNT_AVAILABLE = True
+except ImportError:
+    ETH_ACCOUNT_AVAILABLE = False
+    Account = None
+    encode_typed_data = None
 
 
 class ConnectionState:
@@ -42,7 +51,9 @@ class NadoWebSocketClient:
     """
 
     # WebSocket endpoint
-    WS_URL = "wss://gateway.test.nado.xyz/v1/subscribe"
+    # Mainnet: wss://gateway.prod.nado.xyz/v1/subscribe
+    # Testnet: wss://gateway.test.nado.xyz/v1/subscribe
+    WS_URL = "wss://gateway.prod.nado.xyz/v1/subscribe"
 
     # Ping interval (Nado requires ping every 30 seconds)
     PING_INTERVAL = 25  # Send ping every 25 seconds (5 second buffer)
@@ -52,11 +63,34 @@ class NadoWebSocketClient:
     RECONNECT_DELAY_MAX = 30.0  # Maximum delay
     RECONNECT_ATTEMPTS = 5  # Max reconnection attempts before giving up
 
+    # EIP-712 Domain for StreamAuthentication (from Nado SDK)
+    EIP712_DOMAIN = {
+        "name": "Nado",
+        "version": "0.0.1",
+        "chainId": 542210,
+        "verifyingContract": "0x3646be143c3873771dbeee0758af4a44b19ef5a3"
+    }
+
+    # EIP-712 Types for StreamAuthentication (from Nado SDK)
+    # expiration is uint64 (integer), not string
+    EIP712_TYPES = {
+        "StreamAuthentication": [
+            {"name": "sender", "type": "bytes32"},
+            {"name": "expiration", "type": "uint64"},
+        ]
+    }
+
+    # Private streams that require authentication
+    PRIVATE_STREAMS = {"fill", "position_change", "order_update", "liquidation", "funding_payment", "funding_rate", "latest_candlestick"}
+
     def __init__(
         self,
         product_ids: Optional[List[int]] = None,
         auto_reconnect: bool = True,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        private_key: Optional[str] = None,
+        owner: Optional[str] = None,
+        subaccount_name: str = "default"
     ):
         """
         Initialize Nado WebSocket client.
@@ -65,6 +99,9 @@ class NadoWebSocketClient:
             product_ids: List of product IDs to subscribe to (default: [4, 8] for ETH, SOL)
             auto_reconnect: Whether to automatically reconnect on disconnect
             logger: Optional logger instance
+            private_key: Private key for EIP-712 authentication (required for private streams)
+            owner: Wallet address (owner) for subaccount calculation
+            subaccount_name: Subaccount name (default: "default")
         """
         if not WEBSOCKETS_AVAILABLE:
             raise ImportError("websockets library is required. Install with: pip install websockets")
@@ -74,6 +111,12 @@ class NadoWebSocketClient:
 
         # Setup logger
         self.logger = logger or logging.getLogger(__name__)
+
+        # Authentication credentials
+        self._private_key = private_key
+        self._owner = owner
+        self._subaccount_name = subaccount_name
+        self._authenticated = False
 
         # Connection state
         self._state = ConnectionState.DISCONNECTED
@@ -158,27 +201,104 @@ class NadoWebSocketClient:
         self._state = ConnectionState.DISCONNECTED
         self.logger.info("Disconnected from Nado WebSocket")
 
+    async def authenticate(self) -> None:
+        """
+        Authenticate WebSocket connection using EIP-712 signature.
+
+        This is required for subscribing to private streams (fill, position_change, order_update).
+
+        Raises:
+            ValueError: If private_key or owner is not set
+            ImportError: If eth-account is not available
+        """
+        if not ETH_ACCOUNT_AVAILABLE:
+            raise ImportError("eth-account library is required for authentication. Install with: pip install eth-account")
+
+        if not self._private_key:
+            raise ValueError("private_key is required for authentication")
+        if not self._owner:
+            raise ValueError("owner is required for authentication")
+
+        # Import nado_protocol utilities for subaccount conversion
+        try:
+            from nado_protocol.utils.bytes32 import subaccount_to_hex
+            from nado_protocol.utils.subaccount import SubaccountParams
+        except ImportError:
+            raise ImportError("nado-protocol library is required for subaccount calculation")
+
+        # Calculate subaccount bytes32
+        subaccount_params = SubaccountParams(
+            subaccount_owner=self._owner,
+            subaccount_name=self._subaccount_name,
+        )
+        subaccount_hex = subaccount_to_hex(subaccount_params)
+
+        # Calculate expiration (current time + 60 seconds, max 100s ahead)
+        import time
+        expiration = int(time.time() * 1000) + 60000  # 60 seconds from now
+
+        # Create the message to sign (expiration as uint64 per Nado SDK)
+        message_to_sign = {
+            "sender": subaccount_hex,
+            "expiration": expiration  # uint64 (integer) per Nado SDK
+        }
+
+        # Sign using EIP-712
+        encoded_message = encode_typed_data(
+            domain_data=self.EIP712_DOMAIN,
+            message_types=self.EIP712_TYPES,
+            message_data=message_to_sign
+        )
+
+        signed_message = Account.from_key(self._private_key).sign_message(encoded_message)
+
+        # Build authentication message (expiration as integer per Nado SDK)
+        auth_msg = {
+            "method": "authenticate",
+            "tx": {
+                "sender": subaccount_hex,
+                "expiration": expiration  # uint64 integer
+            },
+            "signature": signed_message.signature.hex(),
+            "id": int(time.time() * 1000) % 1000000
+        }
+
+        # Send authentication message
+        await self._ws.send(json.dumps(auth_msg))
+
+        self._authenticated = True
+        self.logger.info(f"WebSocket authenticated for subaccount: {subaccount_hex[:10]}...{subaccount_hex[-6:]}")
+
     async def subscribe(
         self,
         stream_type: str,
         product_id: int,
-        callback: Optional[Callable[[Dict], None]] = None
+        callback: Optional[Callable[[Dict], None]] = None,
+        subaccount: Optional[str] = None
     ) -> None:
         """
         Subscribe to a stream.
 
         Args:
-            stream_type: Stream type ("best_bid_offer", "book_depth", "trade")
+            stream_type: Stream type ("best_bid_offer", "book_depth", "trade", "fill", "position_change")
             product_id: Product ID (4 for ETH, 8 for SOL)
             callback: Optional callback function for stream messages
+            subaccount: Optional subaccount hex string (required for fill/position_change streams)
 
         Raises:
             ValueError: If stream_type is invalid
             ConnectionError: If not connected
         """
-        valid_streams = ["best_bid_offer", "book_depth", "trade"]
+        # All stream types (public + private)
+        valid_streams = ["best_bid_offer", "book_depth", "trade", "fill", "position_change", "order_update", "liquidation", "latest_candlestick", "funding_payment", "funding_rate"]
+
         if stream_type not in valid_streams:
             raise ValueError(f"Invalid stream_type: {stream_type}. Must be one of {valid_streams}")
+
+        # Check subaccount requirement for private streams
+        private_streams = ["fill", "position_change", "order_update"]
+        if stream_type in private_streams and not subaccount:
+            raise ValueError(f"subaccount parameter required for '{stream_type}' stream")
 
         if not self.is_connected:
             await self.connect()
@@ -189,23 +309,40 @@ class NadoWebSocketClient:
                 self._message_callbacks[stream_type] = []
             self._message_callbacks[stream_type].append(callback)
 
-        # Send subscription message
+        # Build subscription message
+        stream_def = {
+            "type": stream_type,
+            "product_id": product_id
+        }
+
+        # Add subaccount for private streams
+        if subaccount:
+            stream_def["subaccount"] = subaccount
+
         subscribe_msg = {
             "method": "subscribe",
-            "stream": {
-                "type": stream_type,
-                "product_id": product_id
-            },
-            "id": int(time.time() * 1000) % 1000000  # Simple ID generation
+            "stream": stream_def,
+            "id": int(time.time() * 1000) % 1000000
         }
 
         await self._ws.send(json.dumps(subscribe_msg))
 
-        # Track subscription
+        # Track subscription (with subaccount info if applicable)
         if product_id not in self._subscriptions:
             self._subscriptions[product_id] = []
-        if stream_type not in self._subscriptions[product_id]:
-            self._subscriptions[product_id].append(stream_type)
+
+        sub_info = {"type": stream_type}
+        if subaccount:
+            sub_info["subaccount"] = subaccount
+
+        # Check if already subscribed
+        already_subscribed = any(
+            s.get("type") == stream_type and s.get("subaccount") == subaccount
+            for s in self._subscriptions[product_id]
+        )
+
+        if not already_subscribed:
+            self._subscriptions[product_id].append(sub_info)
 
         self.logger.info(f"Subscribed to {stream_type} for product_id={product_id}")
 
@@ -223,7 +360,7 @@ class NadoWebSocketClient:
                 "type": stream_type,
                 "product_id": product_id
             },
-            "id": int(time.time() * 1000) % 1000000
+            "id": int(time.time() * 1000) % 1000000  # subscribe/unsubscribe use int id
         }
 
         await self._ws.send(json.dumps(unsubscribe_msg))
@@ -244,7 +381,7 @@ class NadoWebSocketClient:
                         "type": stream_type,
                         "product_id": product_id
                     },
-                    "id": int(time.time() * 1000) % 1000000
+                    "id": int(time.time() * 1000) % 1000000  # subscribe/unsubscribe use int id
                 }
                 await self._ws.send(json.dumps(subscribe_msg))
                 self.logger.info(f"Resubscribed to {stream_type} for product_id={product_id}")

@@ -227,6 +227,9 @@ class DNPairBot:
                         "quantity",
                         "order_type",
                         "mode",
+                        "fee_usd",
+                        "pnl_no_fee",
+                        "pnl_with_fee",
                     ]
                 )
 
@@ -238,12 +241,15 @@ class DNPairBot:
         quantity: str,
         order_type: str = "hedge",
         mode: str = "",
+        fee_usd: str = "0",
+        pnl_no_fee: str = "0",
+        pnl_with_fee: str = "0",
     ):
         timestamp = datetime.now(pytz.UTC).isoformat()
         with open(self.csv_filename, "a", newline="") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(
-                [exchange, timestamp, side, price, quantity, order_type, mode]
+                [exchange, timestamp, side, price, quantity, order_type, mode, fee_usd, pnl_no_fee, pnl_with_fee]
             )
 
     def export_trade_metrics(self):
@@ -461,11 +467,12 @@ class DNPairBot:
         sol_price = sol_bid if sol_direction == "sell" else sol_ask
 
         # Use slippage-aware order sizing with BookDepth data
+        # Reduced slippage from 20bps to 10bps to minimize losses
         eth_qty, eth_slippage_bps, eth_full_fill = await self.calculate_order_size_with_slippage(
-            eth_price, "ETH", eth_direction, max_slippage_bps=20
+            eth_price, "ETH", eth_direction, max_slippage_bps=10
         )
         sol_qty, sol_slippage_bps, sol_full_fill = await self.calculate_order_size_with_slippage(
-            sol_price, "SOL", sol_direction, max_slippage_bps=20
+            sol_price, "SOL", sol_direction, max_slippage_bps=10
         )
 
         self.logger.info(
@@ -520,24 +527,37 @@ class DNPairBot:
             self.logger.warning(f"[FILL] SOL order did not fill")
 
         # Log actual fills to CSV
+        # Calculate fee (0.05% taker fee for Nado)
+        FEE_RATE = Decimal("0.0005")
+
         if eth_fill_qty > 0:
+            eth_notional = eth_fill_price * eth_fill_qty
+            eth_fee = eth_notional * FEE_RATE
             self.log_trade_to_csv(
                 exchange="NADO",
                 side=f"ETH-{eth_direction.upper()}",
                 price=str(eth_fill_price),
                 quantity=str(eth_fill_qty),
                 order_type="entry" if eth_direction == "buy" else "exit",
-                mode="FILLED" if eth_filled else "PARTIAL"
+                mode="FILLED" if eth_filled else "PARTIAL",
+                fee_usd=str(eth_fee),
+                pnl_no_fee="0",
+                pnl_with_fee="0"
             )
 
         if sol_fill_qty > 0:
+            sol_notional = sol_fill_price * sol_fill_qty
+            sol_fee = sol_notional * FEE_RATE
             self.log_trade_to_csv(
                 exchange="NADO",
                 side=f"SOL-{sol_direction.upper()}",
                 price=str(sol_fill_price),
                 quantity=str(sol_fill_qty),
                 order_type="entry" if sol_direction == "sell" else "exit",
-                mode="FILLED" if sol_filled else "PARTIAL"
+                mode="FILLED" if sol_filled else "PARTIAL",
+                fee_usd=str(sol_fee),
+                pnl_no_fee="0",
+                pnl_with_fee="0"
             )
 
         # Handle partial fills and failed orders
@@ -604,6 +624,19 @@ class DNPairBot:
 
     async def execute_build_cycle(self) -> bool:
         """Execute BUILD cycle: Long ETH / Short SOL."""
+        POSITION_TOLERANCE = Decimal("0.001")
+
+        # SAFETY CHECK: Verify positions are closed before BUILD
+        eth_pos = await self.eth_client.get_account_positions()
+        sol_pos = await self.sol_client.get_account_positions()
+
+        if abs(eth_pos) > POSITION_TOLERANCE or abs(sol_pos) > POSITION_TOLERANCE:
+            self.logger.error(
+                f"[BUILD] SAFETY VIOLATION: Cannot BUILD with open positions - "
+                f"ETH={eth_pos}, SOL={sol_pos}. Run UNWIND first!"
+            )
+            return False
+
         try:
             eth_result, sol_result = await self.place_simultaneous_orders("buy", "sell")
             return (isinstance(eth_result, OrderResult) and eth_result.success and
@@ -611,14 +644,55 @@ class DNPairBot:
         except Exception:
             return False
 
-    async def execute_unwind_cycle(self) -> bool:
-        """Execute UNWIND cycle: Sell ETH / Buy SOL."""
-        try:
-            eth_result, sol_result = await self.place_simultaneous_orders("sell", "buy")
-            return (isinstance(eth_result, OrderResult) and eth_result.success and
-                    isinstance(sol_result, OrderResult) and sol_result.success)
-        except Exception:
+    async def execute_unwind_cycle(self, eth_side: str = "sell", sol_side: str = "buy") -> bool:
+        """Execute UNWIND cycle with specified order sides.
+
+        Args:
+            eth_side: Order side for ETH ("buy" or "sell")
+            sol_side: Order side for SOL ("buy" or "sell")
+
+        Returns:
+            True if both positions are closed (abs < 0.001), False otherwise.
+        """
+        POSITION_TOLERANCE = Decimal("0.001")
+        MAX_RETRIES = 3
+        RETRY_DELAY = 2.0
+
+        # Log pre-unwind positions
+        eth_pos_before = await self.eth_client.get_account_positions()
+        sol_pos_before = await self.sol_client.get_account_positions()
+        self.logger.info(f"[UNWIND] POSITIONS BEFORE: ETH={eth_pos_before}, SOL={sol_pos_before}")
+
+        # Place UNWIND orders with specified sides
+        eth_result, sol_result = await self.place_simultaneous_orders(eth_side, sol_side)
+
+        # Check if orders filled
+        if not (isinstance(eth_result, OrderResult) and eth_result.success and
+                isinstance(sol_result, OrderResult) and sol_result.success):
+            self.logger.warning("[UNWIND] Orders failed or partially filled")
             return False
+
+        # Verify positions closed with retries
+        for attempt in range(MAX_RETRIES):
+            await asyncio.sleep(RETRY_DELAY)
+
+            eth_pos = await self.eth_client.get_account_positions()
+            sol_pos = await self.sol_client.get_account_positions()
+
+            self.logger.info(f"[UNWIND] POSITIONS CHECK (attempt {attempt + 1}/{MAX_RETRIES}): ETH={eth_pos}, SOL={sol_pos}")
+
+            eth_closed = abs(eth_pos) < POSITION_TOLERANCE
+            sol_closed = abs(sol_pos) < POSITION_TOLERANCE
+
+            if eth_closed and sol_closed:
+                self.logger.info("[UNWIND] SUCCESS: Both positions closed")
+                return True
+
+            if attempt < MAX_RETRIES - 1:
+                self.logger.warning(f"[UNWIND] Positions still open, retrying in {RETRY_DELAY}s...")
+
+        self.logger.error(f"[UNWIND] FAILED: Positions still open after {MAX_RETRIES} retries: ETH={eth_pos}, SOL={sol_pos}")
+        return False
 
     async def execute_dn_pair_cycle(self) -> bool:
         """Execute full DN pair cycle: BUILD + UNWIND."""
@@ -649,7 +723,7 @@ class DNPairBot:
                 await asyncio.sleep(self.sleep_time)
 
             # UNWIND: Sell ETH / Buy SOL
-            unwind_success = await self.execute_unwind_cycle()
+            unwind_success = await self.execute_unwind_cycle("sell", "buy")
             return unwind_success
 
         except Exception as e:
@@ -670,9 +744,8 @@ class DNPairBot:
                 await asyncio.sleep(self.sleep_time)
 
             # UNWIND: Buy ETH / Sell SOL
-            eth_result, sol_result = await self.place_simultaneous_orders("buy", "sell")
-            return (isinstance(eth_result, OrderResult) and eth_result.success and
-                    isinstance(sol_result, OrderResult) and sol_result.success)
+            unwind_success = await self.execute_unwind_cycle("buy", "sell")
+            return unwind_success
 
         except Exception as e:
             self.logger.error(f"SELL_FIRST cycle failed: {e}")
@@ -683,12 +756,31 @@ class DNPairBot:
         results = []
 
         for i in range(self.iterations):
+            iteration_num = i + 1
+            self.logger.info(f"\n{'='*60}")
+            self.logger.info(f"ITERATION {iteration_num}/{self.iterations}")
+            self.logger.info(f"{'='*60}")
+
             if i % 2 == 0:
                 result = await self.execute_buy_first_cycle()
             else:
                 result = await self.execute_sell_first_cycle()
 
             results.append(result)
+
+            # CRITICAL: Stop if UNWIND failed
+            if not result:
+                self.logger.error(
+                    f"[SAFETY] Cycle {iteration_num} FAILED! "
+                    f"Bot stopping to prevent position accumulation."
+                )
+                self.logger.error(
+                    f"[SAFETY] Check positions manually before restarting. "
+                    f"ETH and SOL positions should be near 0."
+                )
+                break
+
+            self.logger.info(f"[SUCCESS] Cycle {iteration_num} completed successfully")
 
         return results
 
@@ -784,20 +876,26 @@ class DNPairBot:
 
     async def initialize_clients(self):
         """Initialize ETH and SOL Nado clients for dual-ticker trading."""
+        # Log WebSocket availability status
+        from exchanges.nado import WEBSOCKET_AVAILABLE
+        self.logger.info(
+            f"[INIT] WEBSOCKET_AVAILABLE: {WEBSOCKET_AVAILABLE}"
+        )
+
         # ETH client configuration
         eth_config = Config({
             'ticker': 'ETH',
             'contract_id': '4',  # ETH product ID on Nado
-            'tick_size': Decimal('0.1'),  # ETH tick size (actual: 0.1)
-            'min_size': Decimal('0.1'),
+            'tick_size': Decimal('0.001'),  # ETH tick size (corrected: 0.1 → 0.001)
+            'min_size': Decimal('0.001'),
         })
 
         # SOL client configuration
         sol_config = Config({
             'ticker': 'SOL',
             'contract_id': '8',  # SOL product ID on Nado
-            'tick_size': Decimal('0.1'),  # SOL tick size (actual: 0.1)
-            'min_size': Decimal('0.1'),
+            'tick_size': Decimal('0.001'),  # SOL tick size (corrected: 0.1 → 0.001)
+            'min_size': Decimal('0.001'),
         })
 
         # Create Nado clients for both tickers (pass Config objects directly)
@@ -805,8 +903,23 @@ class DNPairBot:
         self.sol_client = NadoClient(sol_config)
 
         # Connect to Nado
+        self.logger.info("[INIT] Connecting ETH client...")
         await self.eth_client.connect()
+        self.logger.info(
+            f"[INIT] WebSocket status for ETH: {'CONNECTED' if self.eth_client._ws_connected else 'REST FALLBACK'}"
+        )
+
+        self.logger.info("[INIT] Connecting SOL client...")
         await self.sol_client.connect()
+        self.logger.info(
+            f"[INIT] WebSocket status for SOL: {'CONNECTED' if self.sol_client._ws_connected else 'REST FALLBACK'}"
+        )
+
+        # Warning if WebSocket failed
+        if not self.eth_client._ws_connected or not self.sol_client._ws_connected:
+            self.logger.warning(
+                "[INIT] One or more clients failed to connect via WebSocket - using REST fallback (higher latency, rate limits apply)"
+            )
 
         # Store contract attributes
         self.eth_contract_id = eth_config.contract_id
@@ -815,10 +928,10 @@ class DNPairBot:
         self.sol_tick_size = sol_config.tick_size
 
         self.logger.info(
-            f"[INIT] ETH client initialized (contract: {self.eth_contract_id}, tick: {self.eth_tick_size})"
+            f"[INIT] ETH client initialized (contract: {self.eth_contract_id}, tick: {self.eth_tick_size}, ws: {self.eth_client._ws_connected})"
         )
         self.logger.info(
-            f"[INIT] SOL client initialized (contract: {self.sol_contract_id}, tick: {self.sol_tick_size})"
+            f"[INIT] SOL client initialized (contract: {self.sol_contract_id}, tick: {self.sol_tick_size}, ws: {self.sol_client._ws_connected})"
         )
 
     async def connect_websockets(self):
@@ -2821,22 +2934,42 @@ async def main():
     hedge_mode = PriceMode(args.hedge_mode)
     hedge_post_only = args.hedge_post_only and not args.hedge_market
 
-    bot = DNHedgeBot(
-        ticker=args.ticker.upper(),
-        order_quantity=Decimal(args.size),
+    # DNPairBot uses target_notional (USD notional per position)
+    bot = DNPairBot(
+        target_notional=Decimal(args.size),  # USD notional per position (e.g., 100 = $100)
         fill_timeout=args.fill_timeout,
         iterations=args.iter,
         sleep_time=args.sleep,
-        max_position=Decimal(args.max_position),
-        primary_exchange=args.primary,
-        hedge_exchange=args.hedge,
-        primary_mode=primary_mode,
-        hedge_mode=hedge_mode,
-        hedge_post_only=hedge_post_only,
-        min_spread_bps=Decimal(args.min_spread),
+        max_position_eth=Decimal("5"),
+        max_position_sol=Decimal("50"),
+        order_mode=PriceMode.BBO,
     )
 
-    await bot.run()
+    # Initialize clients
+    await bot.initialize_clients()
+
+    # STARTUP CHECK: Verify no residual positions
+    print("\n[STARTUP] Checking for residual positions...")
+    eth_pos = await bot.eth_client.get_account_positions()
+    sol_pos = await bot.sol_client.get_account_positions()
+
+    print(f"[STARTUP] ETH position: {eth_pos}")
+    print(f"[STARTUP] SOL position: {sol_pos}")
+
+    POSITION_TOLERANCE = Decimal("0.001")
+    if abs(eth_pos) > POSITION_TOLERANCE or abs(sol_pos) > POSITION_TOLERANCE:
+        print(f"\n[WARNING] Residual positions detected!")
+        print(f"  ETH: {eth_pos}")
+        print(f"  SOL: {sol_pos}")
+        print(f"\n[SAFETY] Please close positions manually before starting the bot.")
+        print(f"  - Use the exchange interface to close positions")
+        print(f"  - Or use a separate close-positions script")
+        sys.exit(1)
+
+    print("[STARTUP] No residual positions. Ready to start.\n")
+
+    # Run alternating strategy
+    await bot.run_alternating_strategy()
 
 
 if __name__ == "__main__":
