@@ -3,8 +3,9 @@
 Delta Neutral (DN) Hedge Mode: Backpack + GRVT
 
 Usage:
-    python DN_alternate_backpack_grvt.py --ticker SOL --size 1 --iter 10
-    python DN_alternate_backpack_grvt.py --ticker SOL --size 1 --iter 10 --primary-mode bbo_minus_1 --hedge-mode market
+    python DN_alternate_backpack_grvt.py --ticker SOL --size 0.2 --iter 10
+    python DN_alternate_backpack_grvt.py --ticker SOL --size 0.2 --iter 10 --primary-mode bbo --hedge-mode market
+    python DN_alternate_backpack_grvt.py --ticker ETH --size 0.2 --iter 20 --min-spread 5
 """
 
 import asyncio
@@ -24,7 +25,7 @@ import pytz
 
 # Import exchanges modules (like Mean Reversion bot)
 from exchanges.backpack import BackpackClient
-from exchanges.grvt import GrvtClient, extract_filled_quantity, calculate_timeout
+from exchanges.grvt import GrvtClient
 # Paradex removed - replaced by Backpack
 
 
@@ -98,8 +99,8 @@ class DNHedgeBot:
         hedge_exchange: str = "grvt",
         primary_mode: PriceMode = PriceMode.BBO,  # Changed from BBO_MINUS_1 for better fill rate
         hedge_mode: PriceMode = PriceMode.MARKET,
-        hedge_post_only: bool = True,
-        min_spread_bps: Decimal = Decimal("0"),
+        hedge_post_only: bool = True,  # Use POST_ONLY for hedge orders (0% maker fee)
+        min_spread_bps: Decimal = Decimal("5"),  # 5 bps minimum for profitability (break-even: ~7 bps)
     ):
         self.ticker = ticker
         self.order_quantity = order_quantity
@@ -142,6 +143,19 @@ class DNHedgeBot:
         self.MAX_DAILY_LOSS = Decimal("5")  # Maximum $5 USD daily loss
         self.daily_pnl = Decimal("0")  # Daily PnL tracker
         self.daily_start_time = datetime.now(pytz.UTC)  # Daily reset time
+
+        # Safety Layer #1: Idempotency guard - track processed order IDs
+        self.processed_order_ids = set()
+
+        # Safety Layer #2: UNWIND force close tracking
+        self.unwind_start_position = Decimal("0")
+        self.unwind_cycle_count = 0
+        self.unwind_stuck_threshold = 2
+
+        # Safety Layer #3: Order ID tracking
+        self.last_primary_order_id = None
+        self.last_hedge_order_id = None
+        self.last_cycle_orders_pending = False
 
         self.primary_client = None
         self.hedge_client = None
@@ -213,6 +227,55 @@ class DNHedgeBot:
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
         self.logger.propagate = False
+
+    async def measure_rest_api_latency(self):
+        """Measure REST API latency for get_order_info() calls.
+
+        Architect Issue #4: Required before implementing Layer #3.
+        """
+        import time
+        import statistics
+
+        latencies_primary = []
+        latencies_hedge = []
+
+        self.logger.info("[LATENCY_TEST] Starting REST API latency measurement...")
+
+        # Test with recent order IDs or empty strings
+        test_order_id = "test_measurement"
+
+        # Measure primary exchange (Backpack) - 5 calls
+        for i in range(5):
+            try:
+                start = time.time()
+                await self.primary_client.get_order_info(test_order_id)
+                latency_ms = (time.time() - start) * 1000
+                latencies_primary.append(latency_ms)
+                self.logger.info(f"[LATENCY_TEST] Primary call {i+1}: {latency_ms:.2f}ms")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                self.logger.info(f"[LATENCY_TEST] Primary call {i+1}: Error (expected for test) - {type(e).__name__}")
+
+        # Measure hedge exchange (GRVT) - 5 calls
+        for i in range(5):
+            try:
+                start = time.time()
+                await self.hedge_client.get_order_info(test_order_id)
+                latency_ms = (time.time() - start) * 1000
+                latencies_hedge.append(latency_ms)
+                self.logger.info(f"[LATENCY_TEST] Hedge call {i+1}: {latency_ms:.2f}ms")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                self.logger.info(f"[LATENCY_TEST] Hedge call {i+1}: Error (expected for test) - {type(e).__name__}")
+
+        # Report results
+        if latencies_primary:
+            avg_p = statistics.mean(latencies_primary)
+            self.logger.info(f"[LATENCY_TEST] Primary Exchange - Avg: {avg_p:.2f}ms, Min: {min(latencies_primary):.2f}ms, Max: {max(latencies_primary):.2f}ms")
+
+        if latencies_hedge:
+            avg_h = statistics.mean(latencies_hedge)
+            self.logger.info(f"[LATENCY_TEST] Hedge Exchange - Avg: {avg_h:.2f}ms, Min: {min(latencies_hedge):.2f}ms, Max: {max(latencies_hedge):.2f}ms")
 
     def _initialize_csv_file(self):
         if not os.path.exists(self.csv_filename):
@@ -311,57 +374,6 @@ class DNHedgeBot:
             f"{'-' * 55}"
         )
 
-    async def check_grvt_liquidity(
-        self,
-        client,
-        target_quantity: Decimal,
-        side: str
-    ) -> dict:
-        """Check if GRVT has sufficient liquidity at BBO.
-
-        Returns:
-            dict with format:
-            {
-                'sufficient_at_bbo': bool,
-                'available_size': Decimal,
-                'depth_levels_used': int,
-                'fallback_needed': bool
-            }
-        """
-        try:
-            if not hasattr(client, 'analyze_order_book_depth'):
-                self.logger.warning("[LIQUIDITY_CHECK] Client missing analyze_order_book_depth method")
-                return {
-                    'sufficient_at_bbo': False,
-                    'available_size': Decimal('0'),
-                    'depth_levels_used': 0,
-                    'fallback_needed': True
-                }
-
-            analysis = await client.analyze_order_book_depth(
-                symbol=client.config.contract_id,
-                side=side,
-                depth_limit=50
-            )
-
-            bbo_size = analysis['top_size']
-            cumulative = analysis['cumulative']
-
-            return {
-                'sufficient_at_bbo': bbo_size >= target_quantity,
-                'available_size': cumulative,
-                'depth_levels_used': analysis['total_levels_analyzed'],
-                'fallback_needed': cumulative < target_quantity
-            }
-        except Exception as e:
-            self.logger.warning(f"[LIQUIDITY_CHECK] Failed: {e}")
-            return {
-                'sufficient_at_bbo': False,
-                'available_size': Decimal('0'),
-                'depth_levels_used': 0,
-                'fallback_needed': True
-            }
-
     async def cleanup_connections(self):
         if self.hedge_client:
             try:
@@ -456,11 +468,14 @@ class DNHedgeBot:
         if spread_bps >= self.min_spread_bps:
             self.logger.info(
                 f"[ARB] Spread: {spread_bps:.2f} bps >= {self.min_spread_bps} bps -> ENTER"
+                f" (primary_bid={primary_bid:.2f}, primary_ask={primary_ask:.2f}, "
+                f"hedge_bid={hedge_bid:.2f}, hedge_ask={hedge_ask:.2f})"
             )
             return True
         else:
             self.logger.info(
                 f"[ARB] Spread: {spread_bps:.2f} bps < {self.min_spread_bps} bps -> SKIP"
+                f" (break-even: ~7 bps, filter: {self.min_spread_bps} bps)"
             )
             return False
 
@@ -595,6 +610,17 @@ class DNHedgeBot:
 
             # Handle HEDGE order fill via WebSocket
             if status == "FILLED":
+                # SAFETY LAYER #1: Idempotency guard - prevent duplicate WebSocket messages
+                if order_id in self.processed_order_ids:
+                    self.logger.warning(
+                        f"[SAFETY_LAYER_1] Duplicate WebSocket FILLED message ignored. "
+                        f"Order {order_id} already processed."
+                    )
+                    return  # Skip processing duplicate
+
+                # Mark this order as processed
+                self.processed_order_ids.add(order_id)
+
                 if side == "buy":
                     self.hedge_position += filled_size
                     self.local_hedge_position += filled_size
@@ -798,6 +824,8 @@ class DNHedgeBot:
                             break
 
                         if self.primary_order_status == "FILLED":
+                            # SAFETY LAYER #3: Track order ID for next cycle verification
+                            self.last_primary_order_id = order_id
                             return order_id
 
                         if self.primary_order_status in [
@@ -807,10 +835,7 @@ class DNHedgeBot:
                         ]:
                             await asyncio.sleep(0.1)  # Reduced from 0.5s for faster response
 
-                            # OPTIMIZATION: Reduced timeout from 10s to 5s for faster execution
-                            # Expected: 50% speed improvement (77s → <50s per cycle)
-                            # Tradeoff: Fill rate may drop from 95% to 80-90%
-                            if time.time() - start_time > 5:
+                            if time.time() - start_time > 10:
                                 (
                                     best_bid,
                                     best_ask,
@@ -862,7 +887,7 @@ class DNHedgeBot:
 
         use_maker_mode = self.hedge_mode in [PriceMode.BBO_MINUS_1, PriceMode.BBO]
 
-        max_retries = 6  # ENHANCED: 6 retries with exponential backoff for GRVT API stability
+        max_retries = 4  # Increased retries for better reliability
         for attempt in range(1, max_retries + 1):
             try:
                 best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
@@ -897,389 +922,236 @@ class DNHedgeBot:
                 # Backpack/GRVT use string "buy"/"sell" directly
                 order_side = side
 
-                # SOLUTION 3: CLOSE uses iterative market order for GRVT, regular for others
-                if order_type == "CLOSE":
-                    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2"):
-                        self.logger.info(f"[CLOSE] Using ITERATIVE market order for {quantity} ETH")
-                        result = await self.hedge_client.place_iterative_market_order(
-                            contract_id=self.hedge_contract_id,
-                            target_quantity=quantity,
-                            side=order_side,
-                            max_iterations=10,
-                            tick_size=10  # INT: 10 cents = $0.10 - FIXED V4 SIGNATURE
+                # NEW: Try POST_ONLY first for 0% fee, fall back to MARKET if needed
+                hedge_filled = False
+                hedge_fill_price = None
+
+                if self.hedge_post_only and self.hedge_exchange.lower() == "grvt":
+                    try:
+                        # Get BBO for POST_ONLY pricing
+                        best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
+                            self.hedge_contract_id
                         )
 
-                        if result.get('success', True):  # FIXED: Use .get() for safety
-                            filled = extract_filled_quantity(result)
-                            avg_price = result.get('average_price', None) or result.get('traded_size', result.get('size', {}))
+                        # Calculate POST_ONLY price (1 tick inside spread)
+                        if order_side == "buy":
+                            hedge_post_only_price = best_ask - self.hedge_tick_size
+                        else:  # sell
+                            hedge_post_only_price = best_bid + self.hedge_tick_size
+
+                        hedge_post_only_price = self.hedge_client.round_to_tick(hedge_post_only_price)
+
+                        self.logger.info(
+                            f"[CLOSE] [{self.hedge_exchange.upper()}] Attempting POST_ONLY @ {hedge_post_only_price} "
+                            f"(side: {order_side}, fee: 0%)"
+                        )
+
+                        # Try POST_ONLY with 3 second timeout
+                        hedge_result = await asyncio.wait_for(
+                            self.hedge_client.place_post_only_order(
+                                contract_id=self.hedge_contract_id,
+                                quantity=quantity,
+                                price=hedge_post_only_price,
+                                side=order_side
+                            ),
+                            timeout=3.0
+                        )
+
+                        if hedge_result.status == "FILLED":
+                            hedge_filled = True
+                            hedge_fill_price = hedge_result.price
 
                             self.logger.info(
-                                f"[CLOSE] [GRVT] [ITERATIVE_FILL]: "
-                                f"{filled} @ ~{avg_price}"
+                                f"[CLOSE] [POST_ONLY FILLED]: {quantity} @ {hedge_fill_price} "
+                                f"(0% fee saved)"
                             )
 
+                            # Set flags and return success
+                            self.hedge_order_filled = True
+                            self.order_execution_complete = True
+                            self.last_hedge_fill_price = hedge_fill_price
+
+                            # Update tracking variables
+                            self.current_hedge_exit_order_type = "POST_ONLY"
+                            self.current_hedge_exit_fee_saved = True
+
+                            # Log to CSV with POST_ONLY indicator
                             self.log_trade_to_csv(
                                 exchange=self.hedge_exchange.upper(),
                                 side=side,
-                                price=str(avg_price) if avg_price else "N/A",
-                                quantity=str(filled),
-                                order_type="hedge_close_iterative",
-                                mode="iterative_routing"
+                                price=str(hedge_fill_price),
+                                quantity=str(quantity),
+                                order_type="hedge_close_post_only",
+                                mode="post_only_maker",
                             )
 
-                            self.hedge_order_filled = True
-                            self.order_execution_complete = True
-                            self.last_hedge_fill_price = avg_price
                             return True
+
+                        elif hedge_result.status == "OPEN":
+                            # POST_ONLY accepted but not filled - cancel and fallback
+                            self.logger.warning(
+                                f"[CLOSE] POST_ONLY not filled within 3s, canceling order_id={hedge_result.order_id}"
+                            )
+                            cancel_result = await self.hedge_client.cancel_order(hedge_result.order_id)
+                            if not cancel_result.success:
+                                self.logger.error(f"[CLOSE] Failed to cancel POST_ONLY: {cancel_result.error_message}")
                         else:
-                            error_msg = result.get('error', 'unknown') or result.get('reason', 'unknown')
-                            self.logger.error(f"[CLOSE] Iterative failed: {error_msg}")
-                            self.hedge_order_filled = False
-                            self.order_execution_complete = False
-                            return False
-                    else:
-                        # NEW: Try POST_ONLY first for 0% fee, fall back to MARKET if needed
-                        hedge_filled = False
-                        hedge_fill_price = None
-
-                        # Reference: Primary order uses POST_ONLY at line 703
-                        if self.hedge_post_only and self.hedge_exchange.lower() == "grvt":
-                            try:
-                                # Get BBO for POST_ONLY pricing
-                                # VERIFIED: fetch_bbo_prices exists at grvt.py line 340-353
-                                best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
-                                    self.hedge_contract_id
-                                )
-
-                                # Calculate POST_ONLY price (1 tick inside spread)
-                                if order_side == "buy":
-                                    hedge_post_only_price = best_ask - self.hedge_tick_size
-                                else:  # sell
-                                    hedge_post_only_price = best_bid + self.hedge_tick_size
-
-                                hedge_post_only_price = self.hedge_client.round_to_tick(hedge_post_only_price)
-
-                                self.logger.info(
-                                    f"[CLOSE] [{self.hedge_exchange.upper()}] Attempting POST_ONLY @ {hedge_post_only_price} "
-                                    f"(side: {order_side}, fee: 0%)"
-                                )
-
-                                # Try POST_ONLY with 3 second timeout
-                                hedge_result = await asyncio.wait_for(
-                                    self.hedge_client.place_post_only_order(
-                                        contract_id=self.hedge_contract_id,
-                                        quantity=quantity,
-                                        price=hedge_post_only_price,
-                                        side=order_side
-                                    ),
-                                    timeout=3.0
-                                )
-
-                                if hedge_result.status == "FILLED":
-                                    hedge_filled = True
-                                    hedge_fill_price = hedge_result.price
-
-                                    self.logger.info(
-                                        f"[CLOSE] [POST_ONLY FILLED]: {quantity} @ {hedge_fill_price} "
-                                        f"(0% fee saved, from_post_only={hedge_result.from_post_only})"
-                                    )
-
-                                    # VERIFIED: _local_position is updated via WebSocket at grvt.py line 56
-                                    # Additional manual update for immediate tracking
-                                    if hasattr(self.hedge_client, '_local_position'):
-                                        if order_side == "buy":
-                                            self.hedge_client._local_position += quantity
-                                        else:
-                                            self.hedge_client._local_position -= quantity
-
-                                    # Set flags and return success
-                                    self.hedge_order_filled = True
-                                    self.order_execution_complete = True
-                                    self.last_hedge_fill_price = hedge_fill_price
-
-                                    # Update tracking variables
-                                    self.current_hedge_exit_order_type = "POST_ONLY"
-                                    self.current_hedge_exit_fee_saved = True
-
-                                    # Log to CSV with POST_ONLY indicator
-                                    self.log_trade_to_csv(
-                                        exchange=self.hedge_exchange.upper(),
-                                        side=side,
-                                        price=str(hedge_fill_price),
-                                        quantity=str(quantity),
-                                        order_type="hedge_close_post_only",
-                                        mode="post_only_maker",
-                                    )
-
-                                    return True
-
-                                elif hedge_result.status == "OPEN":
-                                    # POST_ONLY accepted but not filled - cancel and fallback
-                                    self.logger.warning(
-                                        f"[CLOSE] POST_ONLY not filled within 3s, canceling order_id={hedge_result.order_id}"
-                                    )
-                                    # VERIFIED: cancel_order exists at grvt.py line 906-920
-                                    cancel_result = await self.hedge_client.cancel_order(hedge_result.order_id)
-                                    if not cancel_result.success:
-                                        self.logger.error(f"[CLOSE] Failed to cancel POST_ONLY: {cancel_result.error_message}")
-                                else:
-                                    self.logger.warning(
-                                        f"[CLOSE] POST_ONLY rejected (status: {hedge_result.status}), falling back to MARKET"
-                                    )
-
-                            except asyncio.TimeoutError:
-                                self.logger.warning(
-                                    f"[CLOSE] POST_ONLY timeout after 3s, falling back to MARKET"
-                                )
-                            except Exception as e:
-                                self.logger.error(
-                                    f"[CLOSE] POST_ONLY failed: {e}, falling back to MARKET"
-                                )
-
-                        # FALLBACK: Use MARKET order (0.05% taker fee)
-                        if not hedge_filled:
-                            self.logger.info(
-                                f"[CLOSE] [{self.hedge_exchange.upper()}] Using MARKET fallback (0.05% taker fee)"
+                            self.logger.warning(
+                                f"[CLOSE] POST_ONLY rejected (status: {hedge_result.status}), falling back to MARKET"
                             )
 
+                    except asyncio.TimeoutError:
+                        self.logger.warning(
+                            f"[CLOSE] POST_ONLY timeout after 3s, falling back to MARKET"
+                        )
+                    except Exception as e:
+                        self.logger.error(
+                            f"[CLOSE] POST_ONLY failed: {e}, falling back to MARKET"
+                        )
+
+                # FALLBACK: Use existing MARKET/ITERATIVE order logic
+                if not hedge_filled:
+                    # SOLUTION 3: CLOSE uses iterative market order for GRVT, regular for others
+                    if order_type == "CLOSE":
+                        if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2"):
+                            self.logger.info(f"[CLOSE] Using ITERATIVE market order for {quantity} ETH")
+                            result = await self.hedge_client.place_iterative_market_order(
+                                contract_id=self.hedge_contract_id,
+                                target_quantity=quantity,
+                                side=order_side,
+                                max_iterations=10,   # Increased from 3 - fixes cold start failures
+                                max_tick_offset=2,    # Sufficient for liquidity depth
+                                max_fill_duration=30  # Increased from 1 - removes timeout constraint
+                            )
+
+                            if result['success']:
+                                self.logger.info(
+                                    f"[CLOSE] [ITERATIVE] Filled {result['total_filled']} @ ${result['average_price']:.2f} "
+                                    f"({result['iterations']} iterations)"
+                                )
+                                self.log_trade_to_csv(
+                                    exchange=self.hedge_exchange.upper(),
+                                    side=side,
+                                    price=str(result['average_price']),
+                                    quantity=str(result['total_filled']),
+                                    order_type="hedge_close_iterative",
+                                    mode="iterative_market"
+                                )
+                                self.hedge_order_filled = True
+                                self.order_execution_complete = True
+                                self.last_hedge_fill_price = result['average_price']
+                                # SAFETY LAYER #3: Track iterative order (self-validating, no order ID)
+                                import time
+                                self.last_hedge_order_id = f"ITERATIVE_{int(time.time())}"
+                                return True
+                            else:
+                                self.logger.error(f"[CLOSE] Iterative failed: {result.get('reason', 'unknown')}")
+                                self.hedge_order_filled = False
+                                self.order_execution_complete = False
+                                return False
+                        else:
+                            # Regular market order for small sizes or non-GRVT
+                            self.logger.info(
+                                f"[CLOSE] [{self.hedge_exchange.upper()}] Using MARKET order for immediate execution"
+                            )
                             # Get position before placing order (REST API for reliability)
                             pos_before_close = await self.hedge_client.get_account_positions()
 
                             # Use true market order (no timeout, immediate fill)
                             order_info = await self.hedge_client.place_market_order(
-                                contract_id=self.hedge_contract_id,
-                                quantity=quantity,
-                                side=order_side,
-                            )
-
-                            # Market orders fill immediately - verify with REST API
-                            await asyncio.sleep(1.0)  # Brief wait for execution
-                            pos_after_close = await self.hedge_client.get_account_positions()
-                            position_change = abs(pos_after_close - pos_before_close)
-
-                            if position_change >= quantity * Decimal("0.9"):
-                                actual_fill_price = best_ask if side == "buy" else best_bid
-                                self.logger.info(
-                                    f"[CLOSE] [MARKET FILLED]: "
-                                    f"{quantity} @ ~{actual_fill_price} (pos: {pos_before_close} -> {pos_after_close})"
-                                )
-
-                                self.log_trade_to_csv(
-                                    exchange=self.hedge_exchange.upper(),
-                                    side=side,
-                                    price=str(actual_fill_price),
-                                    quantity=str(quantity),
-                                    order_type="hedge_close_market_fallback",
-                                    mode="market_taker",
-                                )
-
-                                self.hedge_order_filled = True
-                                self.order_execution_complete = True
-                                self.last_hedge_fill_price = actual_fill_price
-
-                                # Update tracking variables
-                                self.current_hedge_exit_order_type = "MARKET"
-                                self.current_hedge_exit_fee_saved = False
-
-                                return True
-                            else:
-                                self.logger.error(
-                                    f"[CLOSE] Market fallback failed to fill (pos: {pos_before_close} -> {pos_after_close})"
-                                )
-                                self.hedge_order_filled = False
-                                self.order_execution_complete = False
-                                return False
-                else:
-                    # OPEN: Use MARKET order for immediate fill (same as CLOSE)
-                    self.logger.info(
-                        f"[OPEN] [{self.hedge_exchange.upper()}] Using MARKET order for immediate execution"
-                    )
-
-                    # Get position before placing order
-                    pos_before = await self.hedge_client.get_account_positions()
-
-                    # Use iterative approach for GRVT orders > 0.2 ETH, EXCEPT for first BUILD (cold start workaround)
-                    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and self.first_build_completed:
-                        self.logger.info(f"[OPEN] Using ITERATIVE market order for {quantity} ETH")
-                        result = await self.hedge_client.place_iterative_market_order(
                             contract_id=self.hedge_contract_id,
-                            target_quantity=quantity,
+                            quantity=quantity,
                             side=order_side,
-                            max_iterations=10,
-                            tick_size=10  # INT: 10 cents = $0.10 - FIXED V4 SIGNATURE
                         )
 
-                        if result.get('success', True):  # FIXED: Use .get() for safety
-                            filled = extract_filled_quantity(result)
-                            avg_price = result.get('average_price', None) or result.get('traded_size', result.get('size', {}))
+                        # Market orders fill immediately - verify with REST API
+                        await asyncio.sleep(1.0)  # Brief wait for execution
+                        pos_after_close = await self.hedge_client.get_account_positions()
+                        position_change = abs(pos_after_close - pos_before_close)
 
+                        if position_change >= quantity * Decimal("0.9"):
+                            actual_fill_price = best_ask if side == "buy" else best_bid
                             self.logger.info(
-                                f"[OPEN] [GRVT] [ITERATIVE_FILL]: "
-                                f"{filled} @ ~{avg_price}"
+                                f"[CLOSE] [{self.hedge_exchange.upper()}] [FILLED]: "
+                                f"{quantity} @ ~{actual_fill_price} (pos: {pos_before_close} -> {pos_after_close})"
                             )
 
                             self.log_trade_to_csv(
                                 exchange=self.hedge_exchange.upper(),
                                 side=side,
-                                price=str(avg_price) if avg_price else "N/A",
-                                quantity=str(filled),
-                                order_type="hedge_open_iterative",
-                                mode="iterative_routing"
+                                price=str(actual_fill_price),
+                                quantity=str(quantity),
+                                order_type="hedge_close",
+                                mode="market_taker",
                             )
 
                             self.hedge_order_filled = True
                             self.order_execution_complete = True
-                            self.last_hedge_fill_price = avg_price
+                            self.last_hedge_fill_price = actual_fill_price
+                            # SAFETY LAYER #3: Track order ID for next cycle verification
+                            if order_info and hasattr(order_info, 'order_id'):
+                                self.last_hedge_order_id = order_info.order_id
                             return True
                         else:
-                            error_msg = result.get('error', 'unknown') or result.get('reason', 'unknown')
-                            self.logger.error(f"[OPEN] Iterative failed: {error_msg}")
+                            self.logger.error(
+                                f"[CLOSE] Market order failed to fill (pos: {pos_before_close} -> {pos_after_close})"
+                            )
                             self.hedge_order_filled = False
                             self.order_execution_complete = False
                             return False
-
-                    # Place market order for immediate fill
-                    # First BUILD workaround: Try POST_ONLY first, fall back to MARKET if needed
-                    if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:
+                else:
+                        # OPEN: Use MARKET order for immediate fill (same as CLOSE)
                         self.logger.info(
-                            f"[OPEN] [FIRST BUILD] Using POST_ONLY first to avoid cold start issue"
+                            f"[OPEN] [{self.hedge_exchange.upper()}] Using MARKET order for immediate execution"
                         )
 
-                        hedge_filled = False
+                        # Get position before placing order
+                        pos_before = await self.hedge_client.get_account_positions()
 
-                        if self.hedge_post_only and self.hedge_exchange.lower() == "grvt":
-                            try:
-                                # Get BBO for POST_ONLY pricing
-                                best_bid, best_ask = await self.hedge_client.fetch_bbo_prices(
-                                    self.hedge_contract_id
-                                )
-
-                                # Calculate POST_ONLY price (1 tick inside spread)
-                                if order_side == "buy":
-                                    hedge_post_only_price = best_ask - self.hedge_tick_size
-                                else:  # sell
-                                    hedge_post_only_price = best_bid + self.hedge_tick_size
-
-                                hedge_post_only_price = self.hedge_client.round_to_tick(hedge_post_only_price)
-
-                                self.logger.info(
-                                    f"[OPEN] [FIRST BUILD] Attempting POST_ONLY @ {hedge_post_only_price} "
-                                    f"(side: {order_side}, fee: 0%)"
-                                )
-
-                                # Try POST_ONLY with 3 second timeout
-                                hedge_result = await asyncio.wait_for(
-                                    self.hedge_client.place_post_only_order(
-                                        contract_id=self.hedge_contract_id,
-                                        quantity=quantity,
-                                        price=hedge_post_only_price,
-                                        side=order_side
-                                    ),
-                                    timeout=3.0
-                                )
-
-                                if hedge_result.status == "FILLED":
-                                    hedge_filled = True
-
-                                    self.logger.info(
-                                        f"[OPEN] [FIRST BUILD] [POST_ONLY FILLED]: {quantity} @ {hedge_result.price} "
-                                        f"(0% fee saved)"
-                                    )
-
-                                    # Update local position
-                                    if hasattr(self.hedge_client, '_local_position'):
-                                        if order_side == "buy":
-                                            self.hedge_client._local_position += quantity
-                                        else:
-                                            self.hedge_client._local_position -= quantity
-
-                                    # Set flags
-                                    self.hedge_order_filled = True
-                                    self.order_execution_complete = True
-                                    self.last_hedge_fill_price = hedge_result.price
-
-                                    # Update tracking variables
-                                    self.current_hedge_entry_order_type = "POST_ONLY"
-                                    self.current_hedge_entry_fee_saved = True
-
-                                    # Log to CSV
-                                    self.log_trade_to_csv(
-                                        exchange=self.hedge_exchange.upper(),
-                                        side=side,
-                                        price=str(hedge_result.price),
-                                        quantity=str(quantity),
-                                        order_type="hedge_open_first_build_post_only",
-                                        mode="post_only_maker",
-                                    )
-
-                                    return True
-
-                                elif hedge_result.status == "OPEN":
-                                    self.logger.warning(
-                                        f"[OPEN] [FIRST BUILD] POST_ONLY not filled, canceling and falling back"
-                                    )
-                                    await self.hedge_client.cancel_order(hedge_result.order_id)
-                                else:
-                                    self.logger.warning(
-                                        f"[OPEN] [FIRST BUILD] POST_ONLY rejected, falling back to MARKET"
-                                    )
-
-                            except asyncio.TimeoutError:
-                                self.logger.warning(f"[OPEN] [FIRST BUILD] POST_ONLY timeout, falling back to MARKET")
-                            except Exception as e:
-                                self.logger.error(f"[OPEN] [FIRST BUILD] POST_ONLY failed: {e}, falling back to MARKET")
-
-                        # FALLBACK: Use regular MARKET to avoid GRVT cold start issue
-                        if not hedge_filled:
-                            self.logger.info(
-                                f"[OPEN] [FIRST BUILD] Using MARKET fallback (0.05% taker fee)"
-                            )
-
-                            order_info = await self.hedge_client.place_market_order(
+                        # Use iterative approach for GRVT orders > 0.2 ETH, EXCEPT for first BUILD (cold start workaround)
+                        if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and self.first_build_completed:
+                            self.logger.info(f"[OPEN] Using ITERATIVE market order for {quantity} ETH")
+                            result = await self.hedge_client.place_iterative_market_order(
                                 contract_id=self.hedge_contract_id,
-                                quantity=quantity,
+                                target_quantity=quantity,
                                 side=order_side,
+                                max_iterations=10,   # Increased from 3 - fixes cold start failures
+                                max_tick_offset=2,    # Sufficient for liquidity depth
+                                max_fill_duration=30  # Increased from 1 - removes timeout constraint
                             )
 
-                            # Wait briefly for execution and verify
-                            await asyncio.sleep(1.0)
-                            pos_after = await self.hedge_client.get_account_positions()
-                            position_change = abs(pos_after - pos_before)
-
-                            if position_change >= quantity * Decimal("0.9"):
-                                actual_fill_price = best_ask if side == "buy" else best_bid
+                            if result['success']:
                                 self.logger.info(
-                                    f"[OPEN] [FIRST BUILD] [MARKET FILLED]: "
-                                    f"{quantity} @ ~{actual_fill_price} (pos: {pos_before} -> {pos_after})"
+                                    f"[OPEN] [ITERATIVE] Filled {result['total_filled']} @ ${result['average_price']:.2f} "
+                                    f"({result['iterations']} iterations)"
                                 )
-
                                 self.log_trade_to_csv(
                                     exchange=self.hedge_exchange.upper(),
                                     side=side,
-                                    price=str(actual_fill_price),
-                                    quantity=str(quantity),
-                                    order_type="hedge_open_first_build_market_fallback",
-                                    mode="market_taker",
+                                    price=str(result['average_price']),
+                                    quantity=str(result['total_filled']),
+                                    order_type="hedge_open_iterative",
+                                    mode="iterative_market"
                                 )
-
                                 self.hedge_order_filled = True
                                 self.order_execution_complete = True
-                                self.last_hedge_fill_price = actual_fill_price
-
-                                # Update tracking variables
-                                self.current_hedge_entry_order_type = "MARKET"
-                                self.current_hedge_entry_fee_saved = False
-
+                                self.last_hedge_fill_price = result['average_price']
+                                # SAFETY LAYER #3: Track iterative order (self-validating, no order ID)
+                                import time
+                                self.last_hedge_order_id = f"ITERATIVE_{int(time.time())}"
                                 return True
                             else:
-                                self.logger.error(
-                                    f"[OPEN] [FIRST BUILD] Market fallback failed to fill (pos: {pos_before} -> {pos_after})"
-                                )
+                                self.logger.error(f"[OPEN] Iterative failed: {result.get('reason', 'unknown')}")
                                 self.hedge_order_filled = False
                                 self.order_execution_complete = False
                                 return False
-                    else:
-                        # Regular market order for small sizes or non-first-build
+
+                        # Place market order for immediate fill
+                        # First BUILD workaround: Use regular MARKET to avoid GRVT cold start issue
+                        if self.hedge_exchange.lower() == "grvt" and quantity > Decimal("0.2") and not self.first_build_completed:
+                            self.logger.info(
+                                f"[OPEN] [FIRST BUILD] Using regular MARKET (not ITERATIVE) to avoid cold start issue"
+                            )
                         order_info = await self.hedge_client.place_market_order(
                             contract_id=self.hedge_contract_id,
                             quantity=quantity,
@@ -1310,6 +1182,9 @@ class DNHedgeBot:
                             self.hedge_order_filled = True
                             self.order_execution_complete = True
                             self.last_hedge_fill_price = actual_fill_price
+                            # SAFETY LAYER #3: Track order ID for next cycle verification
+                            if order_info and hasattr(order_info, 'order_id'):
+                                self.last_hedge_order_id = order_info.order_id
                             return True
                         else:
                             self.logger.error(
@@ -1398,6 +1273,9 @@ class DNHedgeBot:
                                     # Consider it executed
                                     self.hedge_order_filled = True
                                     self.order_execution_complete = True
+                                    # SAFETY LAYER #3: Track close order ID for next cycle verification
+                                    if close_result and hasattr(close_result, 'order_id'):
+                                        self.last_hedge_order_id = close_result.order_id
                                     return True
                                 except Exception as close_error:
                                     self.logger.error(f"[{order_type}] Failed to close at market: {close_error}")
@@ -1420,10 +1298,8 @@ class DNHedgeBot:
                     f"Error placing HEDGE order (attempt {attempt}/{max_retries}): {e}"
                 )
                 if attempt < max_retries:
-                    # ENHANCED: Exponential backoff (1s, 2s, 4s, 8s, 16s, 32s)
-                    delay = 2 ** (attempt - 1)
-                    self.logger.info(f"Retrying hedge order in {delay} second(s)...")
-                    await asyncio.sleep(delay)
+                    self.logger.info(f"Retrying hedge order in 1 second...")
+                    await asyncio.sleep(1)
                 else:
                     self.logger.error(f"All {max_retries} hedge attempts failed!")
                     self.logger.error(traceback.format_exc())
@@ -1811,10 +1687,6 @@ class DNHedgeBot:
         self.current_websocket_latency = 0
         self.current_rest_latency = 0
         self.current_reconciliation_time = 0
-        self.current_hedge_entry_order_type = "MARKET"
-        self.current_hedge_exit_order_type = "MARKET"
-        self.current_hedge_entry_fee_saved = False
-        self.current_hedge_exit_fee_saved = False
 
     def _create_trade_metrics(self, iteration: int, direction: str) -> TradeMetrics:
         """Create TradeMetrics object from current cycle data."""
@@ -1838,10 +1710,6 @@ class DNHedgeBot:
             reconciliation_time=self.current_reconciliation_time,
             repricing_count=self.repricing_count,
             total_cycle_time=cycle_time,
-            hedge_entry_order_type=self.current_hedge_entry_order_type,
-            hedge_exit_order_type=self.current_hedge_exit_order_type,
-            hedge_entry_fee_saved=self.current_hedge_entry_fee_saved,
-            hedge_exit_fee_saved=self.current_hedge_exit_fee_saved,
         )
 
     async def _pre_trade_check(self):
@@ -1887,6 +1755,184 @@ class DNHedgeBot:
             f"[SAFETY] Pre-trade checks passed: Pos={total_pos}/{self.MAX_POSITION}, "
             f"DailyPnL=${self.daily_pnl:.2f}/${self.MAX_DAILY_LOSS}, NetDelta={net_delta}"
         )
+
+    def _track_unwind_progress(self, current_position: Decimal) -> bool:
+        """Track UNWIND progress and detect if stuck.
+
+        Returns True if UNWIND is making progress, False if stuck.
+        """
+        # Initialize on first UNWIND cycle
+        if self.unwind_cycle_count == 0:
+            self.unwind_start_position = abs(current_position)
+            self.logger.info(
+                f"[SAFETY_LAYER_2] UNWIND tracking started. "
+                f"Starting position: {self.unwind_start_position}"
+            )
+            return True
+
+        self.unwind_cycle_count += 1
+        current_magnitude = abs(current_position)
+
+        # Check if position is decreasing
+        if current_magnitude < self.unwind_start_position:
+            self.unwind_start_position = current_magnitude
+            self.unwind_cycle_count = 0
+            self.logger.info(
+                f"[SAFETY_LAYER_2] UNWIND progress: {current_magnitude:.4f} "
+                f"(decreasing from previous {self.unwind_start_position:.4f})"
+            )
+            return True
+        else:
+            # Not decreasing - check threshold
+            if self.unwind_cycle_count >= self.unwind_stuck_threshold:
+                self.logger.error(
+                    f"[SAFETY_LAYER_2] UNWIND STUCK: Position {current_magnitude:.4f} "
+                    f"has not decreased for {self.unwind_cycle_count} cycles. "
+                    f"Triggering FORCE CLOSE."
+                )
+                return False
+            else:
+                self.logger.warning(
+                    f"[SAFETY_LAYER_2] UNWIND not decreasing: {current_magnitude:.4f}. "
+                    f"Cycle {self.unwind_cycle_count}/{self.unwind_stuck_threshold}"
+                )
+                return True
+
+    async def _force_unwind_close(self):
+        """Force close both exchanges when UNWIND is stuck."""
+        self.logger.error("[SAFETY_LAYER_2] Forcing market close of both exchanges...")
+
+        try:
+            await self.force_close_all_positions()
+            await asyncio.sleep(2)
+
+            # Verify positions are flat
+            api_primary, api_hedge = await self.get_positions(force_api=True)
+            net_delta = api_primary + api_hedge
+
+            if abs(net_delta) < Decimal("0.01"):
+                self.logger.info(
+                    f"[SAFETY_LAYER_2] Force close successful. "
+                    f"Net delta: {net_delta}"
+                )
+                self.unwind_cycle_count = 0
+                self.unwind_start_position = Decimal("0")
+            else:
+                self.logger.error(f"[SAFETY_LAYER_2] Force close incomplete! Net delta: {net_delta}")
+                self.stop_flag = True
+        except Exception as e:
+            self.logger.error(f"[SAFETY_LAYER_2] Error during force close: {e}")
+            self.stop_flag = True
+
+    async def _verify_previous_orders_filled(self) -> bool:
+        """Verify previous cycle's orders are FILLED via REST API.
+
+        Returns True if all orders FILLED, False if any orders still open/canceled.
+        """
+        # First cycle - no previous orders to check
+        if self.last_primary_order_id is None and self.last_hedge_order_id is None:
+            self.logger.info("[SAFETY_LAYER_3] First cycle - no previous orders to verify")
+            return True
+
+        # Architect: Skip iterative orders (they return dict, not order IDs)
+        # Iterative orders are self-validating - they complete immediately
+        if self.last_hedge_order_id and self.last_hedge_order_id.startswith("ITERATIVE_"):
+            self.logger.info(
+                f"[SAFETY_LAYER_3] Skipping iterative order verification "
+                f"(self-validating): {self.last_hedge_order_id}"
+            )
+            return True
+
+        self.logger.info(
+            f"[SAFETY_LAYER_3] Verifying previous orders: "
+            f"Primary={self.last_primary_order_id}, Hedge={self.last_hedge_order_id}"
+        )
+
+        orders_still_open = False
+
+        # Check primary order status using get_order_info()
+        if self.last_primary_order_id:
+            try:
+                import time
+                start_time = time.time()
+
+                primary_order_info = await self.primary_client.get_order_info(self.last_primary_order_id)
+
+                latency_ms = (time.time() - start_time) * 1000
+                self.logger.info(
+                    f"[SAFETY_LAYER_3] REST API latency: {latency_ms:.2f}ms"
+                )
+
+                if primary_order_info:
+                    primary_status = primary_order_info.status
+                    self.logger.info(
+                        f"[SAFETY_LAYER_3] Primary order {self.last_primary_order_id}: {primary_status}"
+                    )
+
+                    if primary_status not in ["FILLED", "CLOSED"]:
+                        self.logger.error(
+                            f"[SAFETY_LAYER_3] Primary order {self.last_primary_order_id} "
+                            f"is {primary_status} (expected FILLED). Position may be stuck."
+                        )
+                        orders_still_open = True
+                else:
+                    self.logger.error(
+                        f"[SAFETY_LAYER_3] Primary order info returned None for {self.last_primary_order_id}"
+                    )
+                    orders_still_open = True
+
+            except Exception as e:
+                self.logger.error(
+                    f"[SAFETY_LAYER_3] Error checking primary order: {e}"
+                )
+                orders_still_open = True
+
+        # Check hedge order status using get_order_info()
+        if self.last_hedge_order_id:
+            try:
+                import time
+                start_time = time.time()
+
+                hedge_order_info = await self.hedge_client.get_order_info(self.last_hedge_order_id)
+
+                latency_ms = (time.time() - start_time) * 1000
+                self.logger.info(
+                    f"[SAFETY_LAYER_3] REST API latency: {latency_ms:.2f}ms"
+                )
+
+                if hedge_order_info:
+                    hedge_status = hedge_order_info.status
+                    self.logger.info(
+                        f"[SAFETY_LAYER_3] Hedge order {self.last_hedge_order_id}: {hedge_status}"
+                    )
+
+                    if hedge_status not in ["FILLED", "CLOSED"]:
+                        self.logger.error(
+                            f"[SAFETY_LAYER_3] Hedge order {self.last_hedge_order_id} "
+                            f"is {hedge_status} (expected FILLED). Position may be stuck."
+                        )
+                        orders_still_open = True
+                else:
+                    self.logger.error(
+                        f"[SAFETY_LAYER_3] Hedge order info returned None for {self.last_hedge_order_id}"
+                    )
+                    orders_still_open = True
+
+            except Exception as e:
+                self.logger.error(
+                    f"[SAFETY_LAYER_3] Error checking hedge order: {e}"
+                )
+                orders_still_open = True
+
+        if orders_still_open:
+            self.logger.error(
+                "[SAFETY_LAYER_3] Previous orders NOT FILLED. "
+                "Forcing UNWIND before allowing new BUILD."
+            )
+            return False
+        else:
+            self.logger.info("[SAFETY_LAYER_3] All previous orders FILLED - safe to BUILD")
+            return True
 
     async def execute_dn_cycle(
         self, direction: str
@@ -2000,11 +2046,10 @@ class DNHedgeBot:
         )
 
         try:
-            # FIX: Changed side= to direction= (Backpack API expects 'direction' parameter)
             await self.primary_client.place_market_order(
                 contract_id=self.primary_contract_id,
                 quantity=unwind_qty,
-                direction=unwind_side
+                side=unwind_side
             )
             self.logger.error(
                 f"[EMERGENCY_UNWIND] Successfully unwound Primary: "
@@ -2123,6 +2168,34 @@ class DNHedgeBot:
             )
 
             # ===== BUILD Phase: max_position =====
+            # SAFETY LAYER #3: Verify previous orders filled before BUILD
+            if not await self._verify_previous_orders_filled():
+                self.logger.warning(
+                    "[SAFETY_LAYER_3] Previous orders not filled. "
+                    "Forcing UNWIND before BUILD to prevent accumulation."
+                )
+
+                # Force unwind any stuck positions
+                await self._force_unwind_close()
+
+                # Re-verify after force close
+                await asyncio.sleep(2)
+                api_primary, api_hedge = await self.get_positions(force_api=True)
+                net_delta = api_primary + api_hedge
+
+                if abs(net_delta) < Decimal("0.01"):
+                    self.logger.info(
+                        "[SAFETY_LAYER_3] Positions flat after force close. "
+                        "Proceeding with BUILD phase."
+                    )
+                else:
+                    self.logger.error(
+                        f"[SAFETY_LAYER_3] Cannot proceed - positions still not flat: "
+                        f"Primary={api_primary}, Hedge={api_hedge}, Net={net_delta}"
+                    )
+                    self.stop_flag = True
+                    break
+
             while (
                 abs(self.primary_client.get_ws_position()) < self.max_position
                 and not self.stop_flag
@@ -2175,6 +2248,10 @@ class DNHedgeBot:
                 await asyncio.sleep(self.sleep_time)
 
             # ===== UNWIND Phase: 0 =====
+            # Safety Layer #2: Reset UNWIND tracking
+            self.unwind_cycle_count = 0
+            self.unwind_start_position = Decimal("0")
+
             while (
                 abs(self.primary_client.get_ws_position()) > 0
                 and not self.stop_flag
@@ -2202,6 +2279,12 @@ class DNHedgeBot:
                 if abs(net_delta) > self.order_quantity * 5:
                     self.logger.error(f"Position imbalance too large: {net_delta}")
                     self.stop_flag = True
+                    break
+
+                # Safety Layer #2: Track UNWIND progress and detect if stuck
+                if not self._track_unwind_progress(self.primary_position):
+                    # UNWIND is stuck - force close and break
+                    await self._force_unwind_close()
                     break
 
                 if not await self.check_arbitrage_opportunity(unwind_direction):
@@ -2329,7 +2412,10 @@ Examples:
         "--ticker", type=str, default="SOL", help="Ticker symbol (default: SOL)"
     )
     parser.add_argument(
-        "--size", type=str, required=True, help="Order quantity per trade"
+        "--size",
+        type=str,
+        default="0.2",
+        help="Order quantity per trade in ETH (default: 0.2, max for GRVT liquidity: 0.2-0.3)",
     )
     parser.add_argument(
         "--iter", type=int, required=True, help="Number of trading iterations"
@@ -2384,13 +2470,13 @@ Examples:
         "--hedge-post-only",
         action="store_true",
         default=True,
-        help="Use POST_ONLY for hedge orders to save 0.05% taker fee (default: True)",
+        help="Use POST_ONLY orders for hedge (0% maker fee, default: enabled)",
     )
     parser.add_argument(
         "--hedge-market",
-        action="store_true",
-        default=False,
-        help="Use MARKET for hedge orders (0.05% taker fee) - disables POST_ONLY",
+        action="store_false",
+        dest="hedge_post_only",
+        help="Use MARKET orders for hedge (0.05% taker fee, disables POST_ONLY)",
     )
     parser.add_argument(
         "--env-file", type=str, default=".env", help=".env file path (default: .env)"
@@ -2398,8 +2484,8 @@ Examples:
     parser.add_argument(
         "--min-spread",
         type=str,
-        default="0",
-        help="Minimum spread in bps to enter trade (default: 0 = disabled)",
+        default="5",
+        help="Minimum spread in bps to enter trade (default: 5, break-even: ~7 bps, 0 = disabled)",
     )
     return parser.parse_args()
 
@@ -2422,7 +2508,6 @@ async def main():
 
     primary_mode = PriceMode(args.primary_mode)
     hedge_mode = PriceMode(args.hedge_mode)
-    hedge_post_only = args.hedge_post_only and not args.hedge_market
 
     bot = DNHedgeBot(
         ticker=args.ticker.upper(),
@@ -2435,7 +2520,7 @@ async def main():
         hedge_exchange=args.hedge,
         primary_mode=primary_mode,
         hedge_mode=hedge_mode,
-        hedge_post_only=hedge_post_only,
+        hedge_post_only=args.hedge_post_only,
         min_spread_bps=Decimal(args.min_spread),
     )
 
