@@ -594,13 +594,28 @@ class NadoClient(BaseExchangeClient):
                 # For IOC orders to fill immediately, they must match with standing orders
                 product_id_int = int(contract_id)
 
+                # Volatility-regime-based slippage tolerance
+                slippage_bps = 1
+                try:
+                    if hasattr(self, 'get_bbo_handler') and self.get_bbo_handler():
+                        spread_state = self.get_bbo_handler().get_spread_state()
+                        if spread_state == "WIDENING":
+                            slippage_bps = 2
+                        elif spread_state == "NARROWING":
+                            slippage_bps = 0.5
+                except Exception as e:
+                    self.logger.debug(f"[IOC] Using default slippage: {e}")
+
+                # Progressive price improvement on retry
+                retry_improvement_bps = retry_count * 2  # 0, 2, 4 bps
+                total_slippage_bps = slippage_bps + retry_improvement_bps
+
+                # Apply combined slippage
                 if direction == 'buy':
-                    # Buy at best ask to match with standing sell orders
-                    order_price = self._round_price_to_increment(product_id_int, best_ask)
+                    order_price_raw = best_ask * (Decimal('1') + Decimal(str(total_slippage_bps)) / Decimal('10000'))
                 else:
-                    # Sell at best bid to match with standing buy orders
-                    # No need to go below - matching at the bid should work as a taker
-                    order_price = self._round_price_to_increment(product_id_int, best_bid)
+                    order_price_raw = best_bid * (Decimal('1') - Decimal(str(total_slippage_bps)) / Decimal('10000'))
+                order_price = self._round_price_to_increment(product_id_int, order_price_raw)
 
                 # Round quantity to size increment (tick size for quantity) FIRST
                 rounded_quantity = self._round_quantity_to_size_increment(product_id_int, quantity)
@@ -768,13 +783,28 @@ class NadoClient(BaseExchangeClient):
                 # Convert to product_id int
                 product_id_int = int(contract_id)
 
-                # CRITICAL FIX #4: Use taker pricing for IOC: match with standing orders at the touch
+                # CRITICAL FIX #4: Volatility-regime-based slippage tolerance for IOC pricing
+                slippage_bps = 1
+                try:
+                    if hasattr(self, 'get_bbo_handler') and self.get_bbo_handler():
+                        spread_state = self.get_bbo_handler().get_spread_state()
+                        if spread_state == "WIDENING":
+                            slippage_bps = 2
+                        elif spread_state == "NARROWING":
+                            slippage_bps = 0.5
+                except Exception as e:
+                    self.logger.debug(f"[CLOSE IOC] Using default slippage: {e}")
+
+                # Progressive price improvement on retry
+                retry_improvement_bps = retry_count * 2  # 0, 2, 4 bps
+                total_slippage_bps = slippage_bps + retry_improvement_bps
+
+                # Apply combined slippage
                 if side.lower() == 'buy':
-                    # Buy at best ask to match with standing sell orders
-                    order_price = self._round_price_to_increment(product_id_int, best_ask)
+                    order_price_raw = best_ask * (Decimal('1') + Decimal(str(total_slippage_bps)) / Decimal('10000'))
                 else:
-                    # Sell at best bid to match with standing buy orders
-                    order_price = self._round_price_to_increment(product_id_int, best_bid)
+                    order_price_raw = best_bid * (Decimal('1') - Decimal(str(total_slippage_bps)) / Decimal('10000'))
+                order_price = self._round_price_to_increment(product_id_int, order_price_raw)
 
                 # CRITICAL FIX #3: Round quantity to size increment FIRST
                 rounded_quantity = self._round_quantity_to_size_increment(product_id_int, quantity)

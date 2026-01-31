@@ -20,13 +20,14 @@ import sys
 import time
 import csv
 from decimal import Decimal
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from datetime import datetime
 import pytz
 
 # Import exchanges modules (like Mean Reversion bot)
 from hedge.exchanges.nado import NadoClient
 from hedge.exchanges.base import OrderResult
+from hedge.rollback_monitor import RollbackMonitor
 
 
 class Config:
@@ -126,6 +127,10 @@ class DNPairBot:
             "worst_cycle_pnl": Decimal("0")
         }
         self.cycle_id = 0  # Unique cycle identifier
+
+        # Rollback monitoring
+        self.rollback_monitor = RollbackMonitor()
+        self._had_safety_stop = False  # Track if current cycle had safety stop
 
         # Real-time PNL logging task
         self._realtime_pnl_task = None
@@ -357,6 +362,7 @@ class DNPairBot:
         self,
         eth_direction: str,
         sol_direction: str,
+        attempt_count: int = 0,
     ) -> Tuple[OrderResult, OrderResult]:
         """Place ETH and SOL orders simultaneously using REST-based position monitoring.
 
@@ -447,19 +453,85 @@ class DNPairBot:
                 self.logger.error(f"[ORDER] SOL order failed: {sol_result}")
                 sol_result = OrderResult(success=False, error_message=str(sol_result))
 
-            # Check if both filled (POST_ONLY orders return with OPEN status)
-            # For POST_ONLY, we need to check if they were filled or just placed
-            eth_filled = isinstance(eth_result, OrderResult) and eth_result.success and eth_result.status in ('FILLED', 'OPEN')
-            sol_filled = isinstance(sol_result, OrderResult) and sol_result.success and sol_result.status in ('FILLED', 'OPEN')
+            # POST_ONLY: Poll and wait for actual fills (OPEN != filled)
+            POST_ONLY_TIMEOUT = 5.0
+            POLL_INTERVAL = 0.1
+            eth_fill_event = asyncio.Event()
+            sol_fill_event = asyncio.Event()
 
-            if eth_filled and sol_filled:
-                self.logger.info("[ORDER] Both POST_ONLY orders placed successfully")
-                # For POST_ONLY orders that are OPEN, we need to wait for fills or cancel
-                # For simplicity, we'll treat OPEN as success and let the exchange handle fills
-                # In production, you'd monitor for fills or cancel after timeout
-            else:
-                self.logger.warning(f"[ORDER] POST_ONLY partial/no fill: ETH={eth_filled}, SOL={sol_filled}")
-                # TODO: V5.4 - Fall back to IOC if POST_ONLY doesn't fill
+            async def poll_eth_fill():
+                try:
+                    for _ in range(int(POST_ONLY_TIMEOUT / POLL_INTERVAL)):
+                        if eth_result.order_id:
+                            order_info = await self.eth_client.get_order_info(eth_result.order_id)
+                            if order_info and order_info.remaining_size == 0:
+                                eth_fill_event.set()
+                                return
+                        await asyncio.sleep(POLL_INTERVAL)
+                except Exception as e:
+                    self.logger.warning(f"[ORDER] Error polling ETH fill: {e}")
+
+            async def poll_sol_fill():
+                try:
+                    for _ in range(int(POST_ONLY_TIMEOUT / POLL_INTERVAL)):
+                        if sol_result.order_id:
+                            order_info = await self.sol_client.get_order_info(sol_result.order_id)
+                            if order_info and order_info.remaining_size == 0:
+                                sol_fill_event.set()
+                                return
+                        await asyncio.sleep(POLL_INTERVAL)
+                except Exception as e:
+                    self.logger.warning(f"[ORDER] Error polling SOL fill: {e}")
+
+            poll_task = asyncio.gather(poll_eth_fill(), poll_sol_fill())
+
+            try:
+                await asyncio.wait_for(asyncio.gather(
+                    eth_fill_event.wait(),
+                    sol_fill_event.wait()
+                ), timeout=POST_ONLY_TIMEOUT)
+                self.logger.info("[ORDER] Both POST_ONLY orders filled successfully")
+                poll_task.cancel()
+            except asyncio.TimeoutError:
+                self.logger.warning("[ORDER] POST_ONLY timeout, checking fill status...")
+                eth_order_info = await self.eth_client.get_order_info(eth_result.order_id) if eth_result.order_id else None
+                sol_order_info = await self.sol_client.get_order_info(sol_result.order_id) if sol_result.order_id else None
+                eth_filled = eth_order_info and eth_order_info.remaining_size == 0
+                sol_filled = sol_order_info and sol_order_info.remaining_size == 0
+                if not (eth_filled and sol_filled):
+                    # Cancel any open POST_ONLY orders
+                    try:
+                        if eth_result.status == 'OPEN' and eth_result.order_id:
+                            await self.eth_client.cancel_order(eth_result.order_id)
+                    except Exception as e:
+                        self.logger.error(f"[CANCEL] Failed to cancel ETH order: {e}")
+
+                    try:
+                        if sol_result.status == 'OPEN' and sol_result.order_id:
+                            await self.sol_client.cancel_order(sol_result.order_id)
+                    except Exception as e:
+                        self.logger.error(f"[CANCEL] Failed to cancel SOL order: {e}")
+
+                    # Recursive fallback with attempt limit
+                    if attempt_count < 2:
+                        self.logger.warning(
+                            f"[ORDER] POST_ONLY incomplete (attempt {attempt_count + 1}/2), "
+                            f"falling back to IOC"
+                        )
+                        original_mode = self.use_post_only
+                        self.use_post_only = False
+                        try:
+                            return await self.place_simultaneous_orders(
+                                eth_direction, sol_direction, attempt_count + 1
+                            )
+                        finally:
+                            self.use_post_only = original_mode
+                    else:
+                        self.logger.error("[ORDER] Max attempts exceeded, aborting cycle")
+                        return (
+                            OrderResult(success=False, error_message="POST_ONLY and IOC both failed"),
+                            OrderResult(success=False, error_message="POST_ONLY and IOC both failed")
+                        )
 
             # Store order results for further processing
             # Note: POST_ONLY orders may return with status='OPEN' instead of 'FILLED'
@@ -546,6 +618,34 @@ class DNPairBot:
             self.logger.warning(f"[FILL] SOL order partially filled: {sol_fill_qty}/{sol_qty}")
         else:
             self.logger.warning(f"[FILL] SOL order did not fill")
+
+        # Hybrid partial fill handling for IOC mode
+        # Check if both orders had partial fills (not fully filled, but some quantity filled)
+        if not self.use_post_only and eth_fill_qty > 0 and sol_fill_qty > 0:
+            if (eth_fill_qty < eth_qty or sol_fill_qty < sol_qty):
+                # At least one order was partially filled
+                should_proceed, reason, retry_coro = self._handle_partial_fill(
+                    eth_filled=eth_filled,
+                    sol_filled=sol_filled,
+                    eth_fill_qty=eth_fill_qty,
+                    sol_fill_qty=sol_fill_qty,
+                    eth_target_qty=eth_qty,
+                    sol_target_qty=sol_qty,
+                    eth_direction=eth_direction,
+                    sol_direction=sol_direction
+                )
+                if not should_proceed:
+                    # Partial fill rejected - trigger emergency unwind
+                    self.logger.warning(f"[PARTIAL] {reason}")
+                    await self.handle_emergency_unwind(eth_result, sol_result)
+                    return eth_result, sol_result
+                elif retry_coro is not None:
+                    # Partial fill accepted - execute retry
+                    self.logger.info(f"[PARTIAL] {reason}")
+                    return await retry_coro
+                else:
+                    # Fill acceptable (>80%), proceed with normal flow
+                    self.logger.info(f"[PARTIAL] {reason}")
 
         # Log actual fills to CSV
         # Fee rate based on order mode: POST_ONLY = 2 bps (maker), IOC = 5 bps (taker)
@@ -685,6 +785,48 @@ class DNPairBot:
             except Exception:
                 pass
 
+    def _handle_partial_fill(
+        self,
+        eth_filled: bool,
+        sol_filled: bool,
+        eth_fill_qty: Decimal,
+        sol_fill_qty: Decimal,
+        eth_target_qty: Decimal,
+        sol_target_qty: Decimal,
+        eth_direction: str,
+        sol_direction: str
+    ) -> tuple[bool, str, Optional]:
+        """
+        Hybrid partial fill handling with complete retry logic.
+        Returns: (should_proceed, reason, retry_coroutine)
+        """
+        eth_fill_ratio = float(eth_fill_qty / eth_target_qty) if eth_target_qty > 0 else 0
+        sol_fill_ratio = float(sol_fill_qty / sol_target_qty) if sol_target_qty > 0 else 0
+        avg_fill_ratio = (eth_fill_ratio + sol_fill_ratio) / 2
+
+        # Check for dangerous imbalance
+        imbalance = abs(eth_fill_ratio - sol_fill_ratio)
+        if imbalance > 0.5:
+            return False, f"Dangerous fill imbalance: ETH={eth_fill_ratio:.1%}, SOL={sol_fill_ratio:.1%}", None
+
+        # Hybrid decision logic
+        if avg_fill_ratio < 0.2:
+            return False, f"Insufficient fill: {avg_fill_ratio:.1%} < 20%", None
+        elif avg_fill_ratio < 0.8:
+            # Retry remaining quantities
+            retry_qty_eth = eth_target_qty - eth_fill_qty
+            retry_qty_sol = sol_target_qty - sol_fill_qty
+            self.logger.info(
+                f"[PARTIAL] {avg_fill_ratio:.1%} filled, retrying remaining: "
+                f"ETH={retry_qty_eth}, SOL={retry_qty_sol}"
+            )
+            async def retry_remaining():
+                return await self.execute_entry(retry_qty_eth, retry_qty_sol)
+            return True, "Partial fill accepted, retrying remaining", retry_remaining()
+        else:
+            # > 80% filled: accept and proceed
+            return True, f"Fill acceptable: {avg_fill_ratio:.1%}", None
+
     def _prepare_csv_params(
         self,
         exchange: str,
@@ -786,7 +928,13 @@ class DNPairBot:
             - max_spread_bps: Maximum of ETH/SOL spreads in bps
             - reason: Skip reason if not profitable
         """
-        MIN_SPREAD_BPS = self.min_spread_bps  # Use configured value
+        # CRITICAL: Mode-aware breakeven calculation
+        # POST_ONLY: 2 bps x 4 legs = 8 bps breakeven
+        # IOC: 5 bps x 4 legs = 20 bps breakeven
+        if self.use_post_only:
+            MIN_SPREAD_BPS = max(self.min_spread_bps, 8)  # Maker fees
+        else:
+            MIN_SPREAD_BPS = max(self.min_spread_bps, 20)  # Taker fees - CRITICAL FIX
 
         # Calculate spreads in bps: (ask - bid) / mid_price * 10000
         eth_mid = (eth_bid + eth_ask) / 2
@@ -1007,10 +1155,22 @@ class DNPairBot:
         """
         from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
 
-        # Default thresholds (STABLE)
-        profit_target = 15
-        quick_exit = 5
-        stop_loss = 30
+        # Fee-aware profit targets (remaining fees only)
+        # Entry fees ALREADY PAID: 10 bps (IOC) or 4 bps (POST_ONLY)
+        # Exit fees REMAINING: 10 bps (IOC) or 4 bps (POST_ONLY)
+        remaining_exit_fees_bps = 10 if not self.use_post_only else 4
+
+        BASE_PROFIT = 15
+        MIN_NET_PROFIT = 5
+
+        profit_target = BASE_PROFIT + remaining_exit_fees_bps  # 25 for IOC, 19 for POST_ONLY
+        quick_exit = MIN_NET_PROFIT + remaining_exit_fees_bps  # 15 for IOC, 9 for POST_ONLY
+        stop_loss = 30  # Stop loss remains absolute
+
+        self.logger.info(
+            f"[EXIT] Fee-aware thresholds: profit_target={profit_target}bps, "
+            f"quick_exit={quick_exit}bps (remaining_exit_fees={remaining_exit_fees_bps}bps)"
+        )
 
         spread_state = None
 
@@ -1221,6 +1381,24 @@ class DNPairBot:
                 f"[CYCLE {self.cycle_id}] PNL Summary: "
                 f"NoFee=${pnl_no_fee:.2f}, WithFee=${pnl_with_fee:.2f}, "
                 f"Fees=${total_fees:.2f}"
+            )
+
+            # Record cycle results to rollback monitor
+            # Calculate PNL in bps (basis points)
+            # Position value = target_notional * 2 (ETH + SOL positions)
+            position_value = float(self.target_notional * 2)
+            if position_value > 0:
+                pnl_bps = (float(pnl_with_fee) / position_value) * 10000
+            else:
+                pnl_bps = 0.0
+
+            self.rollback_monitor.record_cycle(
+                had_safety_stop=getattr(self, '_had_safety_stop', False),
+                pnl_bps=pnl_bps
+            )
+            self.logger.info(
+                f"[ROLLBACK] Cycle recorded: safety_stop={self._had_safety_stop}, "
+                f"pnl_bps={pnl_bps:.2f}"
             )
 
             # Generate daily PNL report after each cycle
@@ -1790,6 +1968,9 @@ class DNPairBot:
         should_exit, exit_reason = await self._check_exit_timing(max_loss_bps=30)
         self.logger.info(f"[EXIT] Timing check: should_exit={should_exit}, reason={exit_reason}")
 
+        # Track if this cycle had a safety stop (for rollback monitoring)
+        self._had_safety_stop = exit_reason.startswith("stop_loss_")
+
         # Get exit spread information for analysis
         eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
         sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
@@ -2020,6 +2201,18 @@ class DNPairBot:
                 break
 
             self.logger.info(f"[SUCCESS] Cycle {iteration_num} completed successfully")
+
+            # Check rollback conditions after each successful cycle
+            should_rollback, rollback_reason = self.rollback_monitor.should_rollback()
+            if should_rollback:
+                self.logger.error(f"[ROLLBACK] {rollback_reason}")
+                self.logger.error(
+                    f"[ROLLBACK] Bot stopping due to rollback conditions. "
+                    f"Review strategy parameters before continuing."
+                )
+                break
+            else:
+                self.logger.info(f"[ROLLBACK] {rollback_reason}")
 
         return results
 
