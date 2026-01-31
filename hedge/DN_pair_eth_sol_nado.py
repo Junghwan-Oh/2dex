@@ -25,8 +25,8 @@ from datetime import datetime
 import pytz
 
 # Import exchanges modules (like Mean Reversion bot)
-from exchanges.nado import NadoClient
-from exchanges.base import OrderResult
+from hedge.exchanges.nado import NadoClient
+from hedge.exchanges.base import OrderResult
 
 
 class Config:
@@ -705,7 +705,7 @@ class DNPairBot:
             Dictionary with all CSV parameters including new V5.3 fields
         """
         from datetime import datetime
-        from exchanges.nado import WEBSOCKET_AVAILABLE
+        from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
 
         # Check if we're in exit phase
         in_exit_phase = hasattr(self, '_is_exit_phase') and self._is_exit_phase
@@ -829,7 +829,7 @@ class DNPairBot:
             - sol_liquidity_usd: Decimal - SOL liquidity available in USD
             - websocket_available: bool - Whether WebSocket data was used
         """
-        from exchanges.nado import WEBSOCKET_AVAILABLE
+        from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
 
         result = {
             "can_exit": True,
@@ -936,7 +936,7 @@ class DNPairBot:
         Returns:
             (should_enter, reason) where reason explains why skipped or "OK"
         """
-        from exchanges.nado import WEBSOCKET_AVAILABLE
+        from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
 
         # Get momentum from BBO handler with null checks
         eth_momentum = None
@@ -1005,7 +1005,7 @@ class DNPairBot:
             - websocket_available: bool - whether WebSocket is active
             - spread_state: str - current spread state (or None if unavailable)
         """
-        from exchanges.nado import WEBSOCKET_AVAILABLE
+        from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
 
         # Default thresholds (STABLE)
         profit_target = 15
@@ -1394,7 +1394,7 @@ class DNPairBot:
         Returns:
             dict with timing metrics including dynamic threshold used
         """
-        from exchanges.nado import WEBSOCKET_AVAILABLE
+        from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
 
         start_time = time.time()
         best_spread = None
@@ -1755,7 +1755,7 @@ class DNPairBot:
             True if both positions are closed (abs < 0.001), False otherwise.
         """
         from datetime import datetime
-        from exchanges.nado import WEBSOCKET_AVAILABLE
+        from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
         POSITION_TOLERANCE = Decimal("0.001")
         MAX_RETRIES = 3
         RETRY_DELAY = 2.0
@@ -2047,7 +2047,7 @@ class DNPairBot:
     async def initialize_clients(self):
         """Initialize ETH and SOL Nado clients for dual-ticker trading."""
         # Log WebSocket availability status
-        from exchanges.nado import WEBSOCKET_AVAILABLE
+        from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
         self.logger.info(
             f"[INIT] WEBSOCKET_AVAILABLE: {WEBSOCKET_AVAILABLE}"
         )
