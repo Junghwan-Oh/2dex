@@ -54,7 +54,7 @@ class DNPairBot:
         sleep_time: int = 0,
         csv_path: str = None,  # Optional custom CSV path for testing
         use_post_only: bool = True,  # POST_ONLY mode (maker, 2 bps) vs IOC (taker, 5 bps)
-        min_spread_bps: int = 6,  # Minimum spread in bps to enter trade (configurable)
+        min_spread_bps: int = 1,  # Minimum spread in bps - sanity check only, profit comes from post-entry movements
     ):
         self.target_notional = target_notional  # USD notional for each position
         self.iterations = iterations
@@ -914,27 +914,38 @@ class DNPairBot:
 
     def _check_spread_profitability(self, eth_bid: Decimal, eth_ask: Decimal,
                                     sol_bid: Decimal, sol_ask: Decimal) -> tuple[bool, dict]:
-        """Check if current spread is profitable enough to enter a trade.
+        """
+        Check if spread is acceptable for entry.
 
-        Args:
-            eth_bid, eth_ask: Current ETH BBO prices
-            sol_bid, sol_ask: Current SOL BBO prices
+        IMPORTANT: This is a sanity check, NOT a profitability filter.
+        Verified from _calculate_current_pnl() (lines 1240-1289):
+        - Profit = (exit_price - entry_price) * qty - fees
+        - Profit comes from POST-ENTRY price movements, NOT entry spread
+        - Exit thresholds (lines 1163-1167) enforce profitability
+
+        Minimum spread prevents:
+        - Data errors (0 or negative spreads from bad quotes)
+        - Obviously poor entry conditions
 
         Returns:
-            (is_profitable, info_dict) where info_dict contains:
-            - eth_spread_bps: ETH spread in bps
-            - sol_spread_bps: SOL spread in bps
-            - min_spread_bps: Minimum required spread (configurable, default 6)
-            - max_spread_bps: Maximum of ETH/SOL spreads in bps
-            - reason: Skip reason if not profitable
+            is_profitable: bool - True if spread >= minimum threshold
+            info: dict with:
+                - eth_spread_bps: ETH spread in bps
+                - sol_spread_bps: SOL spread in bps
+                - min_spread_bps: Minimum required spread (configurable, default 1)
+                - max_spread_bps: Maximum of ETH/SOL spreads in bps
+                - reason: Skip reason if not profitable
         """
-        # CRITICAL: Mode-aware breakeven calculation
-        # POST_ONLY: 2 bps x 4 legs = 8 bps breakeven
-        # IOC: 5 bps x 4 legs = 20 bps breakeven
-        if self.use_post_only:
-            MIN_SPREAD_BPS = max(self.min_spread_bps, 8)  # Maker fees
-        else:
-            MIN_SPREAD_BPS = max(self.min_spread_bps, 20)  # Taker fees - CRITICAL FIX
+        # Minimum spread is a sanity check, not a breakeven requirement
+        # Verified from _calculate_current_pnl() (lines 1240-1289): profit comes from
+        # (exit_price - entry_price) movements AFTER entry, NOT from entry spread
+        #
+        # Mode affects fees via FEE_RATE (line 390):
+        # - POST_ONLY: 2 bps per leg = 8 bps total for 4 legs
+        # - IOC: 5 bps per leg = 20 bps total for 4 legs
+        #
+        # But profitability is determined by exit conditions (lines 1163-1167), not entry spread
+        MIN_SPREAD_BPS = self.min_spread_bps  # Configurable, default 1 bps
 
         # Calculate spreads in bps: (ask - bid) / mid_price * 10000
         eth_mid = (eth_bid + eth_ask) / 2
@@ -1345,6 +1356,40 @@ class DNPairBot:
         except Exception as e:
             self.logger.error(f"[PNL] Error calculating PNL: {e}")
             return Decimal("0"), Decimal("0"), {}
+
+    def _check_cumulative_pnl_health(self) -> tuple[bool, str]:
+        """
+        Check if cumulative PNL indicates strategy issues.
+
+        Risk mitigation for relaxed entry filter:
+        - If first 3 cycles unprofitable, may need to adjust min_spread_bps
+        - Stop if cumulative loss exceeds threshold
+
+        Returns:
+            (is_healthy, message): tuple of health status and explanation
+        """
+        total_cycles = self.daily_pnl_summary.get("total_cycles", 0)
+        total_pnl = self.daily_pnl_summary.get("total_pnl_with_fee", Decimal("0"))
+        losing_cycles = self.daily_pnl_summary.get("losing_cycles", 0)
+
+        # Risk threshold: $50 maximum cumulative loss
+        MAX_CUMULATIVE_LOSS = Decimal("50")
+
+        # Check cumulative loss
+        if total_pnl < -MAX_CUMULATIVE_LOSS:
+            return False, f"Cumulative loss ${-total_pnl:.2f} exceeds threshold ${MAX_CUMULATIVE_LOSS}"
+
+        # Check if first 3 cycles are all unprofitable
+        if 3 <= total_cycles <= 5 and losing_cycles == total_cycles:
+            return False, f"First {total_cycles} cycles all unprofitable - consider increasing min_spread_bps to 2-3"
+
+        # Check win rate after 10 cycles
+        if total_cycles >= 10:
+            win_rate = (total_cycles - losing_cycles) / total_cycles
+            if win_rate < 0.3:
+                return False, f"Win rate {win_rate*100:.0f}% below 30% after {total_cycles} cycles"
+
+        return True, "Cumulative PNL within acceptable range"
 
     def _update_daily_pnl_summary(self):
         """Update daily PNL summary with completed cycle data."""
@@ -2353,8 +2398,8 @@ Examples:
     parser.add_argument(
         "--min-spread-bps",
         type=int,
-        default=6,
-        help="Minimum spread in bps to enter trade (default: 6)"
+        default=1,
+        help="Minimum spread in bps - sanity check only, NOT breakeven. Profit comes from post-entry spread convergence and price movement. (default: 1)"
     )
     return parser.parse_args()
 
@@ -2378,7 +2423,7 @@ async def main():
         sleep_time=args.sleep,
         csv_path=args.csv_path,
         use_post_only=not getattr(args, 'use_ioc', False),  # POST_ONLY mode (default True)
-        min_spread_bps=getattr(args, 'min_spread_bps', 6),  # Min spread filter (default 6 bps)
+        min_spread_bps=getattr(args, 'min_spread_bps', 1),  # Min spread sanity check - profit from post-entry movements (default 1 bps)
     )
 
     # Initialize clients
