@@ -54,7 +54,7 @@ class DNPairBot:
         sleep_time: int = 0,
         csv_path: str = None,  # Optional custom CSV path for testing
         use_post_only: bool = True,  # POST_ONLY mode (maker, 2 bps) vs IOC (taker, 5 bps)
-        min_spread_bps: int = 1,  # Minimum spread in bps - sanity check only, profit comes from post-entry movements
+        min_spread_bps: int = 0,  # Minimum spread in bps - sanity check only, profit comes from post-entry movements
     ):
         self.target_notional = target_notional  # USD notional for each position
         self.iterations = iterations
