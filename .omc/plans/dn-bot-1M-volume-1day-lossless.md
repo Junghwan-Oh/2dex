@@ -2,7 +2,7 @@
 
 **Plan ID**: DN-100-LOSSLESS-001
 **Created**: 2026-01-31
-**Revised**: 2026-01-31 (Final user clarification)
+**Revised**: 2026-01-31 (ITERATION 2 - Critical Fixes)
 **Status**: READY FOR EXECUTION
 **Target File**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
 
@@ -63,11 +63,17 @@ Goal: PNL >= 0 AND 100 trades completed = $1M volume
 ### Current Implementation Status
 
 **Main Bot**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
-- Lines 1-26: Imports (includes `Tuple` from typing)
+- Lines 1-26: Imports (includes `Tuple` from typing, `pytz` needs verification)
 - Lines 136-145: daily_pnl_summary initialization (NO start_time field - CRITICAL FIX NEEDED)
 - Lines 896-937: Daily PNL summary update and tracking
 - Lines 1025-1074: Daily PNL report generation
 - Lines 1800-1814: Main alternating strategy loop (buy_first/sell_first)
+- NO session persistence: State lost on bot restart
+
+**Progressive Sizing Pattern** (Reference for Session Persistence):
+- `/Users/botfarmer/2dex/hedge/helpers/progressive_sizing.py` lines 91-107
+- JSON state file pattern with `_load_state()` and `_save_state()` methods
+- State fields persisted: current_phase, consecutive_successes, consecutive_failures, phase_validated, pending_approval, approval_granted
 
 **Exchange Client**: `/Users/botfarmer/2dex/hedge/exchanges/nado.py`
 - Lines 86-144: Isolated margin leverage verification
@@ -212,10 +218,13 @@ Transform the DN Pair Bot into a trade-accumulating execution engine that:
 1. **Trade Counter**: Count completed trades toward 100
 2. **Volume Tracking**: Cumulative notional (ETH + SOL per trade)
 3. **Loss Limit Auto-Stop**: Halt if cumulative_pnl_with_fee < -$500
-4. **PNL Filter**: Skip trade if previous trade PNL < 0
+4. **PNL Filter**: Skip trade if previous trade PNL < 0 (uses last_cycle_pnl, NOT current_cycle_pnl)
 5. **Progress Logging**: Trade count and volume every 10 trades
-6. **start_time Field**: Add to daily_pnl_summary initialization
+6. **start_time Field**: Add to daily_pnl_summary initialization (PERSISTED across restarts)
 7. **NO Time Constraint**: Run until 100 trades, not 24 hours
+8. **Session Persistence**: JSON state file pattern (progressive_sizing.py lines 91-107)
+9. **Graceful Shutdown**: Complete current BUILD + UNWIND before stopping on loss limit
+10. **last_cycle_pnl Field**: Store previous trade's PNL for PNL filter (NOT current_cycle_pnl)
 
 ### Must NOT Have
 
@@ -235,54 +244,76 @@ T1: Add 100-trades execution parameters
   ├─ Add --cumulative-loss-limit parameter (default -500)
   ├─ Add --disable-pnl-filter flag (default False)
   ├─ Add --use-100-trades-mode flag (explicit strategy selection)
+  ├─ Add --state-file parameter (default: logs/dn_bot_100trades_state.json)
   └─ Update constructor to accept new params
   ↓
-T2: Fix daily_pnl_summary initialization
+T2: Fix daily_pnl_summary initialization and add session state
   ├─ ADD start_time field to daily_pnl_summary
+  ├─ ADD last_cycle_pnl field to daily_pnl_summary (CRITICAL: use this for PNL filter, NOT current_cycle_pnl)
   ├─ Add daily_volume_usd counter
   ├─ Initialize all fields correctly
-  └─ CRITICAL FIX for missing start_time
+  ├─ CRITICAL FIX for missing start_time
+  └─ Add state_file_path for session persistence
   ↓
-T3: Implement trade and volume tracking
+T3: Implement session persistence (JSON state file pattern)
+  ├─ Add _load_session_state() method (pattern from progressive_sizing.py lines 91-107)
+  ├─ Add _save_session_state() method
+  ├─ Persist fields: start_time, last_cycle_pnl, total_cycles, total_volume_usd, total_pnl_with_fee
+  ├─ Load state on initialization if exists
+  ├─ Save state after each completed trade
+  ├─ Handle restart recovery (resume at trade 47 with position validation)
+  └─ Add logging for state load/save operations
+  ↓
+T4: Implement trade and volume tracking
   ├─ Increment trade counter on each completed trade
-  ├─ Volume formula: target_notional * 2
+  ├─ Volume formula: target_notional (PER POSITION, already correct)
   ├─ Add progress logging (every 10 trades)
   ├─ Add trade target completion check
-  └─ Document session-based (no reset)
+  ├─ Document session-based (no reset)
+  └─ Save session state after each trade
   ↓
-T4: Implement loss limit enforcement
+T5: Implement loss limit enforcement with graceful shutdown
   ├─ Add _check_cumulative_loss_limit() method
-  ├─ Call after each UNWIND completes
+  ├─ Call after each UNWIND completes (NOT during BUILD)
   ├─ Set stop_flag if limit exceeded
+  ├─ Implement graceful shutdown: complete current BUILD + UNWIND before stopping
   ├─ Document loss limit formula
-  └─ Log loss limit breach with details
+  ├─ Log loss limit breach with details
+  └─ Handle mid-execution stop detection (check stop_flag throughout cycle)
   ↓
-T5: Implement PNL-based trade filtering
+T6: Implement PNL-based trade filtering (FIXED data race)
   ├─ Add _should_skip_trade() method
-  ├─ Check previous trade PNL before BUILD
+  ├─ Check last_cycle_pnl (NOT current_cycle_pnl) before BUILD
   ├─ Log skip reason and continue
-  └--disable-pnl-filter overrides this check
+  ├─ Store completed trade PNL to last_cycle_pnl after UNWIND
+  ├─ --disable-pnl-filter overrides this check
+  └─ Document: last_cycle_pnl is set AFTER trade completes, not before
   ↓
-T6: Implement continuous execution until 100 trades
+T7: Implement continuous execution until 100 trades
   ├─ Add run_100_trades_strategy() method
   ├─ Check stop conditions (trades, volume, loss)
   ├─ Execute opportunistically (spread-based)
   ├─ Use --use-100-trades-mode flag for selection
-  └--handle trade skips gracefully
+  ├─ Handle graceful shutdown (complete BUILD+UNWIND)
+  └─ Handle trade skips gracefully
   ↓
-T7: Enhanced monitoring and logging
+T8: Enhanced monitoring and logging
   ├─ Add trade count progress to PNL report
   ├─ Add completion detection (reached 100)
   ├─ Log PNL filter skips
-  ├─ Document volume calculation formula
-  └--log loss limit warnings
+  ├─ Document volume calculation formula (target_notional is PER POSITION)
+  ├─ Log loss limit warnings
+  └─ Add session recovery logging
   ↓
-T8: Testing and deployment
+T9: Testing and deployment
+  ├─ Verify pytz import exists
+  ├─ Test session persistence (stop at trade 10, restart, resume at 11)
   ├─ Test with --target-trades 5
-  ├─ Test loss limit enforcement
+  ├─ Test loss limit enforcement with graceful shutdown
   ├─ Test trade and volume tracking
-  ├─ Verify start_time field exists
-  └--deploy for 100-trade lossless run
+  ├─ Verify start_time field persists
+  ├─ Verify last_cycle_pnl used for PNL filter
+  └─ Deploy for 100-trade lossless run
 ```
 
 ---
@@ -293,7 +324,41 @@ T8: Testing and deployment
 
 **File**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
 
-**Step 1**: Update constructor signature
+**CRITICAL FIXES FOR ITERATION 2**:
+1. Add `--state-file` parameter for session persistence
+2. Verify `pytz` import exists (add if missing)
+3. Add `last_cycle_pnl` field initialization
+
+**Step 1**: Verify/Add pytz import
+
+**Location**: Lines 1-26 (imports section)
+
+**BEFORE (lines 1-26)** - Check if pytz exists:
+```python
+import logging
+import os
+import asyncio
+from decimal import Decimal
+from typing import Tuple, List
+import csv
+from datetime import datetime
+# ... other imports
+```
+
+**AFTER (add if missing)**:
+```python
+import logging
+import os
+import asyncio
+from decimal import Decimal
+from typing import Tuple, List
+import csv
+from datetime import datetime
+import pytz  # CRITICAL: Required for start_time timezone handling
+# ... other imports
+```
+
+**Step 2**: Update constructor signature
 
 **Location**: Lines 61-71 (constructor definition)
 
@@ -310,7 +375,7 @@ T8: Testing and deployment
     ):
 ```
 
-**AFTER (lines 61-78)**:
+**AFTER (lines 61-79)**:
 ```python
     def __init__(
         self,
@@ -325,10 +390,11 @@ T8: Testing and deployment
         cumulative_loss_limit: Decimal = Decimal("-500"),  # Auto-stop if cumulative PNL < this
         disable_pnl_filter: bool = False,  # If True, don't skip trades based on previous PNL
         use_100_trades_mode: bool = False,  # If True, use 100-trades continuous strategy
+        state_file: str = None,  # Session state file (default: logs/dn_bot_100trades_state.json)
     ):
 ```
 
-**Step 2**: Fix daily_pnl_summary initialization (CRITICAL)
+**Step 3**: Fix daily_pnl_summary initialization (CRITICAL - ITERATION 2 FIXES)
 
 **Location**: Lines 136-145 (daily_pnl_summary initialization)
 
@@ -347,11 +413,18 @@ T8: Testing and deployment
         self.cycle_id = 0  # Unique cycle identifier
 ```
 
-**AFTER (lines 136-154)**:
+**AFTER (lines 136-157)**:
 ```python
+        # State file path for session persistence
+        if state_file is None:
+            self.state_file = "logs/dn_bot_100trades_state.json"
+        else:
+            self.state_file = state_file
+
+        # Initialize session state (will be loaded from file if exists)
         self.daily_pnl_summary = {
-            "start_time": datetime.now(pytz.UTC),  # CRITICAL: Track session start time
-            "total_cycles": 0,
+            "start_time": datetime.now(pytz.UTC),  # CRITICAL: Track session start time (PERSISTED)
+            "total_cycles": 0,  # Completed trades count
             "profitable_cycles": 0,
             "losing_cycles": 0,
             "total_pnl_no_fee": Decimal("0"),
@@ -359,9 +432,13 @@ T8: Testing and deployment
             "total_fees": Decimal("0"),
             "best_cycle_pnl": Decimal("0"),
             "worst_cycle_pnl": Decimal("0"),
-            "total_volume_usd": Decimal("0"),  # NEW: Cumulative trading volume
+            "total_volume_usd": Decimal("0"),  # Cumulative trading volume
+            "last_cycle_pnl": Decimal("0"),  # CRITICAL: Last completed trade PNL (for PNL filter, NOT current_cycle_pnl)
         }
         self.cycle_id = 0  # Unique cycle identifier
+
+        # Load session state if exists (pattern from progressive_sizing.py lines 91-107)
+        self._load_session_state()
 ```
 
 **Step 3**: Store new parameters after line 87
@@ -527,15 +604,19 @@ T8: Testing and deployment
 
 **File**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
 
-**Volume Calculation Formula**:
+**CRITICAL VOLUME FORMULA CLARIFICATION (ITERATION 2)**:
 ```
-trade_volume_usd = target_notional * 2
+Volume Definition (ARCHITECT CONFIRMED):
+- target_notional is PER POSITION (already correct)
+- Example: --size 5000 means $5,000 ETH position AND $5,000 SOL position
+- Total trade volume = target_notional (ETH) + target_notional (SOL) = target_notional * 2
+- Formula: trade_volume_usd = target_notional * 2
 
-Explanation:
-- target_notional: USD value for EACH position (e.g., --size 5000 = $5K ETH + $5K SOL)
-- Multiply by 2: Both positions (ETH + SOL) contribute to volume
-- Example: --size 5000 → trade_volume = 5000 * 2 = $10,000
+Calculation Example:
+- --size 5000 → $5K ETH + $5K SOL = $10,000 total volume per trade
 - 100 trades → 100 * $10,000 = $1,000,000 volume
+
+NO CHANGE NEEDED: The formula target_notional * 2 is already correct.
 ```
 
 **Step 1**: Update volume on trade completion
@@ -571,11 +652,15 @@ Explanation:
             self.daily_pnl_summary["total_fees"] += total_fees
 
             # NEW: Update volume tracking
-            # Volume calculation: target_notional * 2 (ETH + SOL positions)
-            # Example: --size 5000 → trade_volume = 5000 * 2 = $10,000
+            # CRITICAL (ITERATION 2): target_notional is PER POSITION, so total volume = target_notional * 2
+            # Example: --size 5000 → $5K ETH + $5K SOL = $10,000 total volume
             # 100 trades → 100 * $10,000 = $1,000,000 volume
             trade_volume = self.target_notional * 2
             self.daily_pnl_summary["total_volume_usd"] += trade_volume
+
+            # NEW: Store last completed trade PNL for PNL filter (CRITICAL FIX)
+            # This MUST be set AFTER trade completes, NOT before (data race fix)
+            self.daily_pnl_summary["last_cycle_pnl"] = pnl_with_fee
 
             # Log trade summary
             self.logger.info(
@@ -617,6 +702,9 @@ Explanation:
 
             # Generate daily PNL report after each cycle
             self._generate_daily_pnl_report()
+
+            # NEW: Save session state after each trade (pattern from progressive_sizing.py lines 109-125)
+            self._save_session_state()
 
         except Exception as e:
             self.logger.error(f"[PNL] Error updating daily summary: {e}")
@@ -696,16 +784,165 @@ Explanation:
 **Acceptance**:
 - [ ] Trade counter tracks toward target_trades (default 100)
 - [ ] Volume tracked cumulatively (session-based)
-- [ ] Volume calculation documented: target_notional * 2
+- [ ] Volume calculation documented: target_notional is PER POSITION (already correct)
 - [ ] Progress logged every 10 trades (trade count + volume + PNL)
 - [ ] Volume included in PNL report
 - [ ] $1M target displayed, trade progress shown
 - [ ] Celebration when trade target reached
 - [ ] Elapsed time displayed in hours and days
+- [ ] last_cycle_pnl stored after each trade completion (NOT current_cycle_pnl)
+- [ ] Session state saved after each trade
 
 ---
 
-### T3: Implement Cumulative Loss Limit Enforcement
+### T3: Implement Session Persistence (CRITICAL - ITERATION 2 NEW TASK)
+
+**File**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
+
+**Pattern Reference**: `/Users/botfarmer/2dex/hedge/helpers/progressive_sizing.py` lines 91-125
+
+**Step 1**: Add _load_session_state() method
+
+**Location**: After constructor (after daily_pnl_summary initialization)
+
+**ADD NEW METHOD**:
+```python
+    def _load_session_state(self) -> None:
+        """
+        Load saved session state from JSON file.
+
+        Pattern from progressive_sizing.py lines 91-107.
+
+        Restores:
+        - start_time: Session start time (preserved across restarts)
+        - total_cycles: Completed trades count
+        - last_cycle_pnl: Last completed trade PNL (for PNL filter)
+        - total_pnl_with_fee: Cumulative PNL
+        - total_volume_usd: Cumulative volume
+        """
+        state_path = Path(self.state_file)
+        if state_path.exists():
+            try:
+                with open(state_path, 'r') as f:
+                    state = json.load(f)
+
+                # Restore session start time (CRITICAL: preserved across restarts)
+                if 'start_time' in state:
+                    start_time_str = state['start_time']
+                    self.daily_pnl_summary['start_time'] = datetime.fromisoformat(start_time_str)
+
+                # Restore trade counters
+                self.daily_pnl_summary['total_cycles'] = state.get('total_cycles', 0)
+                self.cycle_id = self.daily_pnl_summary['total_cycles']
+
+                # Restore last_cycle_pnl (CRITICAL: for PNL filter)
+                if 'last_cycle_pnl' in state:
+                    self.daily_pnl_summary['last_cycle_pnl'] = Decimal(str(state['last_cycle_pnl']))
+
+                # Restore PNL totals
+                if 'total_pnl_with_fee' in state:
+                    self.daily_pnl_summary['total_pnl_with_fee'] = Decimal(str(state['total_pnl_with_fee']))
+                if 'total_pnl_no_fee' in state:
+                    self.daily_pnl_summary['total_pnl_no_fee'] = Decimal(str(state['total_pnl_no_fee']))
+
+                # Restore volume
+                if 'total_volume_usd' in state:
+                    self.daily_pnl_summary['total_volume_usd'] = Decimal(str(state['total_volume_usd']))
+
+                # Restore other fields
+                self.daily_pnl_summary['profitable_cycles'] = state.get('profitable_cycles', 0)
+                self.daily_pnl_summary['losing_cycles'] = state.get('losing_cycles', 0)
+                self.daily_pnl_summary['total_fees'] = Decimal(str(state.get('total_fees', '0')))
+                self.daily_pnl_summary['best_cycle_pnl'] = Decimal(str(state.get('best_cycle_pnl', '0')))
+                self.daily_pnl_summary['worst_cycle_pnl'] = Decimal(str(state.get('worst_cycle_pnl', '0')))
+
+                self.logger.info(
+                    f"[SESSION] Loaded state from {state_path}\n"
+                    f"  Resuming at trade {self.cycle_id}\n"
+                    f"  Start time: {self.daily_pnl_summary['start_time'].isoformat()}\n"
+                    f"  Cumulative PNL: ${self.daily_pnl_summary['total_pnl_with_fee']:.2f}\n"
+                    f"  Total volume: ${self.daily_pnl_summary['total_volume_usd']:.0f}\n"
+                    f"  Last trade PNL: ${self.daily_pnl_summary['last_cycle_pnl']:.2f}"
+                )
+
+            except Exception as e:
+                self.logger.warning(f"[SESSION] Failed to load session state: {e}")
+                self.logger.info("[SESSION] Starting fresh session")
+```
+
+**Step 2**: Add _save_session_state() method
+
+**Location**: After _load_session_state()
+
+**ADD NEW METHOD**:
+```python
+    def _save_session_state(self) -> None:
+        """
+        Save current session state to JSON file.
+
+        Pattern from progressive_sizing.py lines 109-125.
+
+        Saves:
+        - start_time: Session start time (for restart recovery)
+        - total_cycles: Completed trades count
+        - last_cycle_pnl: Last completed trade PNL (for PNL filter)
+        - total_pnl_with_fee: Cumulative PNL
+        - total_volume_usd: Cumulative volume
+        """
+        state = {
+            'start_time': self.daily_pnl_summary['start_time'].isoformat(),
+            'total_cycles': self.daily_pnl_summary['total_cycles'],
+            'last_cycle_pnl': str(self.daily_pnl_summary['last_cycle_pnl']),
+            'total_pnl_with_fee': str(self.daily_pnl_summary['total_pnl_with_fee']),
+            'total_pnl_no_fee': str(self.daily_pnl_summary['total_pnl_no_fee']),
+            'total_fees': str(self.daily_pnl_summary['total_fees']),
+            'total_volume_usd': str(self.daily_pnl_summary['total_volume_usd']),
+            'profitable_cycles': self.daily_pnl_summary['profitable_cycles'],
+            'losing_cycles': self.daily_pnl_summary['losing_cycles'],
+            'best_cycle_pnl': str(self.daily_pnl_summary['best_cycle_pnl']),
+            'worst_cycle_pnl': str(self.daily_pnl_summary['worst_cycle_pnl']),
+            'last_updated': datetime.now(pytz.UTC).isoformat(),
+        }
+
+        try:
+            # Ensure directory exists
+            state_path = Path(self.state_file)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(state_path, 'w') as f:
+                json.dump(state, f, indent=2)
+
+            self.logger.debug(f"[SESSION] Saved state to {state_path}")
+
+        except Exception as e:
+            self.logger.error(f"[SESSION] Failed to save session state: {e}")
+```
+
+**Step 3**: Add imports for JSON and Path
+
+**Location**: Lines 1-26 (imports section)
+
+**VERIFY imports exist**:
+```python
+import json  # For session state persistence
+from pathlib import Path  # For file path handling
+```
+
+**ADD if missing**.
+
+**Acceptance**:
+- [ ] Session state loaded from JSON file on startup (pattern from progressive_sizing.py)
+- [ ] start_time preserved across restarts (bot restart resumes with original start time)
+- [ ] last_cycle_pnl preserved across restarts (PNL filter works after restart)
+- [ ] total_cycles restored (resume at trade 47, not start at 0)
+- [ ] Session state saved after each completed trade
+- [ ] State file created in logs directory
+- [ ] Logging shows session recovery on restart
+- [ ] Position validation on restart (verify no residual positions before resuming)
+
+---
+
+### T4: Implement Cumulative Loss Limit Enforcement with Graceful Shutdown (ITERATION 2 UPDATE)
 
 **File**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
 
@@ -717,9 +954,14 @@ Example:
 - cumulative_loss_limit = -500
 - If cumulative_pnl_with_fee = -600, then -600 < -500 → STOP
 - If cumulative_pnl_with_fee = -400, then -400 < -500 → CONTINUE
+
+GRACEFUL SHUTDOWN (ITERATION 2):
+- If loss limit hit during BUILD phase: Complete BUILD → Complete UNWIND → Stop
+- Stop flag checked throughout cycle execution
+- No premature termination during position holding
 ```
 
-**Step 1**: Add loss limit check method
+**Step 1**: Add loss limit check method (with graceful shutdown documentation)
 
 **Location**: After `_generate_daily_pnl_report()` (after line 1090)
 
@@ -736,6 +978,12 @@ Example:
             cumulative_loss_limit = -500
             If PNL = -600: -600 < -500 → STOP (loss exceeded)
             If PNL = -400: -400 < -500 → CONTINUE (within limit)
+
+        GRACEFUL SHUTDOWN (ITERATION 2):
+            - If limit exceeded: Set stop_flag = True
+            - stop_flag checked BEFORE each new trade (in run_100_trades_strategy)
+            - If already in BUILD phase: Complete BUILD → Complete UNWIND → Stop
+            - No premature termination during position holding
 
         Returns:
             bool: True if within limit, False if limit exceeded
@@ -755,7 +1003,7 @@ Example:
                 f"  Loss Limit: ${loss_limit:.2f}\n"
                 f"  Formula: {total_pnl} < {loss_limit} = TRUE\n"
                 f"  Trades: {total_cycles}\n"
-                f"  Action: STOPPING BOT"
+                f"  Action: Setting stop_flag (graceful shutdown: complete current cycle)"
             )
             self.stop_flag = True
             return False
@@ -802,22 +1050,44 @@ Example:
 **Acceptance**:
 - [ ] Loss limit formula documented in code
 - [ ] Loss limit checked after each completed trade
-- [ ] Bot stops (sets stop_flag) when limit exceeded
+- [ ] Bot sets stop_flag when limit exceeded
 - [ ] Formula logged when limit breached
 - [ ] Warning logged when approaching limit (within 20%)
 - [ ] Loss limit configurable via `--cumulative-loss-limit`
+- [ ] Graceful shutdown: stop_flag checked before each new trade
+- [ ] Mid-execution stop handling: Complete BUILD+UNWIND before stopping
+- [ ] No premature termination during position holding
 
 ---
 
-### T4: Implement PNL-Based Trade Filtering
+### T5: Implement PNL-Based Trade Filtering (ITERATION 2 DATA RACE FIX)
 
 **File**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
 
+**CRITICAL DATA RACE FIX (ITERATION 2)**:
+```
+OLD BUG (Iteration 1):
+  PNL filter checked current_cycle_pnl, which is reset BEFORE the filter check
+  Result: Always sees 0, filter never activates
+
+FIX (Iteration 2):
+  1. Store completed trade PNL in last_cycle_pnl field
+  2. PNL filter checks last_cycle_pnl (NOT current_cycle_pnl)
+  3. last_cycle_pnl is set AFTER trade completes (in _update_daily_pnl_summary)
+  4. Data race eliminated: last_cycle_pnl contains previous trade's result
+
+Sequence:
+  Trade 47 completes → PNL = $5 → last_cycle_pnl = $5
+  Trade 48 starts → Check last_cycle_pnl ($5 >= 0, allow)
+  Trade 48 completes → PNL = -$3 → last_cycle_pnl = -$3
+  Trade 49 starts → Check last_cycle_pnl (-$3 < 0, SKIP)
+```
+
 **Note**: `Tuple` is already imported on line 23: `from typing import Tuple, List`
 
-**Step 1**: Add PNL filter check method
+**Step 1**: Add PNL filter check method (FIXED)
 
-**Location**: After `_check_cumulative_loss_limit()` (new method from T3)
+**Location**: After `_check_cumulative_loss_limit()` (new method from T4)
 
 **ADD NEW METHOD**:
 ```python
@@ -825,14 +1095,24 @@ Example:
         """
         Check if current trade should be skipped based on previous PNL.
 
+        CRITICAL FIX (ITERATION 2): Uses last_cycle_pnl, NOT current_cycle_pnl
+
         PNL Filter Rule:
-            Skip if: previous_trade_pnl_with_fee < 0
+            Skip if: last_cycle_pnl < 0 (previous trade was a loss)
+
+        Data Flow:
+        1. Trade 47 completes → _update_daily_pnl_summary() sets last_cycle_pnl = trade_pnl
+        2. Trade 48 starts → _should_skip_trade() checks last_cycle_pnl
+        3. If last_cycle_pnl < 0 → Skip trade 48
+        4. If last_cycle_pnl >= 0 → Allow trade 48
+
+        This eliminates the data race where current_cycle_pnl was reset before the check.
 
         Returns:
             Tuple[bool, str]: (should_skip, reason)
 
         Rules:
-        - Skip if previous trade PNL < 0 (loss)
+        - Skip if last_cycle_pnl < 0 (previous trade was a loss)
         - Don't skip on first trade (no previous PNL)
         - Don't skip if PNL filter disabled via --disable-pnl-filter
         """
@@ -840,17 +1120,18 @@ Example:
         if self.disable_pnl_filter:
             return False, ""
 
-        # Don't skip first trade
+        # Don't skip first trade (no previous PNL to check)
         if self.cycle_id == 0:
             return False, ""
 
-        # Check previous trade PNL
-        prev_pnl = self.current_cycle_pnl.get("pnl_with_fee", Decimal("0"))
+        # CRITICAL FIX (ITERATION 2): Check last_cycle_pnl, NOT current_cycle_pnl
+        # last_cycle_pnl is set in _update_daily_pnl_summary() AFTER each trade completes
+        prev_pnl = self.daily_pnl_summary.get("last_cycle_pnl", Decimal("0"))
 
         if prev_pnl < 0:
             reason = (
                 f"[PNL FILTER] Skipping trade after loss:\n"
-                f"  Previous PNL: ${prev_pnl:.2f}\n"
+                f"  Last trade PNL: ${prev_pnl:.2f}\n"
                 f"  Action: Waiting for next opportunity\n"
                 f"  Override: Use --disable-pnl-filter to disable"
             )
@@ -928,15 +1209,17 @@ Example:
 ```
 
 **Acceptance**:
-- [ ] Trade skipped if previous PNL < 0
+- [ ] Trade skipped if last_cycle_pnl < 0 (NOT current_cycle_pnl)
 - [ ] Skip logged with reason
 - [ ] First trade never skipped
 - [ ] Filter disabled via `--disable-pnl-filter`
 - [ ] Tuple import already exists (line 23)
+- [ ] Data race eliminated: last_cycle_pnl contains previous trade result
+- [ ] last_cycle_pnl set AFTER trade completes (in _update_daily_pnl_summary)
 
 ---
 
-### T5: Implement 100-Trades Continuous Execution
+### T6: Implement 100-Trades Continuous Execution (ITERATION 2 UPDATE)
 
 **File**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
 
@@ -955,15 +1238,21 @@ Example:
 
         Features:
         - Opportunistic execution (spread-based, not time-based)
-        - PNL-based trade filtering (skip after losses)
-        - Cumulative loss limit enforcement (auto-stop)
+        - PNL-based trade filtering (skip after losses using last_cycle_pnl)
+        - Cumulative loss limit enforcement (auto-stop with graceful shutdown)
         - Volume tracking and reporting (session-based)
         - NO time constraint: runs until 100 trades
+        - Session persistence: Resume from state file after restart
 
         Stop Conditions:
         1. Trade target reached (trades >= target_trades)
         2. Cumulative loss limit exceeded (PNL < cumulative_loss_limit)
         3. Stop flag set (manual or automatic)
+
+        GRACEFUL SHUTDOWN (ITERATION 2):
+        - Stop flag checked BEFORE each new trade
+        - If stop_flag set during BUILD: Complete BUILD → Complete UNWIND → Exit
+        - No premature termination during position holding
         """
         import time
 
@@ -1075,14 +1364,15 @@ if __name__ == "__main__":
 - [ ] Trades execute opportunistically (not time-based)
 - [ ] NO time constraint (runs until 100 trades)
 - [ ] Trade target checked after each trade
-- [ ] Stop flag checked before each trade
+- [ ] Stop flag checked before each trade (graceful shutdown)
 - [ ] Final summary logged with runtime, trades, volume, PNL
 - [ ] Strategy selected via explicit --use-100-trades-mode flag
 - [ ] Session start time logged
+- [ ] Session recovery logged (resuming at trade X)
 
 ---
 
-### T6: Enhanced Monitoring and Logging
+### T7: Enhanced Monitoring and Logging (T6 renamed to T7)
 
 **File**: `/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`
 
@@ -1094,8 +1384,10 @@ if __name__ == "__main__":
         """
         Calculate volume statistics for monitoring.
 
-        Volume Calculation:
-            trade_volume_usd = target_notional * 2
+        Volume Calculation (ITERATION 2 CLARIFIED):
+            target_notional is PER POSITION
+            Total volume = target_notional * 2 (ETH + SOL)
+            Example: --size 5000 → $5K ETH + $5K SOL = $10K total volume
 
         Returns:
             dict with volume metrics
@@ -1117,32 +1409,79 @@ if __name__ == "__main__":
 
 **Acceptance**:
 - [ ] Volume statistics available for monitoring
-- [ ] Volume calculation formula documented
+- [ ] Volume calculation formula documented (target_notional is PER POSITION)
+- [ ] PNL filter skips logged separately
+- [ ] Loss limit warnings logged
+- [ ] Session recovery logged
+
+---
+
+### T8: Testing and Deployment (ITERATION 2 WITH SESSION RECOVERY TESTS)
 - [ ] PNL filter skips logged separately
 - [ ] Loss limit warnings logged
 
 ---
 
-### T7: Testing and Deployment
+### T9: Testing and Deployment (ITERATION 2 WITH SESSION RECOVERY TESTS)
 
-**Step 1: Verify start_time field**
+**Step 1: Verify pytz import and start_time field**
 
 ```bash
 cd /Users/botfarmer/2dex/hedge
+
+# Check that pytz is imported
+python -c "
+import DN_pair_eth_sol_nado
+print('pytz imported:', 'pytz' in dir(DN_pair_eth_sol_nado))
+"
 
 # Check that start_time field exists in daily_pnl_summary
 python -c "
 from DN_pair_eth_sol_nado import DNPairBot
 from decimal import Decimal
 bot = DNPairBot(target_notional=Decimal('100'))
-print('start_time' in bot.daily_pnl_summary)
-print(bot.daily_pnl_summary.get('start_time'))
+print('start_time in daily_pnl_summary:', 'start_time' in bot.daily_pnl_summary)
+print('start_time value:', bot.daily_pnl_summary.get('start_time'))
+print('last_cycle_pnl in daily_pnl_summary:', 'last_cycle_pnl' in bot.daily_pnl_summary)
 "
 ```
 
-**Expected**: `True` and a datetime object
+**Expected**: `True` for all checks, datetime object for start_time
 
-**Step 2: Test with 5 trades**
+**Step 2: Test session persistence (NEW - ITERATION 2)**
+
+```bash
+# Test 1: Run 10 trades, stop, restart, verify resume
+cd /Users/botfarmer/2dex/hedge
+
+# First run: 10 trades
+python DN_pair_eth_sol_nado.py \
+    --size 5000 \
+    --iter 1 \
+    --use-100-trades-mode \
+    --target-trades 10 \
+    --cumulative-loss-limit -1000
+
+# Check state file created
+cat logs/dn_bot_100trades_state.json
+
+# Second run: Should resume at trade 11 with same start_time
+python DN_pair_eth_sol_nado.py \
+    --size 5000 \
+    --iter 1 \
+    --use-100-trades-mode \
+    --target-trades 20 \
+    --cumulative-loss-limit -1000
+```
+
+**Expected**:
+- State file created: `logs/dn_bot_100trades_state.json`
+- First run stops at trade 10
+- Second run logs: "Resuming at trade 10"
+- Second run continues to trade 20
+- start_time preserved from first run
+
+**Step 3: Test with 5 trades**
 
 ```bash
 # Test 5-trade run to verify tracking
@@ -1159,8 +1498,9 @@ python DN_pair_eth_sol_nado.py \
 - ~$50K volume (5 x $10,000)
 - Progress logged every 10 trades (will show at completion)
 - Auto-stop at -$100 cumulative loss
+- State saved after each trade
 
-**Step 3: Test volume tracking**
+**Step 4: Test volume tracking**
 
 ```bash
 # Run until 20 trades to verify tracking
@@ -1177,11 +1517,12 @@ python DN_pair_eth_sol_nado.py \
 - Volume progress logged every 10 trades
 - Celebration message when target reached
 - Elapsed time displayed
+- Volume formula: target_notional is PER POSITION (already correct)
 
-**Step 4: Test loss limit**
+**Step 5: Test loss limit with graceful shutdown (NEW - ITERATION 2)**
 
 ```bash
-# Simulate losses with tight limit
+# Test graceful shutdown: Simulate losses during BUILD phase
 python DN_pair_eth_sol_nado.py \
     --size 100 \
     --iter 1 \
@@ -1192,11 +1533,31 @@ python DN_pair_eth_sol_nado.py \
 ```
 
 **Expected**:
+- If loss limit hit during BUILD: Complete BUILD → Complete UNWIND → Stop
 - Bot stops when cumulative PNL < -$20
 - Loss limit formula logged
-- Loss limit breach logged with details
+- Loss limit breach logged with graceful shutdown message
+- No premature termination during position holding
 
-**Step 5: Production 100-trade run**
+**Step 6: Test PNL filter with data race fix (NEW - ITERATION 2)**
+
+```bash
+# Test PNL filter: verify last_cycle_pnl is used (not current_cycle_pnl)
+python DN_pair_eth_sol_nado.py \
+    --size 5000 \
+    --iter 1 \
+    --use-100-trades-mode \
+    --target-trades 10 \
+    --cumulative-loss-limit -1000
+```
+
+**Expected**:
+- Trade skipped if last_cycle_pnl < 0
+- Skip logged: "Last trade PNL: -$X.XX"
+- No data race: last_cycle_pnl contains previous trade result
+- First trade never skipped
+
+**Step 7: Production 100-trade run**
 
 ```bash
 # Full 100-trade lossless run for $1M volume
@@ -1214,18 +1575,23 @@ python DN_pair_eth_sol_nado.py \
 - Realistic duration: 2.5-5 days with POST_ONLY + 6 bps
 - Cumulative PNL >= 0 at completion (lossless)
 - Final volume percentage displayed
+- Session can be resumed after restart
 
 **Acceptance**:
+- [ ] pytz import verified
 - [ ] start_time field verified to exist
+- [ ] last_cycle_pnl field verified to exist
+- [ ] Session persistence tested (stop at 10, restart, resume at 11)
 - [ ] Dry run completes without errors
-- [ ] Volume tracking accurate
-- [ ] Loss limit enforced correctly
+- [ ] Volume tracking accurate (target_notional is PER POSITION)
+- [ ] Loss limit enforced correctly with graceful shutdown
+- [ ] PNL filter uses last_cycle_pnl (no data race)
 - [ ] Formula documented in logs
 - [ ] 100-trade run reports actual vs target
 
 ---
 
-## Risk Management
+## Risk Management (ITERATION 2 UPDATES)
 
 ### Safety Mechanisms
 
@@ -1236,15 +1602,17 @@ python DN_pair_eth_sol_nado.py \
    - Checked after every completed trade
    - Warning at 80% of limit
 
-2. **PNL Filter**
-   - Skips trades after losses
+2. **PNL Filter (ITERATION 2 FIX)**
+   - Skips trades after losses (uses last_cycle_pnl, NOT current_cycle_pnl)
    - Preserves capital for recovery
    - Can be disabled with `--disable-pnl-filter`
+   - Data race eliminated: last_cycle_pnl contains previous trade result
 
 3. **Position Verification**
    - BUILD verification: Ensures positions opened correctly
    - UNWIND verification: Ensures positions closed completely
    - Residual position check at startup
+   - Position validation on restart recovery
 
 4. **Spread Filter**
    - 6 bps minimum spread (configurable)
@@ -1256,7 +1624,19 @@ python DN_pair_eth_sol_nado.py \
    - Prevents over-trading
    - Celebrates achievement
 
-### Mitigation Strategies
+6. **Session Persistence (NEW - ITERATION 2)**
+   - State saved to JSON file after each trade
+   - Resume after restart without losing progress
+   - start_time preserved across restarts
+   - last_cycle_pnl preserved for PNL filter
+   - Position validation before resuming
+
+7. **Graceful Shutdown (NEW - ITERATION 2)**
+   - Stop flag checked before each new trade
+   - Complete current BUILD + UNWIND before stopping
+   - No premature termination during position holding
+
+### Mitigation Strategies (ITERATION 2 UPDATES)
 
 | Risk | Mitigation |
 |------|------------|
@@ -1266,8 +1646,11 @@ python DN_pair_eth_sol_nado.py \
 | **Partial fills** | POST_ONLY mode with position verification |
 | **Network issues** | Retry logic in order placement (3-5 retries) |
 | **Exchange downtime** | Stop flag checked before each trade |
-| **Cumulative loss breach** | Auto-stop with documented formula |
+| **Cumulative loss breach** | Auto-stop with graceful shutdown (complete current cycle) |
 | **Lossless requirement not met** | PNL filter helps, but no guarantee |
+| **Bot restart loses progress** | Session persistence: Resume from JSON state file |
+| **PNL filter data race** | FIXED: Uses last_cycle_pnl (set after trade completes) |
+| **Mid-execution stop risk** | Graceful shutdown: Complete BUILD+UNWIND before stopping |
 
 ### Mode Selection Guide
 
@@ -1289,18 +1672,23 @@ python DN_pair_eth_sol_nado.py \
 
 ## Verification
 
-### Pre-Deployment Checklist
+### Pre-Deployment Checklist (ITERATION 2 UPDATES)
 
 - [ ] All code changes reviewed
-- [ ] start_time field added to daily_pnl_summary
-- [ ] Volume calculation formula documented
+- [ ] pytz import verified (required for start_time timezone handling)
+- [ ] start_time field added to daily_pnl_summary (PERSISTED across restarts)
+- [ ] last_cycle_pnl field added to daily_pnl_summary (for PNL filter)
+- [ ] Volume calculation formula documented (target_notional is PER POSITION)
 - [ ] Cumulative loss limit formula documented
 - [ ] Tuple import verified (line 23)
-- [ ] Loss limit tested with dry run
+- [ ] JSON and Path imports verified (for session persistence)
+- [ ] Session persistence tested (stop at 10, restart, resume at 11)
+- [ ] Loss limit tested with dry run and graceful shutdown
+- [ ] PNL filter tested with data race fix (uses last_cycle_pnl)
 - [ ] Volume tracking verified
 - [ ] PNL filter tested (enable/disable)
 - [ ] CSV logging checked
-- [ ] Backup created: `cp DN_pair_eth_sol_nado.py DN_pair_eth_sol_nado.py.v6.1.backup`
+- [ ] Backup created: `cp DN_pair_eth_sol_nado.py DN_pair_eth_sol_nado.py.v6.2.backup`
 
 ### Runtime Monitoring
 
@@ -1309,6 +1697,7 @@ python DN_pair_eth_sol_nado.py \
 - Volume progress vs $1M
 - Cumulative PNL vs loss limit
 - Elapsed time
+- Session state saved to JSON
 
 **Manual checks** (daily):
 ```bash
@@ -1321,11 +1710,14 @@ tail -50 logs/DN_pair_eth_sol_nado_log.txt | grep "REPORT"
 # Check loss limit
 tail -50 logs/DN_pair_eth_sol_nado_log.txt | grep "LOSS LIMIT"
 
+# Check session state
+cat logs/dn_bot_100trades_state.json
+
 # Check for errors
 tail -100 logs/DN_pair_eth_sol_nado_log.txt | grep -i "error\|warning"
 ```
 
-### Success Criteria
+### Success Criteria (ITERATION 2 UPDATES)
 
 - [ ] **100 trades completed** (primary objective)
 - [ ] **$1M volume achieved** (100 x $10,000)
@@ -1334,6 +1726,8 @@ tail -100 logs/DN_pair_eth_sol_nado_log.txt | grep -i "error\|warning"
 - [ ] **Clean shutdown** (no residual positions)
 - [ ] **Opportunistic execution** (not time-based)
 - [ ] **start_time field exists** and used for elapsed time
+- [ ] **Session persistence works** (resume after restart)
+- [ ] **PNL filter uses last_cycle_pnl** (no data race)
 
 ---
 
@@ -1403,13 +1797,19 @@ User-Confirmed Math:
   Trades for $1M: 100 trades
   Goal: PNL >= 0 AND 100 trades completed
 
-Volume Calculation Formula:
-  trade_volume_usd = target_notional * 2
-  Example: --size 5000 → trade_volume = 5000 * 2 = $10,000
+Volume Calculation Formula (ITERATION 2 CLARIFIED):
+  target_notional is PER POSITION (already correct)
+  Total volume = target_notional * 2 (ETH + SOL)
+  Example: --size 5000 → $5K ETH + $5K SOL = $10K total volume
 
 Cumulative Loss Limit Formula:
   Stop if: cumulative_pnl_with_fee < cumulative_loss_limit
   Example: PNL=-600, limit=-500 → -600 < -500 → STOP
+  Graceful shutdown: Complete BUILD+UNWIND before stopping
+
+PNL Filter Formula (ITERATION 2 DATA RACE FIX):
+  Skip if: last_cycle_pnl < 0 (previous trade was a loss)
+  NOT current_cycle_pnl (which is reset before the check)
 
 New Parameters:
 - --use-100-trades-mode: Enable 100-trades continuous execution
@@ -1417,12 +1817,21 @@ New Parameters:
 - --volume-target: Volume target in USD (default 1000000 = $1M)
 - --cumulative-loss-limit: Auto-stop threshold (default -500)
 - --disable-pnl-filter: Allow trades after losses
+- --state-file: Session state file (default: logs/dn_bot_100trades_state.json)
+
+ITERATION 2 CRITICAL FIXES:
+- Session persistence: JSON state file (pattern from progressive_sizing.py)
+- PNL filter data race: Uses last_cycle_pnl (NOT current_cycle_pnl)
+- Graceful shutdown: Complete BUILD+UNWIND before stopping on loss limit
+- Volume formula clarified: target_notional is PER POSITION
+- pytz import verified: Required for start_time timezone handling
 
 Objectives:
 - 100 trades completed (NOT time-constrained)
 - $1M volume achieved (100 x $10,000)
 - Cumulative PNL >= 0 (lossless)
 - $2000 margin with 5x leverage
+- Session can be resumed after restart
 
 Capital Structure:
 - Margin: $2,000
@@ -1441,32 +1850,43 @@ Co-Authored-By: Claude (glm-4.7) <noreply@anthropic.com>
 
 ---
 
-## File Changes Summary
+## File Changes Summary (ITERATION 2 UPDATES)
 
 ### Modified Files
 
 1. **`/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py`**
-   - Constructor: Add target_trades, volume_target_usd, cumulative_loss_limit, disable_pnl_filter, use_100_trades_mode
-   - daily_pnl_summary: **CRITICAL FIX** Add start_time field, total_volume_usd field
-   - CLI: Add --use-100-trades-mode, --target-trades, --volume-target, --cumulative-loss-limit, --disable-pnl-filter
-   - New methods: _check_cumulative_loss_limit(), _should_skip_trade(), run_100_trades_strategy(), _get_volume_stats()
-   - Update: _update_daily_pnl_summary() (volume tracking, loss limit check, trade target check, celebration)
+   - Imports: **ADD** `import pytz` (required for start_time timezone handling)
+   - Imports: **ADD** `import json`, `from pathlib import Path` (for session persistence)
+   - Constructor: Add target_trades, volume_target_usd, cumulative_loss_limit, disable_pnl_filter, use_100_trades_mode, state_file
+   - daily_pnl_summary: **CRITICAL FIX** Add start_time field (PERSISTED), total_volume_usd field, last_cycle_pnl field (for PNL filter)
+   - CLI: Add --use-100-trades-mode, --target-trades, --volume-target, --cumulative-loss-limit, --disable-pnl-filter, --state-file
+   - New methods: _load_session_state(), _save_session_state(), _check_cumulative_loss_limit(), _should_skip_trade(), run_100_trades_strategy(), _get_volume_stats()
+   - Update: _update_daily_pnl_summary() (volume tracking, last_cycle_pnl storage, loss limit check, trade target check, celebration, session state save)
    - Update: _generate_daily_pnl_report() (trade count, volume display, elapsed time)
-   - Update: execute_buy_first_cycle() (PNL filter check)
-   - Update: execute_sell_first_cycle() (PNL filter check)
+   - Update: execute_buy_first_cycle() (PNL filter check with last_cycle_pnl)
+   - Update: execute_sell_first_cycle() (PNL filter check with last_cycle_pnl)
    - Update: main() (explicit strategy selection via use_100_trades_mode)
 
 ### Backup Files
 
-1. **`/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py.v6.1.backup`**
-   - Pre-modification backup for rollback
+1. **`/Users/botfarmer/2dex/hedge/DN_pair_eth_sol_nado.py.v6.2.backup`**
+   - Pre-modification backup for rollback (ITERATION 2)
+
+### Session State File (NEW)
+
+1. **`/Users/botfarmer/2dex/hedge/logs/dn_bot_100trades_state.json`**
+   - Created automatically on first run
+   - Contains: start_time, total_cycles, last_cycle_pnl, total_pnl_with_fee, total_volume_usd
+   - Used for session recovery after restart
 
 ---
 
-## Dependencies
+## Dependencies (ITERATION 2 UPDATES)
 
 ### External Dependencies
-- None (uses existing libraries)
+- pytz: **NEW** Required for start_time timezone handling
+- json: **NEW** Required for session state persistence
+- pathlib: **NEW** Required for file path handling
 
 ### Internal Dependencies
 - Existing CSV logging structure
@@ -1475,54 +1895,65 @@ Co-Authored-By: Claude (glm-4.7) <noreply@anthropic.com>
 - Existing position verification
 - Existing daily PNL tracking
 - Tuple import (line 23): Already exists
+- Progressive sizing pattern: `/Users/botfarmer/2dex/hedge/helpers/progressive_sizing.py` lines 91-125
 
 ---
 
-## Risk Assessment
+## Risk Assessment (ITERATION 2 UPDATES)
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
 | 100 trades takes too long | Medium | Low | User chooses mode (POST_ONLY: 2-5 days, IOC: ~1 day) |
 | Insufficient spread opportunities | Medium | Low | No time constraint, wait for setups |
-| Cumulative loss breach | Medium | Low | PNL filter + auto-stop |
+| Cumulative loss breach | Medium | Low | PNL filter + auto-stop + graceful shutdown |
 | Exchange downtime | Low | Medium | Stop flag checked each trade |
 | Network issues | Medium | Low | 3-5 retry logic |
 | Partial fills | Low | Low | Position verification |
-| Missing start_time field | Low | High | CRITICAL FIX added in T1 |
+| Missing start_time field | Low | High | **FIXED** Added in T1, persisted across restarts |
 | Lossless requirement not met | Medium | Medium | PNL filter helps, no guarantee |
 | Software bugs | Low | Medium | Extensive testing before 100-trade run |
+| **Bot restart loses progress** | Medium | High | **FIXED** Session persistence (JSON state file) |
+| **PNL filter data race** | High | High | **FIXED** Uses last_cycle_pnl (not current_cycle_pnl) |
+| **Mid-execution stop risk** | Medium | Medium | **FIXED** Graceful shutdown (complete BUILD+UNWIND) |
 
 ---
 
-## Timeline
+## Timeline (ITERATION 2 UPDATES)
 
 ### Development: 1 day
-- **Hour 1-2**: Implement T1-T2 (parameters, start_time fix, volume)
-- **Hour 3-4**: Implement T3-T4 (loss limit, PNL filter)
-- **Hour 5**: Implement T5-T6 (100-trades strategy, monitoring)
-- **Hour 6-7**: Testing (T7 steps 1-4)
-- **Hour 8**: Code review and refinement
+- **Hour 1-2**: Implement T1-T2 (parameters, start_time fix, pytz import, volume)
+- **Hour 3**: Implement T3 (session persistence - _load_session_state, _save_session_state)
+- **Hour 4**: Implement T4 (loss limit with graceful shutdown)
+- **Hour 5**: Implement T5 (PNL filter with data race fix - last_cycle_pnl)
+- **Hour 6**: Implement T6-T7 (100-trades strategy, monitoring)
+- **Hour 7-8**: Testing T9 (session recovery, graceful shutdown, PNL filter data race)
 
 ### Deployment: 1-5 days (depending on mode)
-- **Day 1 Morning**: Verify start_time field exists
+- **Day 1 Morning**: Verify pytz import, start_time field, last_cycle_pnl field
 - **Day 1 Midday**: Dry run testing (5 trades)
-- **Day 1 Afternoon**: Loss limit and volume tests
-- **Day 1 Evening**: Start 100-trade run
+- **Day 1 Afternoon**: Session persistence test (stop at 10, restart, resume at 11)
+- **Day 1 Evening**: Loss limit graceful shutdown test, PNL filter data race test
+- **Day 1 Night**: Start 100-trade run
 - **Day 2-5**: Monitor progress (POST_ONLY: 2.5-5 days, IOC: ~1 day)
-- **Completion**: Verify 100 trades, $1M volume, PNL >= 0
+- **Completion**: Verify 100 trades, $1M volume, PNL >= 0, session recovery works
 
 ---
 
-## Success Criteria
+## Success Criteria (ITERATION 2 UPDATES)
 
 ### Phase 1: Development
-- [ ] All 8 tasks completed
+- [ ] All 9 tasks completed (T1-T9)
 - [ ] Code compiles without errors
-- [ ] start_time field verified to exist
-- [ ] Volume calculation formula documented
+- [ ] pytz import verified
+- [ ] start_time field verified to exist (PERSISTED)
+- [ ] last_cycle_pnl field verified to exist (for PNL filter)
+- [ ] Volume calculation formula documented (target_notional is PER POSITION)
 - [ ] Cumulative loss limit formula documented
+- [ ] PNL filter formula documented (uses last_cycle_pnl)
 - [ ] Dry run tests pass
 - [ ] Volume tracking verified
+- [ ] Session persistence tested
+- [ ] Graceful shutdown tested
 
 ### Phase 2: 100-Trade Run
 - [ ] Bot runs until 100 trades completed
@@ -1530,17 +1961,30 @@ Co-Authored-By: Claude (glm-4.7) <noreply@anthropic.com>
 - [ ] Completes with cumulative PNL >= 0 (lossless)
 - [ ] No residual positions at end
 - [ ] All logs and CSV data complete
+- [ ] Session can be resumed after restart
+- [ ] PNL filter uses last_cycle_pnl (no data race)
+- [ ] Graceful shutdown completes current cycle before stopping
 
 ### Overall Success
 - [ ] **100 trades**: Completed (primary objective)
 - [ ] **$1M volume**: Achieved (100 x $10,000)
 - [ ] **Lossless trading**: Cumulative PNL >= 0
+- [ ] **Session persistence**: Resume after restart works
+- [ ] **Data race fixed**: PNL filter uses last_cycle_pnl
+- [ ] **Graceful shutdown**: Complete BUILD+UNWIND before stop
 - [ ] **Reusable**: Framework for future trade-based strategies
 - [ ] **Documented**: Formulas and calculations explicit
 
 ---
 
-**Plan Status**: READY FOR EXECUTION
+**Plan Status**: READY FOR EXECUTION (ITERATION 2 - ALL CRITICAL ISSUES ADDRESSED)
+
+**ITERATION 2 CRITICAL FIXES SUMMARY**:
+1. Session persistence: JSON state file (progressive_sizing.py pattern)
+2. PNL filter data race: Uses last_cycle_pnl (NOT current_cycle_pnl)
+3. Graceful shutdown: Complete BUILD+UNWIND before stopping
+4. Volume formula clarified: target_notional is PER POSITION
+5. pytz import verified: Required for start_time timezone handling
 
 **Next Step**: Run `/oh-my-claudecode:start-work dn-bot-1M-volume-1day-lossless` to begin implementation.
 
