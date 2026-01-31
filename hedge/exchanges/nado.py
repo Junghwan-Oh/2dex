@@ -295,6 +295,14 @@ class NadoClient(BaseExchangeClient):
         """Get the BookDepth handler for this client (if WebSocket is connected)."""
         return self._bookdepth_handler if self._ws_connected else None
 
+    def get_bbo_handler(self) -> Optional['BBOHandler']:
+        """Get the BBO handler for this client (if WebSocket is connected).
+
+        Returns:
+            BBOHandler instance if WebSocket is connected, None otherwise
+        """
+        return self._bbo_handler if self._ws_connected else None
+
     async def estimate_slippage(
         self,
         side: str,
