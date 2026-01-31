@@ -747,8 +747,15 @@ class NadoClient(BaseExchangeClient):
         return (price / price_increment).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * price_increment
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a close order with Nado using official SDK."""
-        max_retries = 5
+        """Place a close order with Nado using official SDK.
+
+        CRITICAL FIXES:
+        - Uses IOC order type for immediate execution (not POST_ONLY)
+        - Includes isolated_margin calculation (required for isolated margin trading)
+        - Rounds quantity to size increment (same as place_ioc_order)
+        - Short expiration (60s) for immediate-or-cancel behavior
+        """
+        max_retries = 3
         retry_count = 0
 
         while retry_count < max_retries:
@@ -758,66 +765,102 @@ class NadoClient(BaseExchangeClient):
                 if best_bid <= 0 or best_ask <= 0:
                     return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
-                # Adjust order price based on market conditions
-                adjusted_price = price
-                if side.lower() == 'sell':
-                    # For sell orders, ensure price is above best bid to be a maker order
-                    if price <= best_bid:
-                        adjusted_price = best_bid + self.config.tick_size
-                elif side.lower() == 'buy':
-                    # For buy orders, ensure price is below best ask to be a maker order
-                    if price >= best_ask:
-                        adjusted_price = best_ask - self.config.tick_size
+                # Convert to product_id int
+                product_id_int = int(contract_id)
 
-                # Build order parameters
+                # CRITICAL FIX #4: Use taker pricing for IOC: match with standing orders at the touch
+                if side.lower() == 'buy':
+                    # Buy at best ask to match with standing sell orders
+                    order_price = self._round_price_to_increment(product_id_int, best_ask)
+                else:
+                    # Sell at best bid to match with standing buy orders
+                    order_price = self._round_price_to_increment(product_id_int, best_bid)
+
+                # CRITICAL FIX #3: Round quantity to size increment FIRST
+                rounded_quantity = self._round_quantity_to_size_increment(product_id_int, quantity)
+                if rounded_quantity == 0:
+                    return OrderResult(success=False, error_message=f'Quantity {quantity} too small (rounds to 0)')
+
+                # CRITICAL FIX #1: Calculate isolated margin for 5x leverage
+                # SDK requires x6 precision (6 decimal places) for isolated_margin parameter
+                notional_value = float(str(rounded_quantity)) * float(str(order_price))
+                leverage = 5.0
+                isolated_margin = int(notional_value / leverage * 10**6)  # x6 precision
+
+                self.logger.log(
+                    f"Close order: {side} {rounded_quantity} @ ${order_price}, "
+                    f"notional=${notional_value:.2f}, margin=${notional_value/leverage:.2f}",
+                    "INFO"
+                )
+
+                # Build order parameters with isolated_margin
                 order = OrderParams(
                     sender=SubaccountParams(
                         subaccount_owner=self.owner,
                         subaccount_name=self.subaccount_name,
                     ),
-                    priceX18=to_x18(float(adjusted_price)),
-                    amount=to_x18(float(quantity)) if side.lower() == 'buy' else -to_x18(float(quantity)),
-                    expiration=get_expiration_timestamp(3600),  # 1 hour expiration
+                    priceX18=to_x18(float(str(order_price))),
+                    amount=to_x18(float(str(rounded_quantity))) if side.lower() == 'buy' else -to_x18(float(str(rounded_quantity))),
+                    expiration=get_expiration_timestamp(60),  # CRITICAL FIX #6: Short expiration for IOC
                     nonce=gen_order_nonce(),
                     appendix=build_appendix(
-                        order_type=OrderType.POST_ONLY,
-                        isolated=True
+                        order_type=OrderType.IOC,  # CRITICAL FIX #2: IOC for immediate execution
+                        isolated=True,
+                        isolated_margin=isolated_margin  # CRITICAL FIX #1: Required for isolated margin
                     )
                 )
 
                 # Place the order
-                result = self.client.market.place_order({"product_id": int(contract_id), "order": order})
+                result = self.client.market.place_order({"product_id": product_id_int, "order": order})
 
                 if not result:
-                    return OrderResult(success=False, error_message='Failed to place order')
-
-                # Extract order ID from response
-                order_id = result.data.digest
-                if not order_id:
-                    await asyncio.sleep(0.1)
                     return OrderResult(
-                        success=True,
-                        side=side,
-                        size=quantity,
-                        price=adjusted_price,
-                        status='OPEN'
+                        success=False,
+                        error_message='Failed to place order',
+                        status='EXPIRED'
                     )
 
-                # Order successfully placed
+                order_id = result.data.digest
+
+                # CRITICAL FIX #5: Immediately check order status to see if it filled
+                await asyncio.sleep(0.1)  # Brief wait for execution
+                order_info = await self.get_order_info(order_id)
+
+                if order_info is None:
+                    return OrderResult(
+                        success=False,
+                        error_message='Could not get order info',
+                        status='UNKNOWN'
+                    )
+
+                # Determine filled status
+                filled_size = order_info.filled_size
+                remaining_size = order_info.remaining_size
+
+                if remaining_size == 0:
+                    status = 'FILLED'
+                elif filled_size > 0:
+                    status = 'PARTIALLY_FILLED'
+                else:
+                    status = 'EXPIRED'
+
+                # Success only if there was actual fill
+                actual_fill = filled_size != 0
                 return OrderResult(
-                    success=True,
+                    success=actual_fill,
                     order_id=order_id,
                     side=side,
-                    size=quantity,
-                    price=adjusted_price,
-                    status='OPEN'
+                    size=rounded_quantity,
+                    filled_size=abs(filled_size) if filled_size != 0 else Decimal('0'),
+                    price=order_info.price,
+                    status=status
                 )
 
             except Exception as e:
                 self.logger.log(f"Error placing close order: {e}", "ERROR")
                 if retry_count < max_retries - 1:
                     retry_count += 1
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.05)
                     continue
                 else:
                     return OrderResult(success=False, error_message=str(e))
@@ -982,21 +1025,30 @@ class NadoClient(BaseExchangeClient):
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
         try:
-            # Get subaccount identifier
-            resolved_subaccount = subaccount_to_hex(self.client.context.signer.address, self.subaccount_name)
-            
+            # Get subaccount identifier using self.owner (not signer.address)
+            resolved_subaccount = subaccount_to_hex(self.owner, self.subaccount_name)
+
+            self.logger.log(f"get_account_positions: owner={self.owner}, subaccount_name={self.subaccount_name}", "DEBUG")
+            self.logger.log(f"get_account_positions: resolved_subaccount={resolved_subaccount}", "DEBUG")
+
             # Get isolated positions from Nado SDK (requires subaccount parameter)
             account_data = self.client.context.engine_client.get_subaccount_info(resolved_subaccount)
             position_data = account_data.perp_balances
 
+            self.logger.log(f"get_account_positions: retrieved {len(position_data)} positions", "DEBUG")
+
             # Find position for current contract
             product_id = self.config.contract_id
-            
+
             for position in position_data:
+                self.logger.log(f"get_account_positions: checking position.product_id={position.product_id} against {product_id}", "DEBUG")
                 if position.product_id == product_id:
                     position_size = position.balance.amount
-                    return Decimal(str(from_x18(position_size)))
+                    result = Decimal(str(from_x18(position_size)))
+                    self.logger.log(f"get_account_positions: FOUND position={result}", "DEBUG")
+                    return result
 
+            self.logger.log(f"get_account_positions: no position found for {product_id}, returning 0", "DEBUG")
             return Decimal(0)
 
         except Exception as e:

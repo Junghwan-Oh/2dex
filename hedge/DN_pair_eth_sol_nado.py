@@ -575,18 +575,25 @@ class DNPairBot:
             if hasattr(self, 'current_cycle_pnl'):
                 self.current_cycle_pnl["total_fees"] += eth_fee
 
+            # Determine if this is an exit order based on phase flags, not direction
+            # SELL_FIRST cycle BUILD uses "sell" for ETH but it's still an entry, not exit
+            is_exit_order = hasattr(self, '_is_exit_phase') and self._is_exit_phase
+
             # Prepare CSV parameters with new V5.3 fields
             csv_params = self._prepare_csv_params(
                 exchange="NADO",
                 side=f"ETH-{eth_direction.upper()}",
                 price=str(eth_fill_price),
                 quantity=str(eth_fill_qty),
-                order_type="entry" if eth_direction == "buy" else "exit",
+                order_type="entry" if not is_exit_order else "exit",
                 mode="FILLED" if eth_filled else "PARTIAL",
                 fee_usd=str(eth_fee),
-                is_exit=(eth_direction == "sell")
+                is_exit=is_exit_order
             )
-            self.log_trade_to_csv(**csv_params)
+            try:
+                self.log_trade_to_csv(**csv_params)
+            except Exception as e:
+                self.logger.error(f"[CSV] Error logging ETH trade: {e}")
 
         if sol_fill_qty > 0:
             sol_notional = sol_fill_price * sol_fill_qty
@@ -596,18 +603,25 @@ class DNPairBot:
             if hasattr(self, 'current_cycle_pnl'):
                 self.current_cycle_pnl["total_fees"] += sol_fee
 
+            # Determine if this is an exit order based on phase flags, not direction
+            # SELL_FIRST cycle BUILD uses "buy" for SOL but it's still an entry, not exit
+            is_exit_order = hasattr(self, '_is_exit_phase') and self._is_exit_phase
+
             # Prepare CSV parameters with new V5.3 fields
             csv_params = self._prepare_csv_params(
                 exchange="NADO",
                 side=f"SOL-{sol_direction.upper()}",
                 price=str(sol_fill_price),
                 quantity=str(sol_fill_qty),
-                order_type="entry" if sol_direction == "sell" else "exit",
+                order_type="entry" if not is_exit_order else "exit",
                 mode="FILLED" if sol_filled else "PARTIAL",
                 fee_usd=str(sol_fee),
-                is_exit=(sol_direction == "buy")
+                is_exit=is_exit_order
             )
-            self.log_trade_to_csv(**csv_params)
+            try:
+                self.log_trade_to_csv(**csv_params)
+            except Exception as e:
+                self.logger.error(f"[CSV] Error logging SOL trade: {e}")
 
         # Handle partial fills and failed orders
         await self.handle_emergency_unwind(eth_result, sol_result)
@@ -746,11 +760,7 @@ class DNPairBot:
             pnl_no_fee, pnl_with_fee, breakdown = self._calculate_current_pnl()
             params["pnl_no_fee"] = str(pnl_no_fee)
             params["pnl_with_fee"] = str(pnl_with_fee)
-
-            # Add breakdown if available
-            if breakdown:
-                params["eth_pnl"] = str(breakdown.get("eth_pnl", "0"))
-                params["sol_pnl"] = str(breakdown.get("sol_pnl", "0"))
+            # Note: eth_pnl and sol_pnl are in breakdown but not written to CSV
 
         # Set entry timestamp if available
         if hasattr(self, 'current_cycle_pnl') and self.current_cycle_pnl.get("entry_time"):
@@ -1717,11 +1727,20 @@ class DNPairBot:
             # Log spread analysis at entry if orders succeeded
             if (isinstance(eth_result, OrderResult) and eth_result.success and
                 isinstance(sol_result, OrderResult) and sol_result.success):
-                self._log_spread_analysis(spread_info)
+                try:
+                    self._log_spread_analysis(spread_info)
+                except Exception as e:
+                    self.logger.error(f"[CSV] Error logging spread analysis: {e}")
+
+            # DEBUG: Log return values
+            self.logger.info(f"[DEBUG] BUILD Return: isinstance(eth_result, OrderResult)={isinstance(eth_result, OrderResult)}, eth_result.success={eth_result.success if isinstance(eth_result, OrderResult) else 'N/A'}, isinstance(sol_result, OrderResult)={isinstance(sol_result, OrderResult)}, sol_result.success={sol_result.success if isinstance(sol_result, OrderResult) else 'N/A'}")
 
             return (isinstance(eth_result, OrderResult) and eth_result.success and
                     isinstance(sol_result, OrderResult) and sol_result.success)
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"[BUILD] Exception during build cycle: {e}")
+            import traceback
+            self.logger.error(f"[BUILD] Traceback: {traceback.format_exc()}")
             self._is_entry_phase = False
             return False
 
