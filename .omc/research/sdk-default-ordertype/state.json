@@ -1,0 +1,12 @@
+{
+  "session_id": "sdk-default-ordertype",
+  "status": "complete",
+  "started_at": "2026-02-01T00:00:00Z",
+  "completed_at": "2026-02-01T00:00:00Z",
+  "stages": [
+    {"id": 1, "name": "SDK OrderType Investigation", "status": "complete"},
+    {"id": 2, "name": "Current Implementation Analysis", "status": "complete"},
+    {"id": 3, "name": "SDK Documentation Search", "status": "complete"},
+    {"id": 4, "name": "Fee Structure Verification", "status": "complete"}
+  ]
+}

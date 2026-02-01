@@ -1,0 +1,43 @@
+{
+  "objective": "Verify fee structure for OrderType.DEFAULT vs OrderType.POST_ONLY",
+  "fee_rates_found": {
+    "maker_fee": "0.0002 (2bps)",
+    "taker_fee": "0.0005 (5bps)",
+    "source": "hedge/DN_pair_eth_sol_nado.py fee rate calculation"
+  },
+  "order_types_found": {
+    "OrderType.DEFAULT": 0,
+    "OrderType.POST_ONLY": "Maker-only order (rejects if would cross spread)",
+    "OrderType.IOC": "Immediate-Or-Cancel order",
+    "OrderType.LIMIT": "DOES NOT EXIST in this SDK"
+  },
+  "fee_determination": {
+    "key_principle": "Fees determined by EXECUTION METHOD, not OrderType",
+    "maker_execution": "2bps (0.0002) - resting on book, provides liquidity",
+    "taker_execution": "5bps (0.0005) - crossing spread, takes liquidity"
+  },
+  "current_pricing_problem": {
+    "file": "hedge/exchanges/nado.py",
+    "line": "538 (place_open_order)",
+    "order_type": "OrderType.POST_ONLY",
+    "pricing": "best_ask - tick_size (BUY) or best_bid + tick_size (SELL)",
+    "problem": "Creates 1-tick gap away from touch, never fills",
+    "result": "100% timeout rate, 100% fallback to IOC (taker execution)"
+  },
+  "key_questions_answers": {
+    "1_fee_determined_by": "EXECUTION METHOD (maker/taker), NOT by OrderType",
+    "2_default_allows_both": "YES - OrderType.DEFAULT allows both maker and taker execution depending on price placement",
+    "3_post_only_maker_only": "YES - OrderType.POST_ONLY enforces maker-only (rejects taker execution)",
+    "4_exact_fee_rates": "2bps (maker) vs 5bps (taker)"
+  },
+  "critical_undefined": {
+    "question": "Does OrderType.DEFAULT placed AT touch price (crossing spread) execute as maker (2bps) or taker (5bps)?",
+    "status": "PENDING VERIFICATION - NEEDED FROM SDK DOCS OR EMPIRICAL TEST",
+    "impact": "Determines whether DEFAULT+BBO strategy provides fee improvement"
+  },
+  "default_fill_rate_advantage": {
+    "current_post_only": "0% fill rate (100% timeout due to 1-tick gap pricing)",
+    "proposed_default": "100% fill rate (immediate execution by crossing spread)",
+    "latency_improvement": "5 seconds per cycle (no timeout)"
+  }
+}
