@@ -66,7 +66,6 @@ class DNPairBot:
         iterations: int = 20,
         sleep_time: int = 0,
         csv_path: str = None,  # Optional custom CSV path for testing
-        use_post_only: bool = True,  # POST_ONLY mode (maker, 2 bps) vs IOC (taker, 5 bps)
         min_spread_bps: int = 0,  # Minimum spread in bps - sanity check only, profit comes from post-entry movements
         # Feature flags for PNL optimization
         enable_at_touch_pricing: bool = False,
@@ -98,16 +97,9 @@ class DNPairBot:
         self.spread_threshold_ticks = spread_threshold_ticks
         self.min_partial_fill_ratio = min_partial_fill_ratio
 
-        # Determine order mode based on feature flags
-        if self.enable_order_type_default:
-            self.use_post_only = False  # Use OrderType.DEFAULT
-            self.order_mode = "default"
-        elif use_post_only is not None:
-            self.use_post_only = use_post_only
-            self.order_mode = "post_only" if self.use_post_only else "ioc"
-        else:
-            self.use_post_only = True  # Default behavior
-            self.order_mode = "post_only"
+        # Order mode: Always use DEFAULT (true limit order) now
+        # Feature flags have been removed in favor of single unified path
+        self.order_mode = "default"
 
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/DN_pair_eth_sol_nado_log.txt"
@@ -115,7 +107,7 @@ class DNPairBot:
         # Log order mode configuration
         import logging
         self._config_logger = logging.getLogger("dn_config")
-        self._config_logger.info(f"[CONFIG] Order mode: {self.order_mode.upper()} (POST_ONLY={self.use_post_only})")
+        self._config_logger.info(f"[CONFIG] Order mode: {self.order_mode.upper()}")
         self._config_logger.info(f"[CONFIG] Min spread filter: {self.min_spread_bps} bps")
         self._config_logger.info(f"[CONFIG] At-touch pricing: {self.enable_at_touch_pricing}")
         self._config_logger.info(f"[CONFIG] Order type DEFAULT: {self.enable_order_type_default}")
@@ -423,23 +415,88 @@ class DNPairBot:
         )
         return Decimal(0), slippage, False
 
+    async def _poll_limit_order_fill(
+        self,
+        client: 'NadoClient',
+        order_result: OrderResult,
+        original_qty: Decimal,
+        timeout: int
+    ) -> OrderResult:
+        """Poll limit order until filled or timeout.
+
+        Args:
+            client: NadoClient instance
+            order_result: Initial order result with status='OPEN'
+            original_qty: Original order quantity
+            timeout: Maximum seconds to wait
+
+        Returns:
+            Updated OrderResult with fill status
+        """
+        import time
+        POLL_INTERVAL = 0.1
+        start_time = time.time()
+        order_id = order_result.order_id
+
+        while time.time() - start_time < timeout:
+            try:
+                order_info = await client.get_order_info(order_id)
+                if order_info:
+                    filled_size = abs(order_info.filled_size)
+                    remaining_size = order_info.remaining_size
+
+                    if remaining_size == 0:
+                        # Fully filled
+                        return OrderResult(
+                            success=True,
+                            order_id=order_id,
+                            filled_size=original_qty,
+                            status='FILLED',
+                            price=order_info.price,
+                            side=order_result.side
+                        )
+                    elif filled_size > 0:
+                        filled_ratio = filled_size / original_qty
+                        if filled_ratio >= self.min_partial_fill_ratio:
+                            # Partially filled, accept it and cancel remainder
+                            self.logger.info(
+                                f"Partial fill accepted: {filled_size}/{original_qty} ({filled_ratio:.1%})"
+                            )
+                            await client.cancel_order(order_id)
+                            return OrderResult(
+                                success=True,
+                                order_id=order_id,
+                                filled_size=filled_size,
+                                status='PARTIALLY_FILLED',
+                                price=order_info.price,
+                                side=order_result.side
+                            )
+            except Exception as e:
+                self.logger.warning(f"Error polling order {order_id}: {e}")
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+        # Timeout - cancel and return failure (SIMPLE: no retry)
+        self.logger.warning(f"Limit order timeout after {timeout}s, cancelling")
+        try:
+            await client.cancel_order(order_id)
+        except Exception as e:
+            self.logger.error(f"Error cancelling order {order_id}: {e}")
+
+        return OrderResult(
+            success=False,
+            error_message=f'Limit order timeout after {timeout}s'
+        )
+
     async def place_simultaneous_orders(
         self,
         eth_direction: str,
         sol_direction: str,
-        attempt_count: int = 0,
     ) -> Tuple[OrderResult, OrderResult]:
-        """Place ETH and SOL orders simultaneously using REST-based position monitoring.
+        """Place ETH and SOL orders simultaneously using OrderType.DEFAULT.
 
-        Supports both IOC (Immediate-Or-Cancel) and POST_ONLY modes:
-        - IOC: Aggressive, crosses spread, 5 bps taker fee, immediate fills
-        - POST_ONLY: Passive, rests on book, 2 bps maker fee, may not fill
-
-        Follows the your-quantguy reference pattern:
-        1. Get position BEFORE placing order
-        2. Place order with aggressive pricing (IOC) or passive pricing (POST_ONLY)
-        3. Poll position every 100ms via REST API
-        4. Confirm fill when position changes by expected amount
+        Single unified path - no use_post_only branching, no IOC fallback.
+        Orders rest on book at maker prices (BUY=bid, SELL=ask).
         """
         # Get initial positions BEFORE placing orders
         eth_pos_before = await self.eth_client.get_account_positions()
@@ -468,8 +525,8 @@ class DNPairBot:
                 return (OrderResult(success=False, error_message="Spread too wide"),
                         OrderResult(success=False, error_message="Spread too wide"))
 
-        # Fee rate based on order mode: POST_ONLY = 2 bps (maker), IOC = 5 bps (taker)
-        FEE_RATE = Decimal("0.0002") if self.use_post_only else Decimal("0.0005")
+        # Fee rate based on order mode: DEFAULT = 2 bps (maker)
+        FEE_RATE = Decimal("0.0002") if self.order_mode == "default" else Decimal("0.0005")
         fee_bps = float(FEE_RATE * 10000)
         self.logger.info(f"[ORDER] Mode: {self.order_mode.upper()}, Fee: {fee_bps:.0f} bps")
 
@@ -497,260 +554,123 @@ class DNPairBot:
                     OrderResult(success=False, error_message=f"Queue filter: {skip_reasons}")
                 )
 
-        if self.use_post_only:
-            # POST_ONLY: Place at touch price (limit order, passive)
-            # For sell orders: use bid price; for buy orders: use ask price
-            eth_price = eth_bid if eth_direction == "sell" else eth_ask
-            sol_price = sol_bid if sol_direction == "sell" else sol_ask
+        # CORE FIX: Maker pricing (BUY at bid, SELL at ask)
+        eth_price = eth_bid if eth_direction == "buy" else eth_ask
+        sol_price = sol_bid if sol_direction == "buy" else sol_ask
 
-            # Use BookDepth for sizing
-            eth_qty, eth_slippage_bps, eth_full_fill = await self.calculate_order_size_with_slippage(
-                eth_price, "ETH", eth_direction, max_slippage_bps=10
+        # Use BookDepth for sizing
+        eth_qty, eth_slippage_bps, eth_full_fill = await self.calculate_order_size_with_slippage(
+            eth_price, "ETH", eth_direction, max_slippage_bps=10
+        )
+        sol_qty, sol_slippage_bps, sol_full_fill = await self.calculate_order_size_with_slippage(
+            sol_price, "SOL", sol_direction, max_slippage_bps=10
+        )
+
+        # LIQUIDITY-BASED SKIP LOGIC: Check if either leg signals to skip (qty=0)
+        if eth_qty == 0 or sol_qty == 0:
+            skip_reason = []
+            if eth_qty == 0:
+                if eth_slippage_bps >= Decimal(999999):
+                    skip_reason.append(f"ETH order size too small for exchange minimum")
+                else:
+                    skip_reason.append(f"ETH slippage {eth_slippage_bps:.1f} bps > 10 bps threshold")
+            if sol_qty == 0:
+                if sol_slippage_bps >= Decimal(999999):
+                    skip_reason.append(f"SOL order size too small for exchange minimum")
+                else:
+                    skip_reason.append(f"SOL slippage {sol_slippage_bps:.1f} bps > 10 bps threshold")
+            self.logger.warning(
+                f"[ORDER] SKIPPING TRADE due to insufficient liquidity: {', '.join(skip_reason)}"
             )
-            sol_qty, sol_slippage_bps, sol_full_fill = await self.calculate_order_size_with_slippage(
-                sol_price, "SOL", sol_direction, max_slippage_bps=10
-            )
-
-            # LIQUIDITY-BASED SKIP LOGIC: Check if either leg signals to skip (qty=0)
-            if eth_qty == 0 or sol_qty == 0:
-                skip_reason = []
-                if eth_qty == 0:
-                    if eth_slippage_bps >= Decimal(999999):
-                        skip_reason.append(f"ETH order size too small for exchange minimum")
-                    else:
-                        skip_reason.append(f"ETH slippage {eth_slippage_bps:.1f} bps > 10 bps threshold")
-                if sol_qty == 0:
-                    if sol_slippage_bps >= Decimal(999999):
-                        skip_reason.append(f"SOL order size too small for exchange minimum")
-                    else:
-                        skip_reason.append(f"SOL slippage {sol_slippage_bps:.1f} bps > 10 bps threshold")
-                self.logger.warning(
-                    f"[ORDER] SKIPPING TRADE due to insufficient liquidity: {', '.join(skip_reason)}"
-                )
-                # Return failed results to signal skip
-                return (
-                    OrderResult(success=False, error_message=f"Skipped: {', '.join(skip_reason)}"),
-                    OrderResult(success=False, error_message=f"Skipped: {', '.join(skip_reason)}")
-                )
-
-            self.logger.info(
-                f"[ORDER] Placing POST_ONLY orders: "
-                f"ETH {eth_direction} {eth_qty} @ ${eth_price}, "
-                f"SOL {sol_direction} {sol_qty} @ ${sol_price}"
+            return (
+                OrderResult(success=False, error_message=f"Skipped: {', '.join(skip_reason)}"),
+                OrderResult(success=False, error_message=f"Skipped: {', '.join(skip_reason)}")
             )
 
-            # Place POST_ONLY orders using place_open_order (which uses POST_ONLY appendix)
-            # Note: place_open_order uses OrderType.POST_ONLY and isolated=True
-            POST_ONLY_TIMEOUT = 5  # seconds
+        self.logger.info(
+            f"[ORDER] Placing DEFAULT limit orders: "
+            f"ETH {eth_direction} {eth_qty} @ ${eth_price}, "
+            f"SOL {sol_direction} {sol_qty} @ ${sol_price}"
+        )
 
-            eth_result, sol_result = await asyncio.gather(
-                self.eth_client.place_open_order(
-                    self.eth_client.config.contract_id,
-                    eth_qty,
-                    eth_direction,
-                    eth_price
-                ),
-                self.sol_client.place_open_order(
-                    self.sol_client.config.contract_id,
-                    sol_qty,
-                    sol_direction,
-                    sol_price
-                ),
-                return_exceptions=True
+        # Calculate dynamic timeout (FIXED: use get_bbo_handler())
+        spread_state = None
+        if self.enable_dynamic_timeout:
+            if self.eth_client.get_bbo_handler():
+                spread_state = self.eth_client.get_bbo_handler().get_spread_state()
+
+        # For limit orders (maker), use longer timeout since they rest on the book
+        # Base timeout * 3 to give counterparties time to take our orders
+        eth_timeout = self.eth_client.calculate_timeout(eth_qty, spread_state) * 3
+        sol_timeout = self.sol_client.calculate_timeout(sol_qty, spread_state) * 3
+
+        # Cap at 30 seconds maximum for limit orders
+        eth_timeout = min(eth_timeout, 30)
+        sol_timeout = min(sol_timeout, 30)
+
+        # Place limit orders (returns OPEN status immediately)
+        eth_result, sol_result = await asyncio.gather(
+            self.eth_client.place_limit_order(
+                self.eth_client.config.contract_id,
+                eth_qty,
+                eth_direction,
+                eth_price
+            ),
+            self.sol_client.place_limit_order(
+                self.sol_client.config.contract_id,
+                sol_qty,
+                sol_direction,
+                sol_price
+            ),
+            return_exceptions=True
+        )
+
+        # Handle exceptions
+        if isinstance(eth_result, Exception):
+            self.logger.error(f"[ORDER] ETH order failed: {eth_result}")
+            eth_result = OrderResult(success=False, error_message=str(eth_result))
+        if isinstance(sol_result, Exception):
+            self.logger.error(f"[ORDER] SOL order failed: {sol_result}")
+            sol_result = OrderResult(success=False, error_message=str(sol_result))
+
+        # If both failed, return immediately
+        if not eth_result.success and not sol_result.success:
+            self.logger.error(f"[ORDER] Both orders failed - ETH: {eth_result.error_message}, SOL: {sol_result.error_message}")
+            return eth_result, sol_result
+
+        # Poll for fills (if OPEN status)
+        if eth_result.status == 'OPEN' or sol_result.status == 'OPEN':
+            eth_result = await self._poll_limit_order_fill(
+                self.eth_client, eth_result, eth_qty, eth_timeout
             )
-
-            # Handle exceptions
-            if isinstance(eth_result, Exception):
-                self.logger.error(f"[ORDER] ETH order failed: {eth_result}")
-                eth_result = OrderResult(success=False, error_message=str(eth_result))
-            if isinstance(sol_result, Exception):
-                self.logger.error(f"[ORDER] SOL order failed: {sol_result}")
-                sol_result = OrderResult(success=False, error_message=str(sol_result))
-
-            # POST_ONLY: Poll and wait for actual fills (OPEN != filled)
-            # Dynamic timeout (only if enabled)
-            if self.enable_dynamic_timeout:
-                spread_state = self.eth_client._bbo_handler.get_spread_state()
-                POST_ONLY_TIMEOUT = self.eth_client.calculate_timeout(eth_qty, spread_state)
-            else:
-                POST_ONLY_TIMEOUT = 5.0  # Default timeout
-            POLL_INTERVAL = 0.1
-            eth_fill_event = asyncio.Event()
-            sol_fill_event = asyncio.Event()
-
-            async def poll_eth_fill():
-                try:
-                    for _ in range(int(POST_ONLY_TIMEOUT / POLL_INTERVAL)):
-                        if eth_result.order_id:
-                            order_info = await self.eth_client.get_order_info(eth_result.order_id)
-                            if order_info:
-                                filled_ratio = abs(order_info.filled_size) / eth_result.size
-                                if order_info.remaining_size == 0 or filled_ratio >= self.min_partial_fill_ratio:
-                                    eth_fill_event.set()
-                                    return
-                        await asyncio.sleep(POLL_INTERVAL)
-                except Exception as e:
-                    self.logger.warning(f"[ORDER] Error polling ETH fill: {e}")
-
-            async def poll_sol_fill():
-                try:
-                    for _ in range(int(POST_ONLY_TIMEOUT / POLL_INTERVAL)):
-                        if sol_result.order_id:
-                            order_info = await self.sol_client.get_order_info(sol_result.order_id)
-                            if order_info:
-                                filled_ratio = abs(order_info.filled_size) / sol_result.size
-                                if order_info.remaining_size == 0 or filled_ratio >= self.min_partial_fill_ratio:
-                                    sol_fill_event.set()
-                                    return
-                        await asyncio.sleep(POLL_INTERVAL)
-                except Exception as e:
-                    self.logger.warning(f"[ORDER] Error polling SOL fill: {e}")
-
-            poll_task = asyncio.gather(poll_eth_fill(), poll_sol_fill())
-
-            try:
-                await asyncio.wait_for(asyncio.gather(
-                    eth_fill_event.wait(),
-                    sol_fill_event.wait()
-                ), timeout=POST_ONLY_TIMEOUT)
-                self.logger.info("[ORDER] Both POST_ONLY orders filled successfully")
-                poll_task.cancel()
-            except asyncio.TimeoutError:
-                self.logger.warning("[ORDER] POST_ONLY timeout, checking fill status...")
-                eth_order_info = await self.eth_client.get_order_info(eth_result.order_id) if eth_result.order_id else None
-                sol_order_info = await self.sol_client.get_order_info(sol_result.order_id) if sol_result.order_id else None
-                eth_filled = eth_order_info and eth_order_info.remaining_size == 0
-                sol_filled = sol_order_info and sol_order_info.remaining_size == 0
-                if not (eth_filled and sol_filled):
-                    # Cancel any open POST_ONLY orders
-                    try:
-                        if eth_result.status == 'OPEN' and eth_result.order_id:
-                            await self.eth_client.cancel_order(eth_result.order_id)
-                    except Exception as e:
-                        self.logger.error(f"[CANCEL] Failed to cancel ETH order: {e}")
-
-                    try:
-                        if sol_result.status == 'OPEN' and sol_result.order_id:
-                            await self.sol_client.cancel_order(sol_result.order_id)
-                    except Exception as e:
-                        self.logger.error(f"[CANCEL] Failed to cancel SOL order: {e}")
-
-                    # Recursive fallback with attempt limit
-                    if attempt_count < 2:
-                        self.logger.warning(
-                            f"[ORDER] POST_ONLY incomplete (attempt {attempt_count + 1}/2), "
-                            f"falling back to IOC"
-                        )
-                        original_mode = self.use_post_only
-                        self.use_post_only = False
-                        try:
-                            return await self.place_simultaneous_orders(
-                                eth_direction, sol_direction, attempt_count + 1
-                            )
-                        finally:
-                            self.use_post_only = original_mode
-                    else:
-                        self.logger.error("[ORDER] Max attempts exceeded, aborting cycle")
-                        return (
-                            OrderResult(success=False, error_message="POST_ONLY and IOC both failed"),
-                            OrderResult(success=False, error_message="POST_ONLY and IOC both failed")
-                        )
-
-            # Store order results for further processing
-            # Note: POST_ONLY orders may return with status='OPEN' instead of 'FILLED'
-            # We need to handle this case appropriately
-
-        else:
-            # Original IOC logic (existing code)
-            eth_price = eth_ask if eth_direction == "buy" else eth_bid
-            sol_price = sol_bid if sol_direction == "sell" else sol_ask
-
-            # Use slippage-aware order sizing with BookDepth data
-            # Reduced slippage from 20bps to 10bps to minimize losses
-            eth_qty, eth_slippage_bps, eth_full_fill = await self.calculate_order_size_with_slippage(
-                eth_price, "ETH", eth_direction, max_slippage_bps=10
+            sol_result = await self._poll_limit_order_fill(
+                self.sol_client, sol_result, sol_qty, sol_timeout
             )
-            sol_qty, sol_slippage_bps, sol_full_fill = await self.calculate_order_size_with_slippage(
-                sol_price, "SOL", sol_direction, max_slippage_bps=10
-            )
-
-            # LIQUIDITY-BASED SKIP LOGIC: Check if either leg signals to skip (qty=0)
-            if eth_qty == 0 or sol_qty == 0:
-                skip_reason = []
-                if eth_qty == 0:
-                    if eth_slippage_bps >= Decimal(999999):
-                        skip_reason.append(f"ETH order size too small for exchange minimum")
-                    else:
-                        skip_reason.append(f"ETH slippage {eth_slippage_bps:.1f} bps > 10 bps threshold")
-                if sol_qty == 0:
-                    if sol_slippage_bps >= Decimal(999999):
-                        skip_reason.append(f"SOL order size too small for exchange minimum")
-                    else:
-                        skip_reason.append(f"SOL slippage {sol_slippage_bps:.1f} bps > 10 bps threshold")
-                self.logger.warning(
-                    f"[ORDER] SKIPPING TRADE due to insufficient liquidity: {', '.join(skip_reason)}"
-                )
-                # Return failed results to signal skip
-                return (
-                    OrderResult(success=False, error_message=f"Skipped: {', '.join(skip_reason)}"),
-                    OrderResult(success=False, error_message=f"Skipped: {', '.join(skip_reason)}")
-                )
-
-            self.logger.info(
-                f"[ORDER] Placing IOC orders: "
-                f"ETH {eth_direction} {eth_qty} @ ~${eth_price} ({eth_slippage_bps:.1f} bps est. slippage), "
-                f"SOL {sol_direction} {sol_qty} @ ~${sol_price} ({sol_slippage_bps:.1f} bps est. slippage)"
-            )
-
-            # Place IOC orders concurrently (Immediate-Or-Cancel for immediate fills)
-            eth_result, sol_result = await asyncio.gather(
-                self.eth_client.place_ioc_order(self.eth_client.config.contract_id, eth_qty, eth_direction),
-                self.sol_client.place_ioc_order(self.sol_client.config.contract_id, sol_qty, sol_direction),
-                return_exceptions=True
-            )
-
-        # Check for exceptions (IOC mode only - POST_ONLY already handled above)
-        if not self.use_post_only:
-            if isinstance(eth_result, Exception):
-                self.logger.error(f"[ORDER] ETH order failed with exception: {eth_result}")
-                eth_result = OrderResult(success=False, error_message=str(eth_result))
-            if isinstance(sol_result, Exception):
-                self.logger.error(f"[ORDER] SOL order failed with exception: {sol_result}")
-                sol_result = OrderResult(success=False, error_message=str(sol_result))
-
-            # If both failed, return immediately
-            if not eth_result.success and not sol_result.success:
-                self.logger.error("[ORDER] Both orders failed")
-                return eth_result, sol_result
 
         # Extract fill details from OrderResult
-        # Handle both IOC (immediate fill) and POST_ONLY (may return OPEN status)
-        eth_filled = eth_result.status == 'FILLED' or (self.use_post_only and eth_result.status == 'OPEN')
-        eth_fill_qty = eth_result.filled_size if eth_filled else (eth_result.size if eth_result.status == 'OPEN' else Decimal(0))
+        eth_filled = eth_result.status in ('FILLED', 'PARTIALLY_FILLED')
+        eth_fill_qty = eth_result.filled_size if eth_filled else Decimal(0)
         eth_fill_price = eth_result.price if eth_filled else Decimal(0)
 
-        sol_filled = sol_result.status == 'FILLED' or (self.use_post_only and sol_result.status == 'OPEN')
-        sol_fill_qty = sol_result.filled_size if sol_filled else (sol_result.size if sol_result.status == 'OPEN' else Decimal(0))
+        sol_filled = sol_result.status in ('FILLED', 'PARTIALLY_FILLED')
+        sol_fill_qty = sol_result.filled_size if sol_filled else Decimal(0)
         sol_fill_price = sol_result.price if sol_filled else Decimal(0)
 
         # Check results and log fills
         if eth_filled:
-            self.logger.info(f"[FILL] ETH order {'filled' if not self.use_post_only else 'placed'}: {eth_fill_qty} @ ${eth_fill_price}")
-        elif eth_result.success and eth_fill_qty > 0:
-            self.logger.warning(f"[FILL] ETH order partially filled: {eth_fill_qty}/{eth_qty}")
-        else:
-            self.logger.warning(f"[FILL] ETH order did not fill")
+            fill_type = "fully" if eth_result.status == 'FILLED' else "partially"
+            self.logger.info(f"[FILL] ETH order {fill_type} filled: {eth_fill_qty} @ ${eth_fill_price}")
+        elif not eth_result.success:
+            self.logger.error(f"[FILL] ETH order failed: {eth_result.error_message}")
 
         if sol_filled:
-            self.logger.info(f"[FILL] SOL order {'filled' if not self.use_post_only else 'placed'}: {sol_fill_qty} @ ${sol_fill_price}")
-        elif sol_result.success and sol_fill_qty > 0:
-            self.logger.warning(f"[FILL] SOL order partially filled: {sol_fill_qty}/{sol_qty}")
-        else:
-            self.logger.warning(f"[FILL] SOL order did not fill")
+            fill_type = "fully" if sol_result.status == 'FILLED' else "partially"
+            self.logger.info(f"[FILL] SOL order {fill_type} filled: {sol_fill_qty} @ ${sol_fill_price}")
+        elif not sol_result.success:
+            self.logger.error(f"[FILL] SOL order failed: {sol_result.error_message}")
 
-        # Hybrid partial fill handling for IOC mode
-        # Check if both orders had partial fills (not fully filled, but some quantity filled)
-        if not self.use_post_only and eth_fill_qty > 0 and sol_fill_qty > 0:
+        # Partial fill handling
+        if eth_fill_qty > 0 and sol_fill_qty > 0:
             if (eth_fill_qty < eth_qty or sol_fill_qty < sol_qty):
                 # At least one order was partially filled
                 should_proceed, reason, retry_coro = self._handle_partial_fill(
@@ -777,9 +697,8 @@ class DNPairBot:
                     self.logger.info(f"[PARTIAL] {reason}")
 
         # Log actual fills to CSV
-        # Fee rate based on order mode: POST_ONLY = 2 bps (maker), IOC = 5 bps (taker)
-        # Re-calculate FEE_RATE here for CSV logging (was calculated above but in different scope)
-        FEE_RATE = Decimal("0.0002") if self.use_post_only else Decimal("0.0005")
+        # Fee rate based on order mode: DEFAULT = 2 bps (maker)
+        FEE_RATE = Decimal("0.0002") if self.order_mode == "default" else Decimal("0.0005")
 
         # Store entry prices and quantities for PNL tracking
         if hasattr(self, '_is_entry_phase') and self._is_entry_phase:
@@ -1318,15 +1237,15 @@ class DNPairBot:
         from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
 
         # Fee-aware profit targets (remaining fees only)
-        # Entry fees ALREADY PAID: 10 bps (IOC) or 4 bps (POST_ONLY)
-        # Exit fees REMAINING: 10 bps (IOC) or 4 bps (POST_ONLY)
-        remaining_exit_fees_bps = 10 if not self.use_post_only else 4
+        # Entry fees ALREADY PAID: 10 bps (IOC) or 4 bps (DEFAULT)
+        # Exit fees REMAINING: 10 bps (IOC) or 4 bps (DEFAULT)
+        remaining_exit_fees_bps = 4 if self.order_mode == "default" else 10
 
         BASE_PROFIT = 15
         MIN_NET_PROFIT = 5
 
-        profit_target = BASE_PROFIT + remaining_exit_fees_bps  # 25 for IOC, 19 for POST_ONLY
-        quick_exit = MIN_NET_PROFIT + remaining_exit_fees_bps  # 15 for IOC, 9 for POST_ONLY
+        profit_target = BASE_PROFIT + remaining_exit_fees_bps  # 19 for DEFAULT, 25 for IOC
+        quick_exit = MIN_NET_PROFIT + remaining_exit_fees_bps  # 9 for DEFAULT, 15 for IOC
         stop_loss = 30  # Stop loss remains absolute
 
         self.logger.info(
@@ -2674,7 +2593,6 @@ async def main():
         iterations=args.iter,
         sleep_time=args.sleep,
         csv_path=args.csv_path,
-        use_post_only=not getattr(args, 'use_ioc', False),  # POST_ONLY mode (default True)
         min_spread_bps=getattr(args, 'min_spread_bps', 0),  # Min spread sanity check - profit from post-entry movements (default 0 bps)
         # PNL optimization feature flags
         enable_at_touch_pricing=getattr(args, 'enable_at_touch_pricing', False),

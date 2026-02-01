@@ -17,7 +17,7 @@ from nado_protocol.utils.expiration import get_expiration_timestamp
 from nado_protocol.utils.math import to_x18, from_x18
 from nado_protocol.utils.nonce import gen_order_nonce
 from nado_protocol.utils.order import build_appendix, OrderType
-from nado_protocol.engine_client.types.execute import CancelOrdersParams
+from nado_protocol.engine_client.types.execute import CancelOrdersParams, ResponseStatus
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
@@ -576,8 +576,12 @@ class NadoClient(BaseExchangeClient):
                 # Place the order
                 result = self.client.market.place_order({"product_id": int(contract_id), "order": order})
 
-                if not result:
-                    return OrderResult(success=False, error_message='Failed to place order')
+                if not result or result.status != ResponseStatus.SUCCESS:
+                    error_msg = result.error if result and result.error else 'Failed to place order'
+                    return OrderResult(success=False, error_message=error_msg)
+
+                if not result.data:
+                    return OrderResult(success=False, error_message='No data in order response')
 
                 # Extract order ID from response
                 order_id = result.data.digest
@@ -594,6 +598,94 @@ class NadoClient(BaseExchangeClient):
 
             except Exception as e:
                 self.logger.log(f"Error placing open order: {e}", "ERROR")
+                if retry_count < max_retries - 1:
+                    retry_count += 1
+                    await asyncio.sleep(0.1)
+                    continue
+                else:
+                    return OrderResult(success=False, error_message=str(e))
+
+        return OrderResult(success=False, error_message='Max retries exceeded')
+
+    async def place_limit_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        direction: str,
+        price: Decimal
+    ) -> OrderResult:
+        """Place a limit order with OrderType.DEFAULT (no polling, no timeout handling).
+
+        This method places a limit order that rests on the book.
+        Polling and timeout are handled by the caller (place_simultaneous_orders).
+
+        Args:
+            contract_id: Product ID
+            quantity: Order quantity
+            direction: "buy" or "sell"
+            price: Limit price (use bid for buy, ask for sell)
+
+        Returns:
+            OrderResult with status='OPEN' if order placed successfully
+        """
+        max_retries = 5
+        retry_count = 0
+
+        # Convert to product_id int
+        product_id_int = int(contract_id)
+
+        # Round quantity UP to size increment to ensure minimum notional is met
+        rounded_quantity = self._round_quantity_up_to_size_increment(product_id_int, quantity)
+        if rounded_quantity == 0:
+            return OrderResult(success=False, error_message=f'Quantity {quantity} too small (rounds to 0)')
+
+        while retry_count < max_retries:
+            try:
+                # Calculate isolated margin for 5x leverage (same as place_ioc_order/place_close_order)
+                notional_value = float(str(rounded_quantity)) * float(str(price))
+                leverage = 5.0
+                isolated_margin = int(notional_value / leverage * 10**6)  # x6 precision
+
+                # Place order with OrderType.DEFAULT and isolated_margin
+                order = OrderParams(
+                    sender=SubaccountParams(
+                        subaccount_owner=self.owner,
+                        subaccount_name=self.subaccount_name,
+                    ),
+                    priceX18=to_x18(float(str(price))),
+                    amount=to_x18(float(str(rounded_quantity))) if direction == 'buy' else -to_x18(float(str(rounded_quantity))),
+                    expiration=get_expiration_timestamp(60*60*24*30),
+                    nonce=gen_order_nonce(),
+                    appendix=build_appendix(
+                        order_type=OrderType.DEFAULT,  # True limit order behavior
+                        isolated=True,
+                        isolated_margin=isolated_margin  # Required for isolated margin trading
+                    )
+                )
+
+                result = self.client.market.place_order({"product_id": int(contract_id), "order": order})
+
+                if not result or result.status != ResponseStatus.SUCCESS:
+                    error_msg = result.error if result and result.error else 'Failed to place order'
+                    return OrderResult(success=False, error_message=error_msg)
+
+                if not result.data:
+                    return OrderResult(success=False, error_message='No data in order response')
+
+                order_id = result.data.digest
+
+                # Return immediately with OPEN status (caller handles polling)
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    side=direction,
+                    size=rounded_quantity,
+                    price=price,
+                    status='OPEN'
+                )
+
+            except Exception as e:
+                self.logger.log(f"Error placing limit order: {e}", "ERROR")
                 if retry_count < max_retries - 1:
                     retry_count += 1
                     await asyncio.sleep(0.1)
@@ -688,9 +780,14 @@ class NadoClient(BaseExchangeClient):
                 result = self.client.market.place_order({"product_id": int(contract_id), "order": order})
                 print(f"[DEBUG PLACE_ORDER] Result type: {type(result)}, value: {result}", file=sys.stderr)
 
-                if not result:
-                    print(f"[DEBUG PLACE_ORDER] Order placement returned falsy result", file=sys.stderr)
-                    return OrderResult(success=False, error_message='Failed to place order', status='EXPIRED')
+                if not result or result.status != ResponseStatus.SUCCESS:
+                    print(f"[DEBUG PLACE_ORDER] Order placement failed: status={result.status if result else 'None'}", file=sys.stderr)
+                    error_msg = result.error if result and result.error else 'Failed to place order'
+                    return OrderResult(success=False, error_message=error_msg, status='EXPIRED')
+
+                if not result.data:
+                    print(f"[DEBUG PLACE_ORDER] No data in order response", file=sys.stderr)
+                    return OrderResult(success=False, error_message='No data in order response', status='EXPIRED')
 
                 order_id = result.data.digest
 
@@ -769,6 +866,30 @@ class NadoClient(BaseExchangeClient):
         # Round to nearest increment using ROUND_HALF_UP
         from decimal import ROUND_HALF_UP
         return (quantity / size_increment).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * size_increment
+
+    def _round_quantity_up_to_size_increment(self, product_id: int, quantity: Decimal) -> Decimal:
+        """Round quantity UP to the product's size increment (ceiling).
+
+        Uses ROUND_UP (ceiling) to ensure the rounded quantity meets or exceeds
+        the target quantity. This is useful for ensuring minimum notional value
+        requirements are met.
+
+        Args:
+            product_id: Product ID (4=ETH, 8=SOL)
+            quantity: Quantity to round
+
+        Returns:
+            Rounded quantity aligned to size increment (rounded UP)
+        """
+        # Size increment mapping (in Decimal format, not X18)
+        size_increments = {
+            4: Decimal("0.001"),  # ETH
+            8: Decimal("0.1"),    # SOL
+        }
+        size_increment = size_increments.get(product_id, Decimal("0.001"))
+        # Round UP (ceiling) to ensure minimum notional is met
+        from decimal import ROUND_UP
+        return (quantity / size_increment).quantize(Decimal('1'), rounding=ROUND_UP) * size_increment
 
     def _round_price_to_increment(self, product_id: int, price: Decimal) -> Decimal:
         """Round price to the product's price increment.
@@ -899,12 +1020,16 @@ class NadoClient(BaseExchangeClient):
                 # Place the order
                 result = self.client.market.place_order({"product_id": product_id_int, "order": order})
 
-                if not result:
+                if not result or result.status != ResponseStatus.SUCCESS:
+                    error_msg = result.error if result and result.error else 'Failed to place order'
                     return OrderResult(
                         success=False,
-                        error_message='Failed to place order',
+                        error_message=error_msg,
                         status='EXPIRED'
                     )
+
+                if not result.data:
+                    return OrderResult(success=False, error_message='No data in order response', status='EXPIRED')
 
                 order_id = result.data.digest
 
@@ -965,8 +1090,9 @@ class NadoClient(BaseExchangeClient):
                 CancelOrdersParams(productIds=[self.config.contract_id], digests=[order_id], sender=sender)
             )
 
-            if not result:
-                return OrderResult(success=False, error_message='Failed to cancel order')
+            if not result or result.status != ResponseStatus.SUCCESS:
+                error_msg = result.error if result and result.error else 'Failed to cancel order'
+                return OrderResult(success=False, error_message=error_msg)
 
             order_info = await self.get_order_info(order_id)
 
