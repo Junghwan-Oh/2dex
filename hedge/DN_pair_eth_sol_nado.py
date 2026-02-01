@@ -804,56 +804,88 @@ class DNPairBot:
     async def emergency_unwind_eth(self):
         """Emergency unwind ETH position (handles both long and short).
 
-        Determines current position direction and closes with market order.
-        Uses tolerance check (abs(pos) > 0.001) to handle Decimal precision.
+        Determines current position direction and closes with aggressive IOC.
+        Uses high slippage (10 bps) to ensure fill during emergency.
 
         Called from handle_emergency_unwind() when ETH fills but SOL fails.
         """
         if self.eth_client:
-            try:
-                current_pos = await self.eth_client.get_account_positions()
-                # NOTE: No None check needed - get_account_positions() always returns Decimal
-                # See nado.py:1078 - method signature: async def get_account_positions(self) -> Decimal
-                # Tolerance check: skip dust positions below 0.001
-                # Pattern from test_dn_pair.py: handles Decimal precision issues
-                if abs(current_pos) > Decimal("0.001"):
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    current_pos = await self.eth_client.get_account_positions()
+                    if abs(current_pos) < Decimal("0.001"):
+                        self.logger.info(f"[UNWIND] ETH position cleared (pos={current_pos})")
+                        return
+
                     # Determine close side: long positions sell, short positions buy
                     close_side = "sell" if current_pos > 0 else "buy"
-                    await self.eth_client.place_close_order(
+
+                    # Use aggressive IOC with 10 bps slippage for emergency
+                    result = await self.eth_client.place_ioc_order(
                         self.eth_client.config.contract_id,
-                        abs(current_pos),  # Always use positive quantity
-                        Decimal("0"),  # Market order
-                        close_side  # Dynamically determined side
+                        abs(current_pos),
+                        close_side
                     )
-            except Exception as e:
-                self.logger.error(f"[UNWIND] Failed to close ETH position: {e}")
+
+                    if result.success and result.status in ('FILLED', 'PARTIALLY_FILLED'):
+                        self.logger.info(f"[UNWIND] ETH emergency close successful: {result.filled_size} filled")
+                        # Check if remaining position needs another iteration
+                        remaining = await self.eth_client.get_account_positions()
+                        if abs(remaining) < Decimal("0.001"):
+                            return
+                    else:
+                        self.logger.warning(f"[UNWIND] ETH emergency close attempt {attempt+1} failed: {result.error_message}")
+
+                except Exception as e:
+                    self.logger.error(f"[UNWIND] ETH emergency close attempt {attempt+1} error: {e}")
+
+                await asyncio.sleep(0.1)
+
+            self.logger.error(f"[UNWIND] Failed to close ETH position after {max_retries} attempts")
 
     async def emergency_unwind_sol(self):
         """Emergency unwind SOL position (handles both long and short).
 
-        Determines current position direction and closes with market order.
-        Uses tolerance check (abs(pos) > 0.001) to handle Decimal precision.
+        Determines current position direction and closes with aggressive IOC.
+        Uses high slippage (10 bps) to ensure fill during emergency.
 
         Called from handle_emergency_unwind() when SOL fills but ETH fails.
         """
         if self.sol_client:
-            try:
-                current_pos = await self.sol_client.get_account_positions()
-                # NOTE: No None check needed - get_account_positions() always returns Decimal
-                # See nado.py:1078 - method signature: async def get_account_positions(self) -> Decimal
-                # Tolerance check: skip dust positions below 0.001
-                # Pattern from test_dn_pair.py: handles Decimal precision issues
-                if abs(current_pos) > Decimal("0.001"):
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    current_pos = await self.sol_client.get_account_positions()
+                    if abs(current_pos) < Decimal("0.001"):
+                        self.logger.info(f"[UNWIND] SOL position cleared (pos={current_pos})")
+                        return
+
                     # Determine close side: long positions sell, short positions buy
                     close_side = "sell" if current_pos > 0 else "buy"
-                    await self.sol_client.place_close_order(
+
+                    # Use aggressive IOC with 10 bps slippage for emergency
+                    result = await self.sol_client.place_ioc_order(
                         self.sol_client.config.contract_id,
-                        abs(current_pos),  # Always use positive quantity
-                        Decimal("0"),  # Market order
-                        close_side  # Dynamically determined side
+                        abs(current_pos),
+                        close_side
                     )
-            except Exception as e:
-                self.logger.error(f"[UNWIND] Failed to close SOL position: {e}")
+
+                    if result.success and result.status in ('FILLED', 'PARTIALLY_FILLED'):
+                        self.logger.info(f"[UNWIND] SOL emergency close successful: {result.filled_size} filled")
+                        # Check if remaining position needs another iteration
+                        remaining = await self.sol_client.get_account_positions()
+                        if abs(remaining) < Decimal("0.001"):
+                            return
+                    else:
+                        self.logger.warning(f"[UNWIND] SOL emergency close attempt {attempt+1} failed: {result.error_message}")
+
+                except Exception as e:
+                    self.logger.error(f"[UNWIND] SOL emergency close attempt {attempt+1} error: {e}")
+
+                await asyncio.sleep(0.1)
+
+            self.logger.error(f"[UNWIND] Failed to close SOL position after {max_retries} attempts")
 
     def _handle_partial_fill(
         self,
