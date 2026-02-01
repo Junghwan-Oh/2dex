@@ -83,9 +83,7 @@ class DNPairBot:
         self.target_notional = target_notional  # USD notional for each position
         self.iterations = iterations
         self.sleep_time = sleep_time
-        self.use_post_only = use_post_only
         self.min_spread_bps = min_spread_bps
-        self.order_mode = "post_only" if self.use_post_only else "ioc"
 
         # PNL optimization feature flags
         self.enable_at_touch_pricing = enable_at_touch_pricing
@@ -99,6 +97,17 @@ class DNPairBot:
         self.queue_threshold_ratio = queue_threshold_ratio
         self.spread_threshold_ticks = spread_threshold_ticks
         self.min_partial_fill_ratio = min_partial_fill_ratio
+
+        # Determine order mode based on feature flags
+        if self.enable_order_type_default:
+            self.use_post_only = False  # Use OrderType.DEFAULT
+            self.order_mode = "default"
+        elif use_post_only is not None:
+            self.use_post_only = use_post_only
+            self.order_mode = "post_only" if self.use_post_only else "ioc"
+        else:
+            self.use_post_only = True  # Default behavior
+            self.order_mode = "post_only"
 
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/DN_pair_eth_sol_nado_log.txt"
