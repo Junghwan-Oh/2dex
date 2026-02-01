@@ -740,6 +740,9 @@ class NadoClient(BaseExchangeClient):
     def _round_price_to_increment(self, product_id: int, price: Decimal) -> Decimal:
         """Round price to the product's price increment.
 
+        Fetches price_increment_x18 directly from SDK's current_market.book_info
+        to ensure we use the actual exchange tick size, not hardcoded values.
+
         Uses ROUND_HALF_UP to match standard trading behavior where
         values exactly halfway between increments round up.
 
@@ -750,16 +753,36 @@ class NadoClient(BaseExchangeClient):
         Returns:
             Rounded price aligned to price increment
         """
-        # Price increment mapping (in Decimal format, not X18)
-        # ETH: 0.0001, SOL: 0.01
-        price_increments = {
-            4: Decimal("0.0001"),  # ETH
-            8: Decimal("0.01"),     # SOL
-        }
-        price_increment = price_increments.get(product_id, Decimal("0.0001"))
-        # Round to nearest increment using ROUND_HALF_UP
-        from decimal import ROUND_HALF_UP
-        return (price / price_increment).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * price_increment
+        try:
+            # Fetch price increment from SDK API (authoritative source)
+            # Reference: Line 908 shows this SDK method is available
+            all_markets = self.client.market.get_all_engine_markets()
+            markets = all_markets.perp_products
+            current_market = None
+            for market in markets:
+                if market.product_id == product_id:
+                    current_market = market
+                    break
+
+            if current_market is None:
+                self.logger.log(f"Market not found for product_id {product_id}, using fallback tick_size 0.01", "WARNING")
+                price_increment = Decimal("0.01")
+            else:
+                # Convert price_increment_x18 to Decimal using from_x18()
+                # Note: from_x18 is already imported at module level (line 17)
+                price_increment_x18 = current_market.book_info.price_increment_x18
+                price_increment = Decimal(str(from_x18(price_increment_x18)))
+                self.logger.log(f"Product {product_id}: price_increment_x18={price_increment_x18}, tick_size={price_increment}", "INFO")
+
+            # Round to nearest increment using ROUND_HALF_UP
+            from decimal import ROUND_HALF_UP
+            return (price / price_increment).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * price_increment
+
+        except Exception as e:
+            self.logger.log(f"Error fetching price_increment for product_id {product_id}: {e}, using fallback 0.01", "WARNING")
+            from decimal import ROUND_HALF_UP
+            price_increment = Decimal("0.01")
+            return (price / price_increment).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * price_increment
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
         """Place a close order with Nado using official SDK.
@@ -1123,7 +1146,8 @@ class NadoClient(BaseExchangeClient):
 
             min_quantity = Decimal(str(from_x18(min_quantity_x18)))
 
-            if self.config.quantity < min_quantity:
+            # Only validate quantity if it's set in config (quantity may be managed differently)
+            if hasattr(self.config, 'quantity') and self.config.quantity < min_quantity:
                 self.logger.log(f"Order quantity is less than min quantity: {self.config.quantity} < {min_quantity}", "ERROR")
                 raise ValueError(f"Order quantity is less than min quantity: {self.config.quantity} < {min_quantity}")
 
