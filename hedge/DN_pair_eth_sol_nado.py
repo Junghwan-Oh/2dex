@@ -35,6 +35,19 @@ class Config:
         for key, value in config_dict.items():
             setattr(self, key, value)
 
+        # NEW: Feature flags for PNL optimization strategies
+        self.enable_at_touch_pricing = getattr(self, 'enable_at_touch_pricing', False)
+        self.enable_order_type_default = getattr(self, 'enable_order_type_default', False)
+        self.enable_queue_filter = getattr(self, 'enable_queue_filter', False)
+        self.enable_spread_filter = getattr(self, 'enable_spread_filter', False)
+        self.enable_partial_fills = getattr(self, 'enable_partial_fills', False)
+        self.enable_dynamic_timeout = getattr(self, 'enable_dynamic_timeout', False)
+
+        # NEW: Configurable thresholds
+        self.queue_threshold_ratio = getattr(self, 'queue_threshold_ratio', 0.5)
+        self.spread_threshold_ticks = getattr(self, 'spread_threshold_ticks', 5)
+        self.min_partial_fill_ratio = getattr(self, 'min_partial_fill_ratio', 0.5)
+
 
 class DNPairBot:
     """
@@ -55,6 +68,17 @@ class DNPairBot:
         csv_path: str = None,  # Optional custom CSV path for testing
         use_post_only: bool = True,  # POST_ONLY mode (maker, 2 bps) vs IOC (taker, 5 bps)
         min_spread_bps: int = 0,  # Minimum spread in bps - sanity check only, profit comes from post-entry movements
+        # Feature flags for PNL optimization
+        enable_at_touch_pricing: bool = False,
+        enable_order_type_default: bool = False,
+        enable_queue_filter: bool = False,
+        enable_spread_filter: bool = False,
+        enable_partial_fills: bool = False,
+        enable_dynamic_timeout: bool = False,
+        # Configurable thresholds
+        queue_threshold_ratio: float = 0.5,
+        spread_threshold_ticks: int = 5,
+        min_partial_fill_ratio: float = 0.5,
     ):
         self.target_notional = target_notional  # USD notional for each position
         self.iterations = iterations
@@ -62,6 +86,19 @@ class DNPairBot:
         self.use_post_only = use_post_only
         self.min_spread_bps = min_spread_bps
         self.order_mode = "post_only" if self.use_post_only else "ioc"
+
+        # PNL optimization feature flags
+        self.enable_at_touch_pricing = enable_at_touch_pricing
+        self.enable_order_type_default = enable_order_type_default
+        self.enable_queue_filter = enable_queue_filter
+        self.enable_spread_filter = enable_spread_filter
+        self.enable_partial_fills = enable_partial_fills
+        self.enable_dynamic_timeout = enable_dynamic_timeout
+
+        # Configurable thresholds
+        self.queue_threshold_ratio = queue_threshold_ratio
+        self.spread_threshold_ticks = spread_threshold_ticks
+        self.min_partial_fill_ratio = min_partial_fill_ratio
 
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/DN_pair_eth_sol_nado_log.txt"
@@ -71,6 +108,12 @@ class DNPairBot:
         self._config_logger = logging.getLogger("dn_config")
         self._config_logger.info(f"[CONFIG] Order mode: {self.order_mode.upper()} (POST_ONLY={self.use_post_only})")
         self._config_logger.info(f"[CONFIG] Min spread filter: {self.min_spread_bps} bps")
+        self._config_logger.info(f"[CONFIG] At-touch pricing: {self.enable_at_touch_pricing}")
+        self._config_logger.info(f"[CONFIG] Order type DEFAULT: {self.enable_order_type_default}")
+        self._config_logger.info(f"[CONFIG] Queue filter: {self.enable_queue_filter} (threshold: {self.queue_threshold_ratio})")
+        self._config_logger.info(f"[CONFIG] Spread filter: {self.enable_spread_filter} (threshold: {self.spread_threshold_ticks} ticks)")
+        self._config_logger.info(f"[CONFIG] Partial fills: {self.enable_partial_fills} (min ratio: {self.min_partial_fill_ratio})")
+        self._config_logger.info(f"[CONFIG] Dynamic timeout: {self.enable_dynamic_timeout}")
 
         # Use custom CSV path if provided
         if csv_path:
@@ -399,10 +442,51 @@ class DNPairBot:
         eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
         sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
 
+        # Calculate spread in ticks
+        eth_spread = eth_ask - eth_bid
+        eth_spread_ticks = eth_spread / self.eth_client.config.tick_size
+
+        sol_spread = sol_ask - sol_bid
+        sol_spread_ticks = sol_spread / self.sol_client.config.tick_size
+
+        # Spread filter (only if enabled)
+        if self.enable_spread_filter:
+            if eth_spread_ticks > self.spread_threshold_ticks or sol_spread_ticks > self.spread_threshold_ticks:
+                self.logger.warning(
+                    f"[SPREAD FILTER] Skipping: ETH spread={eth_spread_ticks:.1f} ticks, "
+                    f"SOL spread={sol_spread_ticks:.1f} ticks > {self.spread_threshold_ticks}"
+                )
+                return (OrderResult(success=False, error_message="Spread too wide"),
+                        OrderResult(success=False, error_message="Spread too wide"))
+
         # Fee rate based on order mode: POST_ONLY = 2 bps (maker), IOC = 5 bps (taker)
         FEE_RATE = Decimal("0.0002") if self.use_post_only else Decimal("0.0005")
         fee_bps = float(FEE_RATE * 10000)
         self.logger.info(f"[ORDER] Mode: {self.order_mode.upper()}, Fee: {fee_bps:.0f} bps")
+
+        # Queue filter (only if enabled)
+        if self.enable_queue_filter:
+            eth_can_trade, eth_queue_size, eth_queue_reason = await self.check_queue_size(
+                self.eth_client, eth_direction, max_queue_ratio=self.queue_threshold_ratio
+            )
+            sol_can_trade, sol_queue_size, sol_queue_reason = await self.check_queue_size(
+                self.sol_client, sol_direction, max_queue_ratio=self.queue_threshold_ratio
+            )
+
+            # Skip if either queue is too deep
+            if not eth_can_trade or not sol_can_trade:
+                skip_reasons = []
+                if not eth_can_trade:
+                    skip_reasons.append(f"ETH: {eth_queue_reason}")
+                if not sol_can_trade:
+                    skip_reasons.append(f"SOL: {sol_queue_reason}")
+                self.logger.warning(
+                    f"[QUEUE FILTER] Skipping trade: {', '.join(skip_reasons)}"
+                )
+                return (
+                    OrderResult(success=False, error_message=f"Queue filter: {skip_reasons}"),
+                    OrderResult(success=False, error_message=f"Queue filter: {skip_reasons}")
+                )
 
         if self.use_post_only:
             # POST_ONLY: Place at touch price (limit order, passive)
@@ -454,12 +538,14 @@ class DNPairBot:
                 self.eth_client.place_open_order(
                     self.eth_client.config.contract_id,
                     eth_qty,
-                    eth_direction
+                    eth_direction,
+                    eth_price
                 ),
                 self.sol_client.place_open_order(
                     self.sol_client.config.contract_id,
                     sol_qty,
-                    sol_direction
+                    sol_direction,
+                    sol_price
                 ),
                 return_exceptions=True
             )
@@ -473,7 +559,12 @@ class DNPairBot:
                 sol_result = OrderResult(success=False, error_message=str(sol_result))
 
             # POST_ONLY: Poll and wait for actual fills (OPEN != filled)
-            POST_ONLY_TIMEOUT = 5.0
+            # Dynamic timeout (only if enabled)
+            if self.enable_dynamic_timeout:
+                spread_state = self.eth_client._bbo_handler.get_spread_state()
+                POST_ONLY_TIMEOUT = self.eth_client.calculate_timeout(eth_qty, spread_state)
+            else:
+                POST_ONLY_TIMEOUT = 5.0  # Default timeout
             POLL_INTERVAL = 0.1
             eth_fill_event = asyncio.Event()
             sol_fill_event = asyncio.Event()
@@ -483,9 +574,11 @@ class DNPairBot:
                     for _ in range(int(POST_ONLY_TIMEOUT / POLL_INTERVAL)):
                         if eth_result.order_id:
                             order_info = await self.eth_client.get_order_info(eth_result.order_id)
-                            if order_info and order_info.remaining_size == 0:
-                                eth_fill_event.set()
-                                return
+                            if order_info:
+                                filled_ratio = abs(order_info.filled_size) / eth_result.size
+                                if order_info.remaining_size == 0 or filled_ratio >= self.min_partial_fill_ratio:
+                                    eth_fill_event.set()
+                                    return
                         await asyncio.sleep(POLL_INTERVAL)
                 except Exception as e:
                     self.logger.warning(f"[ORDER] Error polling ETH fill: {e}")
@@ -495,9 +588,11 @@ class DNPairBot:
                     for _ in range(int(POST_ONLY_TIMEOUT / POLL_INTERVAL)):
                         if sol_result.order_id:
                             order_info = await self.sol_client.get_order_info(sol_result.order_id)
-                            if order_info and order_info.remaining_size == 0:
-                                sol_fill_event.set()
-                                return
+                            if order_info:
+                                filled_ratio = abs(order_info.filled_size) / sol_result.size
+                                if order_info.remaining_size == 0 or filled_ratio >= self.min_partial_fill_ratio:
+                                    sol_fill_event.set()
+                                    return
                         await asyncio.sleep(POLL_INTERVAL)
                 except Exception as e:
                     self.logger.warning(f"[ORDER] Error polling SOL fill: {e}")
@@ -1916,6 +2011,50 @@ class DNPairBot:
             self.logger.error(f"[FUNDING] Error calculating funding PNL: {e}")
             return Decimal("0")
 
+    async def check_queue_size(
+        self,
+        client,
+        direction: str,
+        max_queue_ratio: float = 0.5
+    ) -> Tuple[bool, Decimal, str]:
+        """
+        Check if queue size at touch is acceptable.
+
+        Args:
+            client: NadoClient instance
+            direction: "buy" or "sell"
+            max_queue_ratio: Maximum queue size as ratio of average (default 0.5)
+
+        Returns:
+            Tuple of (can_trade, queue_size, reason)
+        """
+        handler = client.get_bookdepth_handler()
+        if handler is None:
+            return True, Decimal('0'), "No BookDepth data"
+
+        # Get queue size at touch
+        if direction == 'buy':
+            best_price, queue_size = handler.get_best_ask()
+            side = "ask"
+        else:
+            best_price, queue_size = handler.get_best_bid()
+            side = "bid"
+
+        if queue_size is None or queue_size == 0:
+            return False, Decimal('0'), f"No {side} liquidity"
+
+        # Calculate average queue size (top 5 levels)
+        total_liquidity = handler.get_available_liquidity(side, max_depth=5)
+        avg_queue_size = total_liquidity / 5 if total_liquidity > 0 else Decimal('0')
+
+        # Check if current queue is too deep
+        if avg_queue_size > 0:
+            queue_ratio = queue_size / avg_queue_size
+            if queue_ratio > max_queue_ratio:
+                return False, queue_size, f"Queue too deep: {queue_size} ({queue_ratio:.1%} of avg)"
+
+        return True, queue_size, "OK"
+
     async def execute_build_cycle(self, eth_direction: str = "buy", sol_direction: str = "sell") -> bool:
         """Execute BUILD cycle with specified directions.
 
@@ -2452,6 +2591,59 @@ Examples:
         default=0,
         help="Minimum spread in bps - sanity check only, NOT breakeven. Profit comes from post-entry spread convergence and price movement. (default: 0)"
     )
+
+    # Feature flags for PNL optimization
+    parser.add_argument(
+        '--enable-at-touch-pricing',
+        action='store_true',
+        help='Enable at-touch pricing (buy=bid, sell=ask) for maker execution'
+    )
+    parser.add_argument(
+        '--enable-order-type-default',
+        action='store_true',
+        help='Use OrderType.DEFAULT instead of POST_ONLY for flexibility'
+    )
+    parser.add_argument(
+        '--enable-queue-filter',
+        action='store_true',
+        help='Skip trading when queue size at touch is too deep'
+    )
+    parser.add_argument(
+        '--enable-spread-filter',
+        action='store_true',
+        help='Skip trading when spread is too wide'
+    )
+    parser.add_argument(
+        '--enable-partial-fills',
+        action='store_true',
+        help='Accept partial fills >= 50% of order size'
+    )
+    parser.add_argument(
+        '--enable-dynamic-timeout',
+        action='store_true',
+        help='Adjust timeout based on market volatility'
+    )
+
+    # Configurable thresholds
+    parser.add_argument(
+        '--queue-threshold-ratio',
+        type=float,
+        default=0.5,
+        help='Maximum queue size as ratio of average (default: 0.5)'
+    )
+    parser.add_argument(
+        '--spread-threshold-ticks',
+        type=int,
+        default=5,
+        help='Maximum spread in ticks before skipping (default: 5)'
+    )
+    parser.add_argument(
+        '--min-partial-fill-ratio',
+        type=float,
+        default=0.5,
+        help='Minimum partial fill ratio to accept (default: 0.5)'
+    )
+
     return parser.parse_args()
 
 
@@ -2475,6 +2667,17 @@ async def main():
         csv_path=args.csv_path,
         use_post_only=not getattr(args, 'use_ioc', False),  # POST_ONLY mode (default True)
         min_spread_bps=getattr(args, 'min_spread_bps', 0),  # Min spread sanity check - profit from post-entry movements (default 0 bps)
+        # PNL optimization feature flags
+        enable_at_touch_pricing=getattr(args, 'enable_at_touch_pricing', False),
+        enable_order_type_default=getattr(args, 'enable_order_type_default', False),
+        enable_queue_filter=getattr(args, 'enable_queue_filter', False),
+        enable_spread_filter=getattr(args, 'enable_spread_filter', False),
+        enable_partial_fills=getattr(args, 'enable_partial_fills', False),
+        enable_dynamic_timeout=getattr(args, 'enable_dynamic_timeout', False),
+        # Configurable thresholds
+        queue_threshold_ratio=getattr(args, 'queue_threshold_ratio', 0.5),
+        spread_threshold_ticks=getattr(args, 'spread_threshold_ticks', 5),
+        min_partial_fill_ratio=getattr(args, 'min_partial_fill_ratio', 0.5),
     )
 
     # Initialize clients

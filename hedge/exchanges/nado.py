@@ -397,36 +397,58 @@ class NadoClient(BaseExchangeClient):
         }
         return ticker_id_map.get(product_id, f"PERP_{product_id}")
 
-    def calculate_timeout(self, quantity: Decimal) -> int:
-        """Calculate timeout based on order size with realistic microstructure awareness.
+    def calculate_timeout(
+        self,
+        quantity: Decimal,
+        spread_state: Optional[str] = None
+    ) -> int:
+        """Calculate timeout based on order size and volatility.
 
-        Piecewise logic for predictable timeout values:
-        - 0.1 ETH → 5s (quick fills at BBO)
-        - 0.5 ETH → 10s (moderate spread)
-        - 1.0 ETH → 20s (must look deeper)
+        Base timeout from quantity with volatility adjustment:
+        - 0.1 ETH → 5s base (quick fills at BBO)
+        - 0.5 ETH → 10s base (moderate spread)
+        - 1.0 ETH → 20s base (must look deeper)
+
+        Volatility adjustment:
+        - WIDENING: 50% of base (high volatility, avoid adverse selection)
+        - NARROWING: 200% of base (low volatility, better fill probability)
+        - STABLE/None: base timeout
 
         Args:
             quantity: Order quantity in tokens
+            spread_state: "WIDENING", "NARROWING", or "STABLE" (from BBO handler)
 
         Returns:
-            Timeout in seconds (5-20 second range)
+            Timeout in seconds (3-30 second range)
 
         Example:
-            >>> calculate_timeout(Decimal('0.1'))
+            >>> calculate_timeout(Decimal('0.1'), "STABLE")
             5
-            >>> calculate_timeout(Decimal('0.5'))
-            10
-            >>> calculate_timeout(Decimal('1.0'))
-            20
+            >>> calculate_timeout(Decimal('0.5'), "WIDENING")
+            5
+            >>> calculate_timeout(Decimal('1.0'), "NARROWING")
+            30
         """
         quantity_float = float(quantity)
 
+        # Base timeout from quantity
         if quantity_float <= 0.1:
-            return 5
+            base_timeout = 5
         elif quantity_float <= 0.5:
-            return 10
+            base_timeout = 10
         else:
-            return 20
+            base_timeout = 20
+
+        # Adjust based on volatility
+        if spread_state == "WIDENING":
+            # High volatility: shorter timeout to avoid adverse selection
+            return max(3, base_timeout // 2)
+        elif spread_state == "NARROWING":
+            # Low volatility: longer timeout for better fill probability
+            return min(30, base_timeout * 2)
+        else:
+            # STABLE or None: use base timeout
+            return base_timeout
 
     def extract_filled_quantity(self, order_result: dict) -> Decimal:
         """Extract filled quantity from order result.
@@ -506,7 +528,13 @@ class NadoClient(BaseExchangeClient):
             order_price = best_bid + self.config.tick_size
         return self.round_to_tick(order_price)
 
-    async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+    async def place_open_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        direction: str,
+        price: Optional[Decimal] = None
+    ) -> OrderResult:
         """Place an open order with Nado using official SDK."""
         max_retries = 5
         retry_count = 0
@@ -519,10 +547,15 @@ class NadoClient(BaseExchangeClient):
                     return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
                 # Determine order price
-                if direction == 'buy':
-                    order_price = best_ask - self.config.tick_size
+                if price is not None:
+                    # Use at-touch price from caller
+                    order_price = price
                 else:
-                    order_price = best_bid + self.config.tick_size
+                    # Fallback to legacy 1-tick-behind pricing
+                    if direction == 'buy':
+                        order_price = best_ask - self.config.tick_size
+                    else:
+                        order_price = best_bid + self.config.tick_size
 
                 # Build order parameters
                 order = OrderParams(
@@ -535,7 +568,7 @@ class NadoClient(BaseExchangeClient):
                     expiration=get_expiration_timestamp(60*60*24*30),
                     nonce=gen_order_nonce(),
                     appendix=build_appendix(
-                        order_type=OrderType.POST_ONLY,
+                        order_type=OrderType.DEFAULT,  # Changed from POST_ONLY
                         isolated=True
                     )
                 )
