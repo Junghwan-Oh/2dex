@@ -323,7 +323,20 @@ class DNPairBot:
         client = self.eth_client if ticker == "ETH" else self.sol_client
         raw_qty = self.target_notional / price
         tick_size = client.config.tick_size
-        target_qty = (raw_qty / tick_size).quantize(Decimal('1')) * tick_size
+        min_size = client.config.min_size
+
+        # MINIMUM QUANTITY CHECK: Detect order too small for exchange before quantization
+        if raw_qty < min_size:
+            self.logger.warning(
+                f"[SLIPPAGE] {ticker} order size {raw_qty:.6f} < minimum {min_size} - "
+                f"CANNOT TRADE (notional=${self.target_notional}, price=${price:.2f})"
+            )
+            # Return zero quantity with error indicator (False = can't fill, 999999 = error code)
+            return Decimal(0), Decimal(999999), False
+
+        # Use raw_qty directly - no need to round quantity to price tick_size
+        # (tick_size is for price rounding, not quantity rounding)
+        target_qty = raw_qty
 
         # Try to get slippage estimate from BookDepth
         slippage = await client.estimate_slippage(direction, target_qty)
@@ -409,9 +422,15 @@ class DNPairBot:
             if eth_qty == 0 or sol_qty == 0:
                 skip_reason = []
                 if eth_qty == 0:
-                    skip_reason.append(f"ETH slippage {eth_slippage_bps:.1f} bps > 10 bps threshold")
+                    if eth_slippage_bps >= Decimal(999999):
+                        skip_reason.append(f"ETH order size too small for exchange minimum")
+                    else:
+                        skip_reason.append(f"ETH slippage {eth_slippage_bps:.1f} bps > 10 bps threshold")
                 if sol_qty == 0:
-                    skip_reason.append(f"SOL slippage {sol_slippage_bps:.1f} bps > 10 bps threshold")
+                    if sol_slippage_bps >= Decimal(999999):
+                        skip_reason.append(f"SOL order size too small for exchange minimum")
+                    else:
+                        skip_reason.append(f"SOL slippage {sol_slippage_bps:.1f} bps > 10 bps threshold")
                 self.logger.warning(
                     f"[ORDER] SKIPPING TRADE due to insufficient liquidity: {', '.join(skip_reason)}"
                 )
@@ -555,9 +574,15 @@ class DNPairBot:
             if eth_qty == 0 or sol_qty == 0:
                 skip_reason = []
                 if eth_qty == 0:
-                    skip_reason.append(f"ETH slippage {eth_slippage_bps:.1f} bps > 10 bps threshold")
+                    if eth_slippage_bps >= Decimal(999999):
+                        skip_reason.append(f"ETH order size too small for exchange minimum")
+                    else:
+                        skip_reason.append(f"ETH slippage {eth_slippage_bps:.1f} bps > 10 bps threshold")
                 if sol_qty == 0:
-                    skip_reason.append(f"SOL slippage {sol_slippage_bps:.1f} bps > 10 bps threshold")
+                    if sol_slippage_bps >= Decimal(999999):
+                        skip_reason.append(f"SOL order size too small for exchange minimum")
+                    else:
+                        skip_reason.append(f"SOL slippage {sol_slippage_bps:.1f} bps > 10 bps threshold")
                 self.logger.warning(
                     f"[ORDER] SKIPPING TRADE due to insufficient liquidity: {', '.join(skip_reason)}"
                 )
@@ -754,36 +779,58 @@ class DNPairBot:
         # else: both succeeded or both failed → no emergency unwind
 
     async def emergency_unwind_eth(self):
-        """Emergency unwind ETH position."""
+        """Emergency unwind ETH position (handles both long and short).
+
+        Determines current position direction and closes with market order.
+        Uses tolerance check (abs(pos) > 0.001) to handle Decimal precision.
+
+        Called from handle_emergency_unwind() when ETH fills but SOL fails.
+        """
         if self.eth_client:
             try:
-                # Close ETH position with market order
                 current_pos = await self.eth_client.get_account_positions()
-                if current_pos > 0:
+                # NOTE: No None check needed - get_account_positions() always returns Decimal
+                # See nado.py:1078 - method signature: async def get_account_positions(self) -> Decimal
+                # Tolerance check: skip dust positions below 0.001
+                # Pattern from test_dn_pair.py: handles Decimal precision issues
+                if abs(current_pos) > Decimal("0.001"):
+                    # Determine close side: long positions sell, short positions buy
+                    close_side = "sell" if current_pos > 0 else "buy"
                     await self.eth_client.place_close_order(
                         self.eth_client.config.contract_id,
-                        current_pos,
+                        abs(current_pos),  # Always use positive quantity
                         Decimal("0"),  # Market order
-                        "sell"
+                        close_side  # Dynamically determined side
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.error(f"[UNWIND] Failed to close ETH position: {e}")
 
     async def emergency_unwind_sol(self):
-        """Emergency unwind SOL position."""
+        """Emergency unwind SOL position (handles both long and short).
+
+        Determines current position direction and closes with market order.
+        Uses tolerance check (abs(pos) > 0.001) to handle Decimal precision.
+
+        Called from handle_emergency_unwind() when SOL fills but ETH fails.
+        """
         if self.sol_client:
             try:
-                # Close SOL position with market order
                 current_pos = await self.sol_client.get_account_positions()
-                if current_pos < 0:  # Short position
+                # NOTE: No None check needed - get_account_positions() always returns Decimal
+                # See nado.py:1078 - method signature: async def get_account_positions(self) -> Decimal
+                # Tolerance check: skip dust positions below 0.001
+                # Pattern from test_dn_pair.py: handles Decimal precision issues
+                if abs(current_pos) > Decimal("0.001"):
+                    # Determine close side: long positions sell, short positions buy
+                    close_side = "sell" if current_pos > 0 else "buy"
                     await self.sol_client.place_close_order(
                         self.sol_client.config.contract_id,
-                        abs(current_pos),
+                        abs(current_pos),  # Always use positive quantity
                         Decimal("0"),  # Market order
-                        "buy"
+                        close_side  # Dynamically determined side
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.error(f"[UNWIND] Failed to close SOL position: {e}")
 
     def _handle_partial_fill(
         self,
@@ -2294,21 +2341,25 @@ class DNPairBot:
         eth_config = Config({
             'ticker': 'ETH',
             'contract_id': '4',  # ETH product ID on Nado
-            'tick_size': Decimal('0.001'),  # ETH tick size (corrected: 0.1 → 0.001)
             'min_size': Decimal('0.001'),
+            # Note: tick_size is fetched dynamically from SDK API in _round_price_to_increment()
         })
 
         # SOL client configuration
         sol_config = Config({
             'ticker': 'SOL',
             'contract_id': '8',  # SOL product ID on Nado
-            'tick_size': Decimal('0.001'),  # SOL tick size (corrected: 0.1 → 0.001)
             'min_size': Decimal('0.001'),
+            # Note: tick_size is fetched dynamically from SDK API in _round_price_to_increment()
         })
 
         # Create Nado clients for both tickers (pass Config objects directly)
         self.eth_client = NadoClient(eth_config)
         self.sol_client = NadoClient(sol_config)
+
+        # Fetch contract attributes from SDK (populates client.config.tick_size)
+        await self.eth_client.get_contract_attributes()
+        await self.sol_client.get_contract_attributes()
 
         # Connect to Nado
         self.logger.info("[INIT] Connecting ETH client...")
@@ -2331,9 +2382,9 @@ class DNPairBot:
 
         # Store contract attributes
         self.eth_contract_id = eth_config.contract_id
-        self.eth_tick_size = eth_config.tick_size
+        self.eth_tick_size = self.eth_client.config.tick_size
         self.sol_contract_id = sol_config.contract_id
-        self.sol_tick_size = sol_config.tick_size
+        self.sol_tick_size = self.sol_client.config.tick_size
 
         self.logger.info(
             f"[INIT] ETH client initialized (contract: {self.eth_contract_id}, tick: {self.eth_tick_size}, ws: {self.eth_client._ws_connected})"
@@ -2398,8 +2449,8 @@ Examples:
     parser.add_argument(
         "--min-spread-bps",
         type=int,
-        default=1,
-        help="Minimum spread in bps - sanity check only, NOT breakeven. Profit comes from post-entry spread convergence and price movement. (default: 1)"
+        default=0,
+        help="Minimum spread in bps - sanity check only, NOT breakeven. Profit comes from post-entry spread convergence and price movement. (default: 0)"
     )
     return parser.parse_args()
 
@@ -2423,7 +2474,7 @@ async def main():
         sleep_time=args.sleep,
         csv_path=args.csv_path,
         use_post_only=not getattr(args, 'use_ioc', False),  # POST_ONLY mode (default True)
-        min_spread_bps=getattr(args, 'min_spread_bps', 1),  # Min spread sanity check - profit from post-entry movements (default 1 bps)
+        min_spread_bps=getattr(args, 'min_spread_bps', 0),  # Min spread sanity check - profit from post-entry movements (default 0 bps)
     )
 
     # Initialize clients

@@ -179,9 +179,9 @@ class BookDepthHandler:
         Returns:
             Slippage in basis points, or 999999 if insufficient liquidity
         """
-        # Handle zero quantity - no slippage
+        # Handle zero quantity - error condition
         if quantity == 0:
-            return Decimal("0")
+            return Decimal(999999)  # Error code: invalid quantity
 
         if side == "buy":
             best_price, _ = self.get_best_ask()
