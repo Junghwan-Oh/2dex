@@ -78,6 +78,11 @@ class DNPairBot:
         queue_threshold_ratio: float = 0.5,
         spread_threshold_ticks: int = 5,
         min_partial_fill_ratio: float = 0.5,
+        # Static TP parameters (Phase 2)
+        enable_static_tp: bool = False,
+        tp_bps: float = 10.0,
+        tp_timeout: int = 60,
+        enable_tp_orders: bool = True,  # Set to False to disable TP
     ):
         self.target_notional = target_notional  # USD notional for each position
         self.iterations = iterations
@@ -97,6 +102,16 @@ class DNPairBot:
         self.spread_threshold_ticks = spread_threshold_ticks
         self.min_partial_fill_ratio = min_partial_fill_ratio
 
+        # Static TP parameters (Phase 2)
+        self.enable_static_tp = enable_static_tp
+        self.tp_bps = tp_bps
+        self.tp_timeout = tp_timeout
+        self.enable_tp_orders = enable_tp_orders  # Set to False to disable TP
+
+        # CRITICAL: Initialize to prevent AttributeError in Phase 2
+        self._tp_hit_position = None  # Track which position hit TP
+        self._tp_hit_pnl_pct = None   # Track PNL % when TP hit
+
         # Order mode: Always use DEFAULT (true limit order) now
         # Feature flags have been removed in favor of single unified path
         self.order_mode = "default"
@@ -115,6 +130,7 @@ class DNPairBot:
         self._config_logger.info(f"[CONFIG] Spread filter: {self.enable_spread_filter} (threshold: {self.spread_threshold_ticks} ticks)")
         self._config_logger.info(f"[CONFIG] Partial fills: {self.enable_partial_fills} (min ratio: {self.min_partial_fill_ratio})")
         self._config_logger.info(f"[CONFIG] Dynamic timeout: {self.enable_dynamic_timeout}")
+        self._config_logger.info(f"[CONFIG] Static TP: {self.enable_static_tp} (threshold: {self.tp_bps} bps, timeout: {self.tp_timeout}s)")
 
         # Use custom CSV path if provided
         if csv_path:
@@ -122,7 +138,11 @@ class DNPairBot:
         else:
             self.csv_filename = f"logs/DN_pair_eth_sol_nado_trades.csv"
 
+        # Position CSV file for tracking WebSocket position updates
+        self.position_csv_filename = csv_path.replace("_trades.csv", "_positions.csv") if csv_path and "_trades.csv" in csv_path else f"logs/DN_pair_eth_sol_nado_positions.csv"
+
         self._initialize_csv_file()
+        self._initialize_position_csv_file()
         self._setup_logger()
 
         self.stop_flag = False
@@ -148,6 +168,11 @@ class DNPairBot:
         self.entry_quantities = {
             "ETH": Decimal("0"),
             "SOL": Decimal("0")
+        }
+        # Track actual order directions (buy/sell) for TP calculation
+        self.entry_directions = {
+            "ETH": None,  # "buy" (long) or "sell" (short)
+            "SOL": None
         }
         self.entry_timestamps = {
             "ETH": None,
@@ -178,6 +203,11 @@ class DNPairBot:
 
         # Real-time PNL logging task
         self._realtime_pnl_task = None
+
+        # WebSocket position tracking for startup residual detection
+        self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+        self._ws_initial_sync_complete = False  # Track if WebSocket has received initial position data
+        self._startup_data_source = None  # Track which data source was used for startup check
 
     def _setup_logger(self):
         self.logger = logging.getLogger("dn_pair_eth_sol_nado")
@@ -250,6 +280,27 @@ class DNPairBot:
                     ]
                 )
 
+    def _initialize_position_csv_file(self):
+        """Initialize position CSV file with headers if it doesn't exist."""
+        if not os.path.exists(self.position_csv_filename):
+            csv_dir = os.path.dirname(self.position_csv_filename)
+            if csv_dir and not os.path.exists(csv_dir):
+                os.makedirs(csv_dir, exist_ok=True)
+
+            with open(self.position_csv_filename, "w", newline="") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    "exchange",
+                    "timestamp",
+                    "ticker",
+                    "old_position",
+                    "new_position",
+                    "position_change",
+                    "cycle_id",
+                    "source",
+                    "price"
+                ])
+
     def log_trade_to_csv(
         self,
         exchange: str,
@@ -303,6 +354,240 @@ class DNPairBot:
                 exit_liquidity_available, exit_liquidity_usd,
                 websocket_available
             ])
+
+    def log_position_update(
+        self,
+        ticker: str,
+        old_position: Decimal,
+        new_position: Decimal,
+        cycle_id: str = "",
+        source: str = "websocket",
+        price: Decimal = None
+    ):
+        """Log position update to CSV for tracking."""
+        from decimal import Decimal
+
+        position_change = float(new_position - old_position)
+        timestamp = datetime.now(pytz.UTC).isoformat()
+
+        with open(self.position_csv_filename, "a", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                "NADO",
+                timestamp,
+                ticker,
+                str(old_position),
+                str(new_position),
+                str(position_change),
+                cycle_id,
+                source,
+                str(price) if price else ""
+            ])
+
+        self.logger.debug(f"[POSITION CSV] {ticker}: {old_position} -> {new_position} ({source})")
+
+    def _on_eth_position_update(self, old_pos: Decimal, new_pos: Decimal) -> None:
+        """Callback for ETH position updates from WebSocket."""
+        try:
+            self.log_position_update(
+                ticker="ETH",
+                old_position=old_pos,
+                new_position=new_pos,
+                cycle_id=str(self.iteration) if hasattr(self, 'iteration') else "",
+                source="websocket"
+            )
+        except Exception as e:
+            self.logger.error(f"[POSITION] Error logging ETH update: {e}")
+
+    def _on_sol_position_update(self, old_pos: Decimal, new_pos: Decimal) -> None:
+        """Callback for SOL position updates from WebSocket."""
+        try:
+            self.log_position_update(
+                ticker="SOL",
+                old_position=old_pos,
+                new_position=new_pos,
+                cycle_id=str(self.iteration) if hasattr(self, 'iteration') else "",
+                source="websocket"
+            )
+        except Exception as e:
+            self.logger.error(f"[POSITION] Error logging SOL update: {e}")
+
+    def _on_position_change(self, data: dict) -> None:
+        """WebSocket callback for position changes.
+
+        This callback receives real-time position updates from Nado's WebSocket
+        position_change stream, enabling early detection of position imbalances.
+        """
+        from decimal import Decimal
+
+        # Debug: Log full message to understand the actual format
+        self.logger.debug(f"[POSITION CHANGE] Raw data: {data}")
+        self.logger.info(f"[POSITION CHANGE] Keys: {list(data.keys())}")
+
+        try:
+            # Determine which ticker this update is for
+            product_id = data.get("product_id")
+            if product_id == self.eth_client.config.contract_id:
+                ticker = "ETH"
+            elif product_id == self.sol_client.config.contract_id:
+                ticker = "SOL"
+            else:
+                self.logger.warning(f"[POSITION CHANGE] Unknown product_id: {product_id}")
+                return
+
+            # Extract position data (actual format from Nado WebSocket)
+            # The amount field is in raw contract units (wei/atomic units)
+            # ETH uses 1e18 (18 decimal places), SOL uses 1e9 (9 decimal places)
+            amount_raw = data.get("amount", "0")
+            precision = Decimal("1e18") if ticker == "ETH" else Decimal("1e9")
+            amount = Decimal(str(amount_raw)) / precision if amount_raw else Decimal("0")
+            v_quote_amount = data.get("v_quote_amount", "0")  # USD value
+            reason = data.get("reason", "")
+
+            # Store in memory for real-time monitoring
+            if not hasattr(self, '_ws_positions'):
+                self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+
+            # For position_change events, the amount field contains the absolute position
+            # Calculate change from previous tracked value
+            old_pos = self._ws_positions.get(ticker, Decimal("0"))
+            new_pos = amount
+
+            # Update the tracked position
+            self._ws_positions[ticker] = new_pos
+
+            # Mark sync as complete when we receive position data for both tickers
+            if not self._ws_initial_sync_complete:
+                # Check if we have received data for both tickers
+                has_eth = "ETH" in self._ws_positions
+                has_sol = "SOL" in self._ws_positions
+                if has_eth and has_sol:
+                    self._ws_initial_sync_complete = True
+                    self.logger.info("[POSITION SYNC] Initial WebSocket position sync complete")
+
+            # For position_change events, calculate the delta
+            position_change = float(new_pos - old_pos) if old_pos > 0 else float(new_pos)
+
+            # Log to CSV
+            self.log_position_update(
+                ticker=ticker,
+                old_position=old_pos,
+                new_position=new_pos,
+                cycle_id=str(self.iteration) if hasattr(self, 'iteration') else "",
+                source="websocket_position_change",
+                price=None  # Price not provided in position_change message
+            )
+
+            self.logger.debug(
+                f"[POSITION CHANGE] {ticker}: amount={amount}, v_quote=${v_quote_amount}, reason={reason}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"[POSITION CHANGE] Error processing update: {e}")
+
+    async def _wait_for_ws_position_sync(self, timeout: float = 5.0) -> bool:
+        """
+        Wait for WebSocket to receive initial position_change events.
+
+        Args:
+            timeout: Maximum time to wait in seconds (default 5.0)
+
+        Returns:
+            True when sync complete, False on timeout
+        """
+        if not self.eth_client._ws_connected or not self.sol_client._ws_connected:
+            self.logger.warning("[WS SYNC] WebSocket not connected, skipping sync wait")
+            return False
+
+        start_time = time.time()
+        self.logger.info(f"[WS SYNC] Waiting for initial position sync (timeout: {timeout}s)...")
+
+        while not self._ws_initial_sync_complete:
+            if time.time() - start_time > timeout:
+                self.logger.warning(f"[WS SYNC] Timeout waiting for position sync after {timeout}s")
+                return False
+            await asyncio.sleep(0.1)
+
+        self.logger.info("[WS SYNC] Position sync complete")
+        return True
+
+    async def _get_startup_positions(self) -> Tuple[Decimal, Decimal]:
+        """
+        Get positions at startup with WebSocket priority.
+
+        Priority:
+        1. WebSocket positions (_ws_positions) if available (sync complete or manually set)
+        2. REST API fallback
+
+        Returns:
+            Tuple of (eth_pos, sol_pos)
+            Data source is tracked in self._startup_data_source
+        """
+        # Try WebSocket positions first
+        # Use WebSocket positions if:
+        # 1. Initial sync is complete (WebSocket is connected and received data), OR
+        # 2. _ws_positions has been manually set with non-default values (for testing)
+        use_websocket = False
+        if hasattr(self, '_ws_positions') and self._ws_positions:
+            if self._ws_initial_sync_complete:
+                # WebSocket sync completed - use these positions
+                use_websocket = True
+            else:
+                # Check if positions have been manually set (not the default zero initialization)
+                # This allows tests to simulate WebSocket positions
+                eth_val = self._ws_positions.get("ETH", Decimal("0"))
+                sol_val = self._ws_positions.get("SOL", Decimal("0"))
+                # If either position is non-zero, assume it was manually set for testing
+                if eth_val != Decimal("0") or sol_val != Decimal("0"):
+                    use_websocket = True
+
+        if use_websocket:
+            eth_pos = self._ws_positions.get("ETH", Decimal("0"))
+            sol_pos = self._ws_positions.get("SOL", Decimal("0"))
+            self._startup_data_source = "websocket"
+            self.logger.info("[STARTUP] Using WebSocket positions for startup check")
+            self.logger.info(f"[STARTUP] ETH (WS): {eth_pos}, SOL (WS): {sol_pos}")
+            return eth_pos, sol_pos
+
+        # Fall back to REST API
+        self._startup_data_source = "rest_api"
+        self.logger.info("[STARTUP] WebSocket not ready, using REST API for startup check")
+        eth_pos = await self.eth_client.get_account_positions()
+        sol_pos = await self.sol_client.get_account_positions()
+        self.logger.info(f"[STARTUP] ETH (REST): {eth_pos}, SOL (REST): {sol_pos}")
+        return eth_pos, sol_pos
+
+    async def _check_residual_positions_at_startup(self) -> bool:
+        """
+        Complete startup position check with WebSocket priority.
+
+        Uses WebSocket positions if available, falls back to REST API.
+        Logs which data source was used.
+
+        Returns:
+            True if no residuals (clean start), exits if residuals found
+
+        Raises:
+            SystemExit: If residual positions detected (exit code 1)
+        """
+        POSITION_TOLERANCE = Decimal("0.001")
+
+        # Get positions using WebSocket priority
+        eth_pos, sol_pos = await self._get_startup_positions()
+
+        # Check for residual positions
+        if abs(eth_pos) > POSITION_TOLERANCE or abs(sol_pos) > POSITION_TOLERANCE:
+            data_source = self._startup_data_source or "unknown"
+            print(f"\n[WARNING] Residual positions detected (source: {data_source})!")
+            print(f"  ETH: {eth_pos}")
+            print(f"  SOL: {sol_pos}")
+            print(f"\n[SAFETY] Please close positions manually before starting the bot.")
+            print(f"  - Use the exchange interface to close positions")
+            print(f"  - Or use a separate close-positions script")
+            sys.exit(1)
+
+        print("[STARTUP] No residual positions. Ready to start.\n")
+        return True
 
     async def cleanup_connections(self):
         # Disconnect old clients if they exist
@@ -499,10 +784,11 @@ class DNPairBot:
         Orders rest on book at maker prices (BUY=bid, SELL=ask).
         """
         # Get initial positions BEFORE placing orders
-        eth_pos_before = await self.eth_client.get_account_positions()
-        sol_pos_before = await self.sol_client.get_account_positions()
+        # NOTE: WebSocket positions are real-time; REST API has ~20s lag
+        eth_pos_before = self._ws_positions.get("ETH", Decimal("0"))
+        sol_pos_before = self._ws_positions.get("SOL", Decimal("0"))
 
-        self.logger.info(f"[INIT] ETH pos: {eth_pos_before}, SOL pos: {sol_pos_before}")
+        self.logger.info(f"[INIT] ETH pos: {eth_pos_before} (WS), SOL pos: {sol_pos_before} (WS)")
 
         # Calculate order quantities
         eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
@@ -707,12 +993,12 @@ class DNPairBot:
 
             if eth_fill_qty > 0:
                 self.entry_prices["ETH"] = eth_fill_price
-                self.entry_quantities["ETH"] = eth_fill_qty
+                self.entry_quantities["ETH"] += eth_fill_qty
                 self.entry_timestamps["ETH"] = entry_timestamp
 
             if sol_fill_qty > 0:
                 self.entry_prices["SOL"] = sol_fill_price
-                self.entry_quantities["SOL"] = sol_fill_qty
+                self.entry_quantities["SOL"] += sol_fill_qty
                 self.entry_timestamps["SOL"] = entry_timestamp
 
         if eth_fill_qty > 0:
@@ -771,46 +1057,179 @@ class DNPairBot:
             except Exception as e:
                 self.logger.error(f"[CSV] Error logging SOL trade: {e}")
 
-        # Handle partial fills and failed orders
-        await self.handle_emergency_unwind(eth_result, sol_result)
+        # Handle partial fills and failed orders - ONLY trigger if there's an actual issue
+        eth_filled = (isinstance(eth_result, OrderResult) and self._is_fill_complete(eth_result))
+        sol_filled = (isinstance(sol_result, OrderResult) and self._is_fill_complete(sol_result))
+
+        # Only trigger emergency unwind if one leg failed
+        if not eth_filled or not sol_filled:
+            # One or both orders failed - trigger emergency unwind
+            self.logger.warning(f"[BUILD] Triggering emergency unwind - ETH filled={eth_filled}, SOL filled={sol_filled}")
+            await self.handle_emergency_unwind(eth_result, sol_result)
+        elif eth_filled and sol_filled:
+            # Both filled successfully - proceed to UNWIND phase, do NOT close positions!
+            self.logger.info(f"[BUILD] Both orders filled successfully - proceeding to UNWIND phase")
+            # No emergency unwind needed - positions are established correctly
+        else:
+            # Both failed (shouldn't happen but handle safely)
+            self.logger.error(f"[BUILD] Both orders failed - checking for residual positions")
+            await self.handle_emergency_unwind(eth_result, sol_result)
 
         return eth_result, sol_result
 
     async def handle_emergency_unwind(self, eth_result, sol_result):
-        """Handle emergency unwind when one leg fails or is partially filled."""
+        """Handle emergency unwind when one leg fails or is partially filled.
+
+        CRITICAL: ALWAYS close BOTH positions on emergency unwind to prevent
+        position accumulation bugs. This is called when:
+        - One leg fills and the other fails
+        - Positions become imbalanced
+        - Retry limit is exceeded
+        """
         # Debug logging
         self.logger.info(f"[DEBUG] handle_emergency_unwind: eth_result.success={eth_result.success if isinstance(eth_result, OrderResult) else 'Exception'}, sol_result.success={sol_result.success if isinstance(sol_result, OrderResult) else 'Exception'}")
 
-        # Check if both legs filled successfully
-        # For IOC orders, success=True and status='FILLED' means the order filled
-        eth_filled = (isinstance(eth_result, OrderResult) and
-                      eth_result.success and
-                      eth_result.status == 'FILLED')
-        sol_filled = (isinstance(sol_result, OrderResult) and
-                      sol_result.success and
-                      sol_result.status == 'FILLED')
+        # CRITICAL FIX: Always close BOTH positions on emergency unwind
+        # This prevents position accumulation when one leg fails
 
-        # Only do emergency unwind if one succeeded and the other failed
+        # Check if both legs filled successfully
+        eth_filled = (isinstance(eth_result, OrderResult) and
+                      self._is_fill_complete(eth_result))
+        sol_filled = (isinstance(sol_result, OrderResult) and
+                      self._is_fill_complete(sol_result))
+
+        # Log the situation
         if eth_filled and not sol_filled:
-            # ETH succeeded, SOL failed → close ETH
-            self.logger.info(f"[UNWIND] ETH filled but SOL failed, closing ETH position")
-            await self.emergency_unwind_eth()
+            self.logger.warning(f"[UNWIND] ETH filled but SOL failed - closing BOTH positions")
         elif sol_filled and not eth_filled:
-            # SOL succeeded, ETH failed → close SOL
-            self.logger.info(f"[UNWIND] SOL filled but ETH failed, closing SOL position")
-            await self.emergency_unwind_sol()
-        # else: both succeeded or both failed → no emergency unwind
+            self.logger.warning(f"[UNWIND] SOL filled but ETH failed - closing BOTH positions")
+        elif eth_filled and sol_filled:
+            self.logger.info(f"[UNWIND] Both filled but imbalanced - closing BOTH positions")
+        else:
+            self.logger.info(f"[UNWIND] Both failed - checking for residual positions")
+
+        # ALWAYS close both positions
+        await self._force_close_position("ETH")
+        await self._force_close_position("SOL")
+
+    async def _force_close_position(self, ticker: str) -> bool:
+        """Force close position with retry, handling settlement lag.
+
+        This method is used during emergency unwind to ensure positions are
+        fully closed even when settlement delays cause position checks to
+        be temporarily inaccurate.
+
+        Args:
+            ticker: Either "ETH" or "SOL"
+
+        Returns:
+            True if position confirmed closed, False otherwise
+        """
+        from decimal import Decimal
+        POSITION_TOLERANCE = Decimal("0.001")
+
+        client = self.eth_client if ticker == "ETH" else self.sol_client
+
+        if not client:
+            self.logger.warning(f"[FORCE] No client for {ticker}, skipping")
+            return False
+
+        contract_id = client.config.contract_id
+
+        for attempt in range(5):
+            try:
+                # Wait for settlement to process
+                await asyncio.sleep(2)
+
+                current_pos = await client.get_account_positions()
+
+                if abs(current_pos) < POSITION_TOLERANCE:
+                    self.logger.info(f"[FORCE] {ticker} position confirmed closed (pos={current_pos})")
+                    return True
+
+                # Determine close side and quantity
+                close_side = "sell" if current_pos > 0 else "buy"
+                close_qty = abs(current_pos)
+
+                # Get current prices
+                bid, ask = await client.fetch_bbo_prices(contract_id)
+                close_price = bid if close_side == "sell" else ask
+
+                self.logger.info(
+                    f"[FORCE] Closing {ticker} {close_side} {close_qty} @ {close_price} "
+                    f"(attempt {attempt+1}/5, current_pos={current_pos})"
+                )
+
+                result = await client.place_limit_order_with_timeout(
+                    contract_id=contract_id,
+                    quantity=close_qty,
+                    direction=close_side,
+                    price=close_price,
+                    timeout_seconds=15,
+                    max_retries=1
+                )
+
+                if result.success:
+                    filled_size = self._get_filled_size(result)
+                    if self._is_fill_complete(result):
+                        self.logger.info(f"[FORCE] {ticker} closed successfully: {filled_size} filled")
+                        # Final verification
+                        await asyncio.sleep(1)
+                        final_pos = await client.get_account_positions()
+                        if abs(final_pos) < POSITION_TOLERANCE:
+                            return True
+                        else:
+                            self.logger.warning(f"[FORCE] {ticker} still has position after close: {final_pos}")
+                    else:
+                        self.logger.warning(f"[FORCE] {ticker} partial fill: {filled_size}")
+                else:
+                    self.logger.warning(f"[FORCE] {ticker} close attempt failed: {result.error_message}")
+
+            except Exception as e:
+                self.logger.error(f"[FORCE] {ticker} close attempt {attempt+1} error: {e}")
+
+        self.logger.error(f"[FORCE] Failed to close {ticker} after 5 attempts")
+        return False
+
+    async def _verify_and_force_close_all_positions(self) -> None:
+        """Verify and force close all positions to prevent accumulation.
+
+        This is called in exception handlers to ensure no residual positions
+        remain after errors or unexpected failures.
+        """
+        from decimal import Decimal
+        POSITION_TOLERANCE = Decimal("0.001")
+
+        try:
+            # NOTE: WebSocket positions are real-time; REST API has ~20s lag
+            eth_pos = self._ws_positions.get("ETH", Decimal("0"))
+            sol_pos = self._ws_positions.get("SOL", Decimal("0"))
+
+            self.logger.warning(f"[CLEANUP] Checking positions (WS): ETH={eth_pos}, SOL={sol_pos}")
+
+            if abs(eth_pos) > POSITION_TOLERANCE:
+                self.logger.warning(f"[CLEANUP] Force closing ETH position: {eth_pos}")
+                await self._force_close_position("ETH")
+
+            if abs(sol_pos) > POSITION_TOLERANCE:
+                self.logger.warning(f"[CLEANUP] Force closing SOL position: {sol_pos}")
+                await self._force_close_position("SOL")
+
+        except Exception as e:
+            self.logger.error(f"[CLEANUP] Error during position cleanup: {e}")
 
     async def emergency_unwind_eth(self):
         """Emergency unwind ETH position (handles both long and short).
 
-        Determines current position direction and closes with aggressive IOC.
-        Uses high slippage (10 bps) to ensure fill during emergency.
+        Determines current position direction and closes with limit order.
+        Uses at-touch pricing with automatic price improvement (2, 4, 6 bps).
 
         Called from handle_emergency_unwind() when ETH fills but SOL fails.
         """
         if self.eth_client:
-            max_retries = 5
+            max_retries = 3
+            max_timeout_seconds = 60
+
             for attempt in range(max_retries):
                 try:
                     current_pos = await self.eth_client.get_account_positions()
@@ -821,39 +1240,42 @@ class DNPairBot:
                     # Determine close side: long positions sell, short positions buy
                     close_side = "sell" if current_pos > 0 else "buy"
 
-                    # Use aggressive IOC with 10 bps slippage for emergency
-                    result = await self.eth_client.place_ioc_order(
-                        self.eth_client.config.contract_id,
-                        abs(current_pos),
-                        close_side
+                    # Use limit order with timeout and price improvement
+                    result = await self.eth_client.place_limit_order_with_timeout(
+                        contract_id=self.eth_client.config.contract_id,
+                        quantity=abs(current_pos),
+                        direction=close_side,
+                        price=None,  # Let method determine at-touch price
+                        timeout_seconds=max_timeout_seconds,
+                        max_retries=1  # Single attempt per outer loop iteration
                     )
 
                     if result.success and result.status in ('FILLED', 'PARTIALLY_FILLED'):
-                        self.logger.info(f"[UNWIND] ETH emergency close successful: {result.filled_size} filled")
+                        self.logger.info(f"[UNWIND] ETH emergency close attempt {attempt+1}: {result.filled_size} filled")
                         # Check if remaining position needs another iteration
                         remaining = await self.eth_client.get_account_positions()
                         if abs(remaining) < Decimal("0.001"):
+                            self.logger.info(f"[UNWIND] ETH position fully closed")
                             return
+                        # Continue to next attempt with remaining quantity
                     else:
                         self.logger.warning(f"[UNWIND] ETH emergency close attempt {attempt+1} failed: {result.error_message}")
 
                 except Exception as e:
                     self.logger.error(f"[UNWIND] ETH emergency close attempt {attempt+1} error: {e}")
 
-                await asyncio.sleep(0.1)
-
-            self.logger.error(f"[UNWIND] Failed to close ETH position after {max_retries} attempts")
+            self.logger.error(f"[UNWIND] Failed to fully close ETH position after {max_retries} attempts ({max_retries * max_timeout_seconds}s total)")
 
     async def emergency_unwind_sol(self):
         """Emergency unwind SOL position (handles both long and short).
 
-        Determines current position direction and closes with aggressive IOC.
-        Uses high slippage (10 bps) to ensure fill during emergency.
+        Determines current position direction and closes with Limit Order.
+        Max 3 retries, 60 seconds per retry (180 seconds total).
 
         Called from handle_emergency_unwind() when SOL fills but ETH fails.
         """
         if self.sol_client:
-            max_retries = 5
+            max_retries = 3
             for attempt in range(max_retries):
                 try:
                     current_pos = await self.sol_client.get_account_positions()
@@ -864,11 +1286,14 @@ class DNPairBot:
                     # Determine close side: long positions sell, short positions buy
                     close_side = "sell" if current_pos > 0 else "buy"
 
-                    # Use aggressive IOC with 10 bps slippage for emergency
-                    result = await self.sol_client.place_ioc_order(
-                        self.sol_client.config.contract_id,
-                        abs(current_pos),
-                        close_side
+                    # Use Limit Order with timeout (NO IOC)
+                    result = await self.sol_client.place_limit_order_with_timeout(
+                        contract_id=self.sol_client.config.contract_id,
+                        quantity=abs(current_pos),
+                        direction=close_side,
+                        price=None,
+                        timeout_seconds=60,
+                        max_retries=3
                     )
 
                     if result.success and result.status in ('FILLED', 'PARTIALLY_FILLED'):
@@ -1126,7 +1551,8 @@ class DNPairBot:
                     eth_price = self.entry_prices.get("ETH", Decimal("0"))
                     if eth_price > 0:
                         liq = await self.eth_client.get_available_liquidity("ask", max_depth=20)
-                        result["eth_liquidity_usd"] = liq * eth_price
+                        if liq is not None:
+                            result["eth_liquidity_usd"] = liq * eth_price
                 else:
                     # WebSocket fallback - assume sufficient liquidity
                     result["eth_can_exit"] = True
@@ -1154,7 +1580,8 @@ class DNPairBot:
                     sol_price = self.entry_prices.get("SOL", Decimal("0"))
                     if sol_price > 0:
                         liq = await self.sol_client.get_available_liquidity("bid", max_depth=20)
-                        result["sol_liquidity_usd"] = liq * sol_price
+                        if liq is not None:
+                            result["sol_liquidity_usd"] = liq * sol_price
                 else:
                     # WebSocket fallback - assume sufficient liquidity
                     result["sol_can_exit"] = True
@@ -1589,10 +2016,10 @@ class DNPairBot:
             eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
             sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
 
-            eth_entry_price = self.entry_prices.get("ETH", Decimal("0"))
-            sol_entry_price = self.entry_prices.get("SOL", Decimal("0"))
-            eth_qty = self.entry_quantities.get("ETH", Decimal("0"))
-            sol_qty = self.entry_quantities.get("SOL", Decimal("0"))
+            eth_entry_price = self.entry_prices.get("ETH") or Decimal("0")
+            sol_entry_price = self.entry_prices.get("SOL") or Decimal("0")
+            eth_qty = self.entry_quantities.get("ETH") or Decimal("0")
+            sol_qty = self.entry_quantities.get("SOL") or Decimal("0")
 
             # Calculate unrealized PNL
             # ETH Long: would exit at bid
@@ -1865,10 +2292,10 @@ class DNPairBot:
         eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
         sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
 
-        eth_entry_price = self.entry_prices.get("ETH", Decimal("0"))
-        sol_entry_price = self.entry_prices.get("SOL", Decimal("0"))
-        eth_qty = self.entry_quantities.get("ETH", Decimal("0"))
-        sol_qty = self.entry_quantities.get("SOL", Decimal("0"))
+        eth_entry_price = self.entry_prices.get("ETH") or Decimal("0")
+        sol_entry_price = self.entry_prices.get("SOL") or Decimal("0")
+        eth_qty = self.entry_quantities.get("ETH") or Decimal("0")
+        sol_qty = self.entry_quantities.get("SOL") or Decimal("0")
 
         eth_unrealized = (eth_bid - eth_entry_price) * eth_qty
         sol_unrealized = (sol_entry_price - sol_ask) * sol_qty
@@ -1895,6 +2322,427 @@ class DNPairBot:
 
         # Small loss: wait for better
         return False, f"waiting_{pnl_bps:.1f}bps"
+
+    async def _monitor_static_individual_tp(
+        self,
+        tp_threshold_bps: float = 10.0,
+        timeout_seconds: int = 60
+    ) -> tuple[bool, str]:
+        """
+        Monitor individual positions and exit when TP hit.
+
+        Static TP: Set at entry, check until hit or timeout.
+
+        Args:
+            tp_threshold_bps: TP threshold in basis points (default: 10bps = 0.1%)
+            timeout_seconds: Max wait time before fallback (default: 60s)
+
+        Returns:
+            (should_exit, reason)
+            - should_exit=True when TP hit or timeout
+            - reason indicates which position hit TP or "timeout"
+
+        Instance Variables Used:
+            - self.entry_prices: Dict with "ETH" and "SOL" entry prices
+            - self.entry_quantities: Dict with "ETH" and "SOL" quantities
+            - self._tp_hit_position: Set to "ETH" or "SOL" when TP hit
+            - self._tp_hit_pnl_pct: Set to PNL % when TP hit
+            - self.eth_client: NadoClient for ETH
+            - self.sol_client: NadoClient for SOL
+        """
+        from decimal import Decimal
+        import asyncio
+
+        LEVERAGE = 5  # 5x leverage from nado.py
+        tp_threshold = Decimal(str(tp_threshold_bps / 10000)) / LEVERAGE
+        POSITION_TOLERANCE = Decimal("0.001")
+
+        start_time = time.time()
+        check_interval = 1.0
+
+        self.logger.info(
+            f"[STATIC TP] Monitoring: TP={tp_threshold_bps}bps, "
+            f"timeout={timeout_seconds}s"
+        )
+
+        # BLOCKING BEHAVIOR: This loop blocks until TP hit or timeout
+        while time.time() - start_time < timeout_seconds:
+            eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(
+                self.eth_client.config.contract_id
+            )
+            sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(
+                self.sol_client.config.contract_id
+            )
+
+            eth_entry_price = self.entry_prices.get("ETH") or Decimal("0")
+            sol_entry_price = self.entry_prices.get("SOL") or Decimal("0")
+            eth_qty = self.entry_quantities.get("ETH") or Decimal("0")
+            sol_qty = self.entry_quantities.get("SOL") or Decimal("0")
+
+            if eth_entry_price == 0 or sol_entry_price == 0:
+                self.logger.warning("[STATIC TP] No entry data available")
+                return False, "no_entry_data"
+
+            # CRITICAL: Use tracked entry_directions, not derive from quantity sign
+            # entry_quantities stores absolute values (always positive)
+            eth_entry_direction = self.entry_directions.get("ETH", "buy")
+            sol_entry_direction = self.entry_directions.get("SOL", "buy")
+            eth_direction = "long" if eth_entry_direction == "buy" else "short"
+            sol_direction = "long" if sol_entry_direction == "buy" else "short"
+
+            if eth_direction == "long":
+                eth_pnl_pct = (eth_bid - eth_entry_price) / eth_entry_price
+            else:
+                eth_pnl_pct = (eth_entry_price - eth_ask) / eth_entry_price
+
+            if sol_direction == "long":
+                sol_pnl_pct = (sol_bid - sol_entry_price) / sol_entry_price
+            else:
+                sol_pnl_pct = (sol_entry_price - sol_ask) / sol_entry_price
+
+            self.logger.info(
+                f"[STATIC TP] ETH: {eth_pnl_pct*100:.2f}% ({eth_direction}), "
+                f"SOL: {sol_pnl_pct*100:.2f}% ({sol_direction}), target: +{tp_threshold_bps}bps"
+            )
+
+            if eth_pnl_pct >= tp_threshold:
+                self.logger.info(
+                    f"[STATIC TP] ETH TP hit: {eth_pnl_pct*100:.2f}% >= {tp_threshold_bps}bps"
+                )
+                self._tp_hit_position = "ETH"
+                self._tp_hit_pnl_pct = float(eth_pnl_pct) * 100
+                return True, f"static_tp_eth_{eth_pnl_pct*100:.2f}bps"
+
+            if sol_pnl_pct >= tp_threshold:
+                self.logger.info(
+                    f"[STATIC TP] SOL TP hit: {sol_pnl_pct*100:.2f}% >= {tp_threshold_bps}bps"
+                )
+                self._tp_hit_position = "SOL"
+                self._tp_hit_pnl_pct = float(sol_pnl_pct) * 100
+                return True, f"static_tp_sol_{sol_pnl_pct*100:.2f}bps"
+
+            await asyncio.sleep(check_interval)
+
+        self.logger.info(
+            f"[STATIC TP] Timeout after {timeout_seconds}s, "
+            f"falling back to spread exit"
+        )
+        return False, "static_tp_timeout"
+
+    async def _place_tp_orders(self) -> bool:
+        """
+        Place TP orders for both positions using trigger_client.
+
+        TP orders are self-executing limit orders that fire when
+        the trigger price is hit.
+
+        Returns:
+            True if both TP orders placed successfully
+        """
+        from decimal import Decimal
+        from nado_protocol.utils.math import to_x18
+        from nado_protocol.utils.subaccount import SubaccountParams
+        from nado_protocol.engine_client.types.execute import ResponseStatus
+
+        LEVERAGE = 5
+        TP_THRESHOLD_BPS = 10  # 10bps = 0.1%
+        tp_threshold = Decimal(str(TP_THRESHOLD_BPS / 10000)) / LEVERAGE
+
+        self._tp_order_ids = {}  # Store for tracking
+
+        for ticker in ["ETH", "SOL"]:
+            client = self.eth_client if ticker == "ETH" else self.sol_client
+
+            entry_price = self.entry_prices.get(ticker)
+            entry_qty = self.entry_quantities.get(ticker, Decimal("0"))
+            entry_direction = self.entry_directions.get(ticker, "buy")
+
+            if not entry_price or entry_qty == 0:
+                self.logger.warning(f"[TP] {ticker} skipping - no entry data")
+                continue
+
+            # Calculate TP trigger price
+            if entry_direction == "buy":
+                # Long position: TP above entry
+                tp_trigger_price = entry_price * (Decimal("1") + tp_threshold)
+                tp_amount = str(-to_x18(float(str(entry_qty))))  # Sell to close
+            else:
+                # Short position: TP below entry
+                tp_trigger_price = entry_price * (Decimal("1") - tp_threshold)
+                tp_amount = str(to_x18(float(str(entry_qty))))  # Buy to close
+
+            # Round to tick size
+            product_id = int(client.config.contract_id)
+            tp_trigger_price_rounded = client._round_price_to_increment(
+                product_id, tp_trigger_price
+            )
+
+            # Build sender params
+            sender = SubaccountParams(
+                subaccount_owner=client.owner,
+                subaccount_name=client.subaccount_name,
+            )
+
+            try:
+                # Long positions trigger when price rises, short when price falls
+                trigger_type = "last_price_above" if entry_direction == "buy" else "last_price_below"
+
+                result = client.client.context.trigger_client.place_price_trigger_order(
+                    product_id=product_id,
+                    price_x18=str(to_x18(float(str(tp_trigger_price_rounded)))),
+                    amount_x18=tp_amount,
+                    trigger_price_x18=str(to_x18(float(str(tp_trigger_price_rounded)))),
+                    trigger_type=trigger_type,
+                    sender=sender,
+                    reduce_only=True,
+                )
+
+                if result and result.status == ResponseStatus.SUCCESS:
+                    order_id = result.data.digest
+                    self._tp_order_ids[ticker] = order_id
+                    self.logger.info(
+                        f"[TP] {ticker} TP order placed: {order_id} @ ${tp_trigger_price_rounded}"
+                    )
+                else:
+                    error = result.error if result else "Unknown error"
+                    self.logger.error(f"[TP] {ticker} failed to place TP: {error}")
+                    return False
+
+            except Exception as e:
+                self.logger.error(f"[TP] {ticker} error placing TP: {e}")
+                return False
+
+        return True
+
+    async def _maybe_place_tp_orders(self) -> None:
+        """
+        Place TP orders if configured.
+
+        This is a conditional wrapper that checks if TP is enabled
+        before placing orders. Makes it easy to disable TP if needed.
+        """
+        if not getattr(self, 'enable_tp_orders', True):
+            self.logger.info("[TP] TP orders disabled, skipping")
+            return
+
+        success = await self._place_tp_orders()
+        if success:
+            self.logger.info(f"[TP] TP orders placed: {self._tp_order_ids}")
+        else:
+            self.logger.warning("[TP] Failed to place TP orders, continuing without TP")
+
+    async def _verify_position_closed(self, ticker: str, max_wait_seconds: int = 10) -> bool:
+        """Verify position is actually closed via both REST and WebSocket."""
+        from decimal import Decimal
+        import asyncio
+
+        POSITION_TOLERANCE = Decimal("0.001")
+        start_time = time.time()
+
+        self.logger.info(f"[VERIFY] Starting position verification for {ticker}")
+
+        while time.time() - start_time < max_wait_seconds:
+            # Check REST API
+            client = self.eth_client if ticker == "ETH" else self.sol_client
+            rest_pos = await client.get_account_positions()
+
+            # Check WebSocket (if available)
+            ws_pos = self._ws_positions.get(ticker, Decimal("0")) if hasattr(self, '_ws_positions') else rest_pos
+
+            self.logger.info(f"[VERIFY] {ticker} - REST={rest_pos}, WS={ws_pos}")
+
+            if abs(rest_pos) < POSITION_TOLERANCE and abs(ws_pos) < POSITION_TOLERANCE:
+                self.logger.info(f"[VERIFY] {ticker} confirmed closed")
+                return True
+
+            await asyncio.sleep(1)
+
+        # CRITICAL: Position not closed after timeout
+        self.logger.critical(f"[VERIFY] CRITICAL: {ticker} NOT CLOSED after {max_wait_seconds}s - REST={rest_pos}, WS={ws_pos}")
+        return False
+
+    async def _close_individual_position(self, ticker: str) -> bool:
+        """
+        Close individual position (ETH or SOL).
+
+        Args:
+            ticker: "ETH" or "SOL"
+
+        Returns:
+            True if position closed successfully (full or partial)
+            False if order failed completely
+
+        "Hedge break" definition: Period when one position is closed but the other
+        remains open, exposing the bot to directional risk.
+
+        Partial Fill Handling:
+            - If order partially filled, accept partial fill and update entry_quantities
+            - If order fails completely, return False to trigger emergency handling
+
+        CRITICAL: Uses entry_quantities instead of get_account_positions() to avoid
+        settlement delay issues where positions show 0.0 for 20+ seconds after fills.
+        """
+        from decimal import Decimal
+
+        POSITION_TOLERANCE = Decimal("0.001")
+        client = self.eth_client if ticker == "ETH" else self.sol_client
+        contract_id = client.config.contract_id
+
+        # CRITICAL: Use entry_quantities which we know are filled, not position checks which lag
+        entry_qty = self.entry_quantities.get(ticker, Decimal("0"))
+        entry_price = self.entry_prices.get(ticker)
+
+        if entry_qty == Decimal("0") or abs(entry_qty) < POSITION_TOLERANCE:
+            self.logger.info(f"[CLOSE] {ticker} no entry quantity to close (entry_qty={entry_qty})")
+            return True
+
+        if entry_price is None or entry_price == Decimal("0"):
+            self.logger.warning(f"[CLOSE] {ticker} no entry price, cannot close (entry_price={entry_price})")
+            return False
+
+        # Determine close side from entry_direction (NOT from entry_qty sign)
+        # entry_directions stores actual order direction: "buy" = long, "sell" = short
+        # To close: opposite of entry direction
+        entry_direction = self.entry_directions.get(ticker, "buy")
+        close_side = "sell" if entry_direction == "buy" else "buy"
+        close_qty = abs(entry_qty)
+
+        bid, ask = await client.fetch_bbo_prices(contract_id)
+        close_price = bid if close_side == "sell" else ask
+
+        self.logger.info(
+            f"[CLOSE] {ticker} {close_side} {close_qty} @ ${close_price} "
+            f"(entry_qty={entry_qty}, entry_price=${entry_price})"
+        )
+
+        # Optional: Log position check for debugging (may show 0.0 due to lag)
+        pos_check = await client.get_account_positions()
+        self.logger.debug(f"[CLOSE] Position check (may lag): {ticker}={pos_check}")
+
+        result = await client.place_limit_order_with_timeout(
+            contract_id=contract_id,
+            quantity=close_qty,
+            direction=close_side,
+            price=close_price,
+            timeout_seconds=30
+        )
+
+        filled_size = self._get_filled_size(result)
+
+        # Store exit price for PNL calculation
+        if not hasattr(self, '_exit_prices'):
+            self._exit_prices = {}
+        if not hasattr(self, '_exit_quantities'):
+            self._exit_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+
+        if result.success and self._is_fill_complete(result):
+            exit_price = result.price if result.price else entry_price
+            self._exit_prices[ticker] = exit_price
+            self._exit_quantities[ticker] += filled_size
+            # DO NOT clear entry_quantities yet - verify position closed first
+            # REMOVED: self.entry_quantities[ticker] = Decimal("0")
+
+            # VERIFY position is actually closed before clearing state
+            self.logger.info(f"[CLOSE] {ticker} order filled, verifying position closed...")
+            verified = await self._verify_position_closed(ticker, max_wait_seconds=5)
+
+            if verified:
+                self.entry_quantities[ticker] = Decimal("0")
+                self.logger.info(f"[CLOSE] {ticker} fully closed and verified: {filled_size}, exit_price={exit_price}")
+                return True
+            else:
+                self.logger.critical(f"[CLOSE] CRITICAL: {ticker} order filled but position STILL OPEN! Attempting market order fallback...")
+
+                # Market order fallback
+                try:
+                    close_side = "sell" if entry_qty > 0 else "buy"
+                    market_result = await client.place_ioc_order(
+                        contract_id=contract_id,
+                        quantity=abs(entry_qty),
+                        direction=close_side
+                    )
+
+                    # Re-verify
+                    verified = await self._verify_position_closed(ticker, max_wait_seconds=5)
+                    if verified:
+                        self.entry_quantities[ticker] = Decimal("0")
+                        self.logger.warning(f"[CLOSE] {ticker} closed via MARKET order fallback")
+                        return True
+                except Exception as e:
+                    self.logger.critical(f"[CLOSE] FAILED to close {ticker} with market order: {e}")
+
+                return False
+        elif result.success and filled_size > POSITION_TOLERANCE:
+            exit_price = result.price if result.price else entry_price
+            self._exit_prices[ticker] = exit_price
+            self._exit_quantities[ticker] += filled_size
+            # Update entry quantity for remaining position
+            self.entry_quantities[ticker] = entry_qty - filled_size
+            self.logger.warning(
+                f"[CLOSE] {ticker} partially closed: {filled_size}/{close_qty} "
+                f"({float(filled_size/close_qty*100):.1f}%), remaining={entry_qty - filled_size}"
+            )
+            return True
+        else:
+            self.logger.error(
+                f"[CLOSE] {ticker} failed: success={result.success}, "
+                f"status={result.status if hasattr(result, 'status') else 'N/A'}, "
+                f"error={result.error_message if hasattr(result, 'error_message') else 'N/A'}"
+            )
+            return False
+
+    async def _check_and_close_remaining_position(self, closed_position: str) -> bool:
+        """
+        Check and close remaining position after individual TP close.
+
+        Args:
+            closed_position: "ETH" or "SOL" that was already closed
+
+        Returns:
+            True if all positions closed, False if error occurred
+        """
+        from decimal import Decimal
+
+        POSITION_TOLERANCE = Decimal("0.001")
+
+        remaining_ticker = "SOL" if closed_position == "ETH" else "ETH"
+        remaining_client = self.eth_client if remaining_ticker == "ETH" else self.sol_client
+
+        # Use WebSocket positions if available (more accurate, no settlement lag)
+        if hasattr(self, '_ws_positions') and remaining_ticker in self._ws_positions:
+            ws_pos = self._ws_positions[remaining_ticker]
+            # Also check REST as backup
+            rest_pos = await remaining_client.get_account_positions()
+            self.logger.info(f"[CLOSE] {remaining_ticker} position check - WS={ws_pos}, REST={rest_pos}")
+
+            # Use WebSocket position (more accurate)
+            remaining_pos = ws_pos
+        else:
+            # Fallback to REST only
+            remaining_pos = await remaining_client.get_account_positions()
+            self.logger.info(f"[CLOSE] {remaining_ticker} position check (REST only) - {remaining_pos}")
+
+        if abs(remaining_pos) < POSITION_TOLERANCE:
+            self.logger.info(f"[CLOSE] No remaining {remaining_ticker} position")
+            return True
+
+        self.logger.info(
+            f"[CLOSE] Remaining position: {remaining_ticker}={remaining_pos}"
+        )
+
+        should_exit, exit_reason = await self._check_exit_timing(max_loss_bps=30)
+
+        if should_exit:
+            self.logger.info(
+                f"[CLOSE] Closing {remaining_ticker}: {exit_reason}"
+            )
+            return await self._close_individual_position(remaining_ticker)
+        else:
+            self.logger.warning(
+                f"[CLOSE] Spread condition not met for {remaining_ticker}, "
+                f"closing anyway to minimize hedge break time"
+            )
+            return await self._close_individual_position(remaining_ticker)
 
     async def _fetch_funding_rate_rest(self, contract_id: int, ticker: str) -> Decimal:
         """
@@ -1937,10 +2785,10 @@ class DNPairBot:
         """
         try:
             # Get position values
-            eth_entry_price = self.entry_prices.get("ETH", Decimal("0"))
-            sol_entry_price = self.entry_prices.get("SOL", Decimal("0"))
-            eth_qty = self.entry_quantities.get("ETH", Decimal("0"))
-            sol_qty = self.entry_quantities.get("SOL", Decimal("0"))
+            eth_entry_price = self.entry_prices.get("ETH") or Decimal("0")
+            sol_entry_price = self.entry_prices.get("SOL") or Decimal("0")
+            eth_qty = self.entry_quantities.get("ETH") or Decimal("0")
+            sol_qty = self.entry_quantities.get("SOL") or Decimal("0")
 
             eth_value = eth_entry_price * eth_qty
             sol_value = sol_entry_price * sol_qty
@@ -2015,6 +2863,106 @@ class DNPairBot:
 
         return True, queue_size, "OK"
 
+    def _get_filled_size(self, result) -> Decimal:
+        """Extract filled_size from OrderResult with null-safety."""
+        if result is None:
+            return Decimal("0")
+        if not hasattr(result, 'filled_size'):
+            return Decimal("0")
+        if result.filled_size is None:
+            return Decimal("0")
+        return result.filled_size
+
+    def _is_fill_complete(self, result, expected_quantity: Decimal = None) -> bool:
+        """Check if order is completely filled."""
+        if result is None or not hasattr(result, 'success'):
+            return False
+        if not result.success:
+            return False
+
+        # Check status field - FILLED means complete
+        if hasattr(result, 'status') and result.status == 'FILLED':
+            return True
+
+        filled = self._get_filled_size(result)
+
+        # If expected_quantity provided, check if we filled >= 99% of it
+        if expected_quantity is not None and expected_quantity > 0:
+            fill_ratio = filled / expected_quantity
+            self.logger.debug(f"[FILL] fill_ratio={fill_ratio:.2%}, filled={filled}, expected={expected_quantity}")
+            return fill_ratio >= Decimal("0.99")
+
+        return filled > Decimal("0.001")  # Legacy behavior when no expected quantity
+
+    def _calculate_remaining_quantities(
+        self,
+        target_notional: Decimal,
+        eth_price: Decimal,
+        sol_price: Decimal
+    ) -> Tuple[Decimal, Decimal]:
+        """
+        Calculate remaining quantities based on filled amounts and current prices.
+        Uses remaining notional (USD) to handle price changes between retries.
+        """
+        eth_filled_notional = Decimal("0")
+        sol_filled_notional = Decimal("0")
+
+        if self.entry_quantities.get("ETH", Decimal("0")) > Decimal("0"):
+            eth_fill_price = self.entry_prices.get("ETH") or eth_price
+            eth_filled_notional = self.entry_quantities["ETH"] * eth_fill_price
+
+        if self.entry_quantities.get("SOL", Decimal("0")) > Decimal("0"):
+            sol_fill_price = self.entry_prices.get("SOL") or sol_price
+            sol_filled_notional = self.entry_quantities["SOL"] * sol_fill_price
+
+        eth_remaining_notional = target_notional - eth_filled_notional
+        sol_remaining_notional = target_notional - sol_filled_notional
+
+        eth_remaining_qty = eth_remaining_notional / eth_price if eth_price > 0 else Decimal("0")
+        sol_remaining_qty = sol_remaining_notional / sol_price if sol_price > 0 else Decimal("0")
+
+        eth_remaining_qty = max(eth_remaining_qty, Decimal("0"))
+        sol_remaining_qty = max(sol_remaining_qty, Decimal("0"))
+
+        return eth_remaining_qty, sol_remaining_qty
+
+    async def _retry_side_order(
+        self,
+        client,
+        ticker: str,
+        direction: str,
+        quantity: Decimal,
+        price: Decimal,
+        bypass_queue_filter: bool = False
+    ):
+        """
+        Retry a single side order with optional filter bypass.
+        """
+        contract_id = client.config.contract_id
+
+        if bypass_queue_filter:
+            self.logger.warning(
+                f"[RETRY] Bypassing queue filter for {ticker} - "
+                f"placing order at current market price"
+            )
+            result = await client.place_limit_order_with_timeout(
+                contract_id=contract_id,
+                quantity=quantity,
+                price=price,
+                direction=direction,
+                timeout_seconds=30
+            )
+            return result
+        else:
+            # Use standard place_limit_order_with_timeout
+            result = await client.place_limit_order_with_timeout(
+                contract_id=contract_id,
+                quantity=quantity,
+                price=price,
+                direction=direction
+            )
+            return result
+
     async def execute_build_cycle(self, eth_direction: str = "buy", sol_direction: str = "sell") -> bool:
         """Execute BUILD cycle with specified directions.
 
@@ -2028,13 +2976,14 @@ class DNPairBot:
         POSITION_TOLERANCE = Decimal("0.001")
 
         # SAFETY CHECK: Verify positions are closed before BUILD
-        eth_pos = await self.eth_client.get_account_positions()
-        sol_pos = await self.sol_client.get_account_positions()
+        # NOTE: WebSocket positions are real-time; REST API has ~20s lag
+        eth_pos = self._ws_positions.get("ETH", Decimal("0"))
+        sol_pos = self._ws_positions.get("SOL", Decimal("0"))
 
         if abs(eth_pos) > POSITION_TOLERANCE or abs(sol_pos) > POSITION_TOLERANCE:
             self.logger.error(
                 f"[BUILD] SAFETY VIOLATION: Cannot BUILD with open positions - "
-                f"ETH={eth_pos}, SOL={sol_pos}. Run UNWIND first!"
+                f"ETH={eth_pos} (WS), SOL={sol_pos} (WS). Run UNWIND first!"
             )
             return False
 
@@ -2079,38 +3028,226 @@ class DNPairBot:
         # Store entry spread info for later logging
         self._entry_spread_info = spread_info
 
+        MAX_RETRIES = 3
+        RETRY_DELAY = 2.0
+        POSITION_TOLERANCE = Decimal("0.001")
+
         try:
             # Store entry phase flag for PNL tracking
             self._is_entry_phase = True
-            eth_result, sol_result = await self.place_simultaneous_orders(eth_direction, sol_direction)
-            self._is_entry_phase = False
 
-            # Check if orders were skipped due to insufficient liquidity
-            if (isinstance(eth_result, OrderResult) and not eth_result.success and
-                eth_result.error_message and "Skipped:" in eth_result.error_message):
-                self.logger.warning(f"[BUILD] LIQUIDITY SKIP: {eth_result.error_message}")
-                # Log skipped cycle to CSV
-                self._log_skipped_cycle(f"LIQUIDITY: {eth_result.error_message}")
+            # Reset entry quantities and prices for retry tracking
+            self.entry_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+            self.entry_prices = {"ETH": None, "SOL": None}
+            self.entry_directions = {"ETH": eth_direction, "SOL": sol_direction}
+
+            eth_result, sol_result = await self.place_simultaneous_orders(eth_direction, sol_direction)
+
+            # Extract initial fills
+            eth_filled_size = self._get_filled_size(eth_result)
+            sol_filled_size = self._get_filled_size(sol_result)
+
+            self.logger.info(
+                f"[BUILD] Initial fills: ETH={eth_filled_size}, SOL={sol_filled_size}"
+            )
+
+            # Check for filter SKIP (both failed with filter error)
+            both_failed_filter = (
+                isinstance(eth_result, OrderResult) and not eth_result.success and
+                isinstance(sol_result, OrderResult) and not sol_result.success and
+                eth_result.error_message and "Queue filter" in eth_result.error_message
+            )
+            if both_failed_filter:
+                self.logger.warning(f"[BUILD] FILTER SKIP: {eth_result.error_message}")
+                self._log_skipped_cycle(f"FILTER: {eth_result.error_message}")
+                self._is_entry_phase = False
                 return False
 
-            # Log spread analysis at entry if orders succeeded
-            if (isinstance(eth_result, OrderResult) and eth_result.success and
-                isinstance(sol_result, OrderResult) and sol_result.success):
+            # Check if both filled
+            if self._is_fill_complete(eth_result) and self._is_fill_complete(sol_result):
+                self.logger.info(f"[BUILD] Both orders filled successfully on first attempt")
+                self._is_entry_phase = False
+                await self._maybe_place_tp_orders()
+
+                # Log spread analysis at entry if orders succeeded
                 try:
                     self._log_spread_analysis(spread_info)
                 except Exception as e:
                     self.logger.error(f"[CSV] Error logging spread analysis: {e}")
 
-            # DEBUG: Log return values
-            self.logger.info(f"[DEBUG] BUILD Return: isinstance(eth_result, OrderResult)={isinstance(eth_result, OrderResult)}, eth_result.success={eth_result.success if isinstance(eth_result, OrderResult) else 'N/A'}, isinstance(sol_result, OrderResult)={isinstance(sol_result, OrderResult)}, sol_result.success={sol_result.success if isinstance(sol_result, OrderResult) else 'N/A'}")
+                return True
 
-            return (isinstance(eth_result, OrderResult) and eth_result.success and
-                    isinstance(sol_result, OrderResult) and sol_result.success)
+            # Retry loop for position imbalance
+            latest_eth_result = eth_result
+            latest_sol_result = sol_result
+
+            # Track cumulative fills from OrderResult (not position checks which lag)
+            cumulative_eth_filled = self._get_filled_size(eth_result)
+            cumulative_sol_filled = self._get_filled_size(sol_result)
+            self.logger.info(
+                f"[BUILD] Initial cumulative fills: ETH={cumulative_eth_filled}, SOL={cumulative_sol_filled}"
+            )
+
+            for attempt in range(MAX_RETRIES):
+                self.logger.warning(
+                    f"[BUILD] Position imbalance detected (attempt {attempt + 1}/{MAX_RETRIES})"
+                )
+
+                await asyncio.sleep(RETRY_DELAY)
+
+                # Fetch current prices
+                eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
+                sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
+
+                # Calculate target quantities from notional
+                eth_price = eth_bid if eth_direction == "buy" else eth_ask
+                sol_price = sol_bid if sol_direction == "buy" else sol_ask
+                target_eth_qty = self.target_notional / eth_price
+                target_sol_qty = self.target_notional / sol_price
+
+                # Calculate remaining based on cumulative fills (not positions)
+                eth_remaining_qty = max(target_eth_qty - cumulative_eth_filled, Decimal("0"))
+                sol_remaining_qty = max(target_sol_qty - cumulative_sol_filled, Decimal("0"))
+
+                self.logger.info(
+                    f"[BUILD] Cumulative fills: ETH={cumulative_eth_filled}/{target_eth_qty}, "
+                    f"SOL={cumulative_sol_filled}/{target_sol_qty}"
+                )
+                self.logger.info(
+                    f"[BUILD] Remaining quantities: ETH={eth_remaining_qty}, SOL={sol_remaining_qty}"
+                )
+
+                # Check positions for logging only (may show 0.0 before settlement)
+                eth_pos = await self.eth_client.get_account_positions()
+                sol_pos = await self.sol_client.get_account_positions()
+                self.logger.info(f"[BUILD] Current positions (may lag): ETH={eth_pos}, SOL={sol_pos}")
+
+                # Retry missing sides with filter bypass on 3rd attempt
+                bypass_filter = (attempt >= 2)
+                retry_results = []
+
+                if eth_remaining_qty > Decimal("0.001"):
+                    self.logger.info(
+                        f"[BUILD] Retrying ETH {eth_direction} {eth_remaining_qty} @ ${eth_price}"
+                    )
+                    retry_result = await self._retry_side_order(
+                        self.eth_client, "ETH", eth_direction, eth_remaining_qty, eth_price, bypass_filter
+                    )
+                    retry_results.append(("ETH", retry_result))
+                    latest_eth_result = retry_result
+
+                if sol_remaining_qty > Decimal("0.001"):
+                    self.logger.info(
+                        f"[BUILD] Retrying SOL {sol_direction} {sol_remaining_qty} @ ${sol_price}"
+                    )
+                    retry_result = await self._retry_side_order(
+                        self.sol_client, "SOL", sol_direction, sol_remaining_qty, sol_price, bypass_filter
+                    )
+                    retry_results.append(("SOL", retry_result))
+                    latest_sol_result = retry_result
+
+                # Update entry quantities and cumulative fills from retry results
+                for ticker, result in retry_results:
+                    filled_size = self._get_filled_size(result)
+                    if filled_size > Decimal("0.001"):
+                        # Update cumulative fills for remaining quantity calculation
+                        if ticker == "ETH":
+                            cumulative_eth_filled += filled_size
+                        elif ticker == "SOL":
+                            cumulative_sol_filled += filled_size
+
+                        # Update entry quantities and prices
+                        if hasattr(result, 'price') and result.price:
+                            self.entry_quantities[ticker] += filled_size
+                            # Always update entry_prices on successful fills (use latest price)
+                            # This ensures entry_prices is set even during retries with different prices
+                            if result.price > 0:
+                                self.entry_prices[ticker] = result.price
+                            self.logger.info(
+                                f"[BUILD] {ticker} retry filled: {filled_size} @ ${result.price}, "
+                                f"cumulative: {cumulative_eth_filled if ticker == 'ETH' else cumulative_sol_filled}"
+                            )
+
+                # Check if all target quantities are now filled based on cumulative fills
+                if cumulative_eth_filled >= target_eth_qty * Decimal("0.99") and cumulative_sol_filled >= target_sol_qty * Decimal("0.99"):
+                    self.logger.info(
+                        f"[BUILD] All target quantities filled: ETH={cumulative_eth_filled}/{target_eth_qty}, "
+                        f"SOL={cumulative_sol_filled}/{target_sol_qty}. Waiting for positions to settle..."
+                    )
+                    # CRITICAL: Trust cumulative fills, not position checks which lag
+                    # Position checks can show 0.0 for 20+ seconds after fills
+                    if cumulative_eth_filled >= target_eth_qty * Decimal("0.99") and cumulative_sol_filled >= target_sol_qty * Decimal("0.99"):
+                        self.logger.info(
+                            f"[BUILD] Both positions filled (cumulative): ETH={cumulative_eth_filled}/{target_eth_qty}, "
+                            f"SOL={cumulative_sol_filled}/{target_sol_qty}"
+                        )
+
+                        # Optional: Log position check for debugging (may show 0.0 due to lag)
+                        eth_pos_check = await self.eth_client.get_account_positions()
+                        sol_pos_check = await self.sol_client.get_account_positions()
+                        self.logger.debug(f"[BUILD] Position check (may lag): ETH={eth_pos_check}, SOL={sol_pos_check}")
+
+                        self._is_entry_phase = False
+                        await self._maybe_place_tp_orders()
+
+                        # Log spread analysis at entry if orders succeeded
+                        try:
+                            self._log_spread_analysis(spread_info)
+                        except Exception as e:
+                            self.logger.error(f"[CSV] Error logging spread analysis: {e}")
+
+                        return True
+
+            # After all retries, verify final state
+            eth_pos = await self.eth_client.get_account_positions()
+            sol_pos = await self.sol_client.get_account_positions()
+
+            # CRITICAL FIX: Check if positions are imbalanced (one significantly larger than other)
+            # This detects both "double entry" bugs and single-leg failures
+            eth_significant = abs(eth_pos) > Decimal("0.01")
+            sol_significant = abs(sol_pos) > Decimal("0.01")
+
+            # If both have positions (double entry) OR one is significantly larger
+            if (eth_significant and sol_significant) or (eth_significant != sol_significant):
+                # Check for imbalance ratio (more than 10% difference)
+                if eth_significant and sol_significant:
+                    ratio = abs(eth_pos) / max(abs(sol_pos), Decimal("0.0001"))
+                    if Decimal("0.9") <= ratio <= Decimal("1.1"):
+                        # Positions are balanced, this is OK
+                        self.logger.info(f"[BUILD] Both positions established and balanced")
+                        self._is_entry_phase = False
+                        await self._maybe_place_tp_orders()
+                        return True
+
+                # Positions are imbalanced or single-leg only - trigger emergency unwind
+                self.logger.error(
+                    f"[BUILD] FAILED: Positions still imbalanced after {MAX_RETRIES} retries: "
+                    f"ETH={eth_pos}, SOL={sol_pos}"
+                )
+                # Trigger emergency unwind with latest results
+                await self.handle_emergency_unwind(latest_eth_result, latest_sol_result)
+                self._is_entry_phase = False
+                return False
+
+            self.logger.info(f"[BUILD] Both positions established")
+            self._is_entry_phase = False
+            await self._maybe_place_tp_orders()
+
+            # Log spread analysis at entry if orders succeeded
+            try:
+                self._log_spread_analysis(spread_info)
+            except Exception as e:
+                self.logger.error(f"[CSV] Error logging spread analysis: {e}")
+
+            return True
         except Exception as e:
             self.logger.error(f"[BUILD] Exception during build cycle: {e}")
             import traceback
             self.logger.error(f"[BUILD] Traceback: {traceback.format_exc()}")
             self._is_entry_phase = False
+
+            # CRITICAL: Force close any open positions to prevent accumulation
+            await self._verify_and_force_close_all_positions()
             return False
 
     async def execute_unwind_cycle(self, eth_side: str = "sell", sol_side: str = "buy") -> bool:
@@ -2130,9 +3267,10 @@ class DNPairBot:
         RETRY_DELAY = 2.0
 
         # Log pre-unwind positions
-        eth_pos_before = await self.eth_client.get_account_positions()
-        sol_pos_before = await self.sol_client.get_account_positions()
-        self.logger.info(f"[UNWIND] POSITIONS BEFORE: ETH={eth_pos_before}, SOL={sol_pos_before}")
+        # NOTE: WebSocket positions are real-time; REST API has ~20s lag
+        eth_pos_before = self._ws_positions.get("ETH", Decimal("0"))
+        sol_pos_before = self._ws_positions.get("SOL", Decimal("0"))
+        self.logger.info(f"[UNWIND] POSITIONS BEFORE (WS): ETH={eth_pos_before}, SOL={sol_pos_before}")
 
         # TASK 5: Pre-exit liquidity check using BookDepth (V5.6)
         liquidity_check = await self._check_exit_liquidity(max_slippage_bps=20)
@@ -2184,6 +3322,45 @@ class DNPairBot:
         # Set exit phase flag for PNL tracking
         self._is_exit_phase = True
 
+        # Initialize exit tracking (separate from entry tracking)
+        if not hasattr(self, '_exit_quantities'):
+            self._exit_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+        if not hasattr(self, '_exit_prices'):
+            self._exit_prices = {"ETH": None, "SOL": None}
+
+        # STATIC TP CHECK (if enabled) - Runs FIRST
+        if self.enable_static_tp:
+            self.logger.info("[UNWIND] Checking static TP conditions...")
+            should_exit_tp, tp_reason = await self._monitor_static_individual_tp(
+                tp_threshold_bps=self.tp_bps,
+                timeout_seconds=self.tp_timeout
+            )
+
+            if should_exit_tp:
+                self.logger.info(f"[EXIT] Static TP triggered: {tp_reason}")
+
+                # SEQUENTIAL EXECUTION: Close TP-hit position first
+                if hasattr(self, '_tp_hit_position') and self._tp_hit_position:
+                    position_to_close = self._tp_hit_position
+                    self.logger.info(f"[EXIT] Closing {position_to_close} (TP hit: {self._tp_hit_pnl_pct:.2f}bps)")
+
+                    # Step 1: Close individual position that hit TP
+                    close_success = await self._close_individual_position(position_to_close)
+
+                    if not close_success:
+                        self.logger.error(f"[EXIT] Failed to close {position_to_close}")
+                        return False
+
+                    # Step 2: Check and close remaining position
+                    remaining_pos_check = await self._check_and_close_remaining_position(
+                        closed_position=position_to_close
+                    )
+
+                    return remaining_pos_check
+
+        # FALLBACK: Spread-based exit check (original logic)
+        self.logger.info("[UNWIND] Checking spread-based exit conditions...")
+
         # Place UNWIND orders with specified sides
         eth_result, sol_result = await self.place_simultaneous_orders(eth_side, sol_side)
 
@@ -2198,20 +3375,165 @@ class DNPairBot:
 
         self._is_exit_phase = False
 
-        # Check if orders filled
-        if not (isinstance(eth_result, OrderResult) and eth_result.success and
-                isinstance(sol_result, OrderResult) and sol_result.success):
-            self.logger.warning("[UNWIND] Orders failed or partially filled")
-            return False
+        # Check if orders filled and add retry logic for partial fills
+        MAX_ORDER_RETRIES = 3
+        ORDER_RETRY_DELAY = 2.0
+
+        # Check initial fill status using _is_fill_complete()
+        eth_filled = (isinstance(eth_result, OrderResult) and
+                      self._is_fill_complete(eth_result))
+        sol_filled = (isinstance(sol_result, OrderResult) and
+                      self._is_fill_complete(sol_result))
+
+        if eth_filled and sol_filled:
+            self.logger.info("[UNWIND] Both orders filled successfully")
+        else:
+            # One or both legs didn't fill - retry individual legs
+            self.logger.warning(f"[UNWIND] Initial fill incomplete: ETH={eth_filled}, SOL={sol_filled}")
+
+            latest_eth_result = eth_result
+            latest_sol_result = sol_result
+
+            # Get entry quantities to determine target close amounts
+            eth_entry_qty = self.entry_quantities.get("ETH", Decimal("0"))
+            sol_entry_qty = self.entry_quantities.get("SOL", Decimal("0"))
+
+            # Track cumulative filled amounts from OrderResult (not position checks which lag)
+            cumulative_eth_filled = self._get_filled_size(eth_result)
+            cumulative_sol_filled = self._get_filled_size(sol_result)
+
+            self.logger.info(
+                f"[UNWIND] Initial cumulative fills: ETH={cumulative_eth_filled}/{eth_entry_qty}, "
+                f"SOL={cumulative_sol_filled}/{sol_entry_qty}"
+            )
+
+            for attempt in range(MAX_ORDER_RETRIES):
+                await asyncio.sleep(ORDER_RETRY_DELAY)
+
+                # Get current prices
+                eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
+                sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
+
+                # Calculate remaining based on cumulative fills (not positions which lag)
+                # We need to close the full entry quantity
+                eth_remaining_qty = max(eth_entry_qty - cumulative_eth_filled, Decimal("0"))
+                sol_remaining_qty = max(sol_entry_qty - cumulative_sol_filled, Decimal("0"))
+
+                # Determine which side needs retry based on cumulative fills
+                retry_eth = cumulative_eth_filled < eth_entry_qty * Decimal("0.99")
+                retry_sol = cumulative_sol_filled < sol_entry_qty * Decimal("0.99")
+
+                self.logger.info(
+                    f"[UNWIND] Cumulative fills: ETH={cumulative_eth_filled}/{eth_entry_qty}, "
+                    f"SOL={cumulative_sol_filled}/{sol_entry_qty}"
+                )
+                self.logger.info(
+                    f"[UNWIND] Remaining: ETH={eth_remaining_qty}, SOL={sol_remaining_qty}, "
+                    f"retry_eth={retry_eth}, retry_sol={retry_sol}"
+                )
+
+                # Log positions for reference (may lag actual fills)
+                eth_pos = await self.eth_client.get_account_positions()
+                sol_pos = await self.sol_client.get_account_positions()
+                self.logger.info(f"[UNWIND] Current positions (may lag): ETH={eth_pos}, SOL={sol_pos}")
+
+                if not retry_eth and not retry_sol:
+                    self.logger.info("[UNWIND] Both positions now closed, no retry needed")
+                    break
+
+                # Bypass queue filter on 3rd attempt
+                bypass_queue_filter = (attempt >= 2)
+
+                if retry_eth:
+                    self.logger.info(f"[UNWIND] Retrying ETH: side={eth_side}, qty={eth_remaining_qty}")
+                    eth_result = await self._retry_side_order(
+                        self.eth_client, "ETH", eth_side, eth_remaining_qty,
+                        eth_bid if eth_side == "buy" else eth_ask,
+                        bypass_queue_filter
+                    )
+                    latest_eth_result = eth_result
+
+                    # Track cumulative fills and exit quantities
+                    filled_size = self._get_filled_size(eth_result)
+                    if filled_size > POSITION_TOLERANCE:
+                        cumulative_eth_filled += filled_size
+                        self._exit_quantities["ETH"] += filled_size
+                        # Always update exit_prices on successful fills (use latest price)
+                        if eth_result.price and eth_result.price > 0:
+                            self._exit_prices["ETH"] = eth_result.price
+                        self.logger.info(
+                            f"[UNWIND] ETH retry filled: {filled_size} @ {eth_result.price}, "
+                            f"cumulative: {cumulative_eth_filled}/{eth_entry_qty}"
+                        )
+
+                if retry_sol:
+                    self.logger.info(f"[UNWIND] Retrying SOL: side={sol_side}, qty={sol_remaining_qty}")
+                    sol_result = await self._retry_side_order(
+                        self.sol_client, "SOL", sol_side, sol_remaining_qty,
+                        sol_bid if sol_side == "buy" else sol_ask,
+                        bypass_queue_filter
+                    )
+                    latest_sol_result = sol_result
+
+                    # Track cumulative fills and exit quantities
+                    filled_size = self._get_filled_size(sol_result)
+                    if filled_size > POSITION_TOLERANCE:
+                        cumulative_sol_filled += filled_size
+                        self._exit_quantities["SOL"] += filled_size
+                        # Always update exit_prices on successful fills (use latest price)
+                        if sol_result.price and sol_result.price > 0:
+                            self._exit_prices["SOL"] = sol_result.price
+                        self.logger.info(
+                            f"[UNWIND] SOL retry filled: {filled_size} @ {sol_result.price}, "
+                            f"cumulative: {cumulative_sol_filled}/{sol_entry_qty}"
+                        )
+
+                # Check if retry succeeded based on cumulative fills (99% of entry quantity)
+                if (cumulative_eth_filled >= eth_entry_qty * Decimal("0.99") and
+                    cumulative_sol_filled >= sol_entry_qty * Decimal("0.99")):
+                    self.logger.info(
+                        f"[UNWIND] Retry successful: ETH={cumulative_eth_filled}/{eth_entry_qty}, "
+                        f"SOL={cumulative_sol_filled}/{sol_entry_qty}"
+                    )
+                    break
+
+            # After order retry, check for emergency unwind condition
+            # Use cumulative fills for accurate determination (not just latest result)
+            eth_final_filled = cumulative_eth_filled >= eth_entry_qty * Decimal("0.99")
+            sol_final_filled = cumulative_sol_filled >= sol_entry_qty * Decimal("0.99")
+
+            if eth_final_filled and not sol_final_filled:
+                self.logger.warning("[UNWIND] ETH filled but SOL failed after retries")
+                await self.handle_emergency_unwind(latest_eth_result, latest_sol_result)
+                return False
+            elif sol_final_filled and not eth_final_filled:
+                self.logger.warning("[UNWIND] SOL filled but ETH failed after retries")
+                await self.handle_emergency_unwind(latest_eth_result, latest_sol_result)
+                return False
+            elif not eth_final_filled and not sol_final_filled:
+                self.logger.error("[UNWIND] Both legs failed after retries")
+                return False
 
         # Verify positions closed with retries
         for attempt in range(MAX_RETRIES):
             await asyncio.sleep(RETRY_DELAY)
 
-            eth_pos = await self.eth_client.get_account_positions()
-            sol_pos = await self.sol_client.get_account_positions()
+            # NOTE: WebSocket positions are real-time; REST API has ~20s lag
+            # Use WS for initial check, REST as backup/verification
+            eth_pos_ws = self._ws_positions.get("ETH", Decimal("0"))
+            sol_pos_ws = self._ws_positions.get("SOL", Decimal("0"))
+            eth_pos_rest = await self.eth_client.get_account_positions()
+            sol_pos_rest = await self.sol_client.get_account_positions()
 
-            self.logger.info(f"[UNWIND] POSITIONS CHECK (attempt {attempt + 1}/{MAX_RETRIES}): ETH={eth_pos}, SOL={sol_pos}")
+            self.logger.info(
+                f"[UNWIND] POSITIONS CHECK (attempt {attempt + 1}/{MAX_RETRIES}): "
+                f"ETH WS={eth_pos_ws} REST={eth_pos_rest}, "
+                f"SOL WS={sol_pos_ws} REST={sol_pos_rest}"
+            )
+
+            # Use WebSocket positions for real-time verification
+            eth_pos = eth_pos_ws
+            sol_pos = sol_pos_ws
 
             eth_closed = abs(eth_pos) < POSITION_TOLERANCE
             sol_closed = abs(sol_pos) < POSITION_TOLERANCE
@@ -2257,6 +3579,18 @@ class DNPairBot:
                 while elapsed < self.sleep_time:
                     await asyncio.sleep(min(sleep_interval, self.sleep_time - elapsed))
                     await self._log_realtime_pnl()
+
+                    # Check for position imbalance using WebSocket data
+                    if hasattr(self, '_ws_positions'):
+                        eth_pos = abs(self._ws_positions.get("ETH", Decimal("0")))
+                        sol_pos = abs(self._ws_positions.get("SOL", Decimal("0")))
+                        if sol_pos > 0:
+                            ratio = float(eth_pos / sol_pos)
+                            if ratio > 1.5 or ratio < 0.67:  # More than 50% imbalance
+                                self.logger.warning(
+                                    f"[POSITION IMBALANCE] ETH={eth_pos}, SOL={sol_pos}, ratio={ratio:.2f}"
+                                )
+
                     elapsed += sleep_interval
 
             unwind_success = await self.execute_unwind_cycle()
@@ -2285,6 +3619,10 @@ class DNPairBot:
         self.entry_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
         self.entry_timestamps = {"ETH": None, "SOL": None}
 
+        # Reset WebSocket position tracking to prevent stale data from previous cycles
+        self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+        self.logger.info("[CYCLE START] Reset WebSocket position tracking to 0")
+
         try:
             # BUILD: Long ETH / Short SOL
             build_success = await self.execute_build_cycle("buy", "sell")
@@ -2298,6 +3636,18 @@ class DNPairBot:
                 while elapsed < self.sleep_time:
                     await asyncio.sleep(min(sleep_interval, self.sleep_time - elapsed))
                     await self._log_realtime_pnl()
+
+                    # Check for position imbalance using WebSocket data
+                    if hasattr(self, '_ws_positions'):
+                        eth_pos = abs(self._ws_positions.get("ETH", Decimal("0")))
+                        sol_pos = abs(self._ws_positions.get("SOL", Decimal("0")))
+                        if sol_pos > 0:
+                            ratio = float(eth_pos / sol_pos)
+                            if ratio > 1.5 or ratio < 0.67:  # More than 50% imbalance
+                                self.logger.warning(
+                                    f"[POSITION IMBALANCE] ETH={eth_pos}, SOL={sol_pos}, ratio={ratio:.2f}"
+                                )
+
                     elapsed += sleep_interval
 
             # UNWIND: Sell ETH / Buy SOL
@@ -2311,6 +3661,8 @@ class DNPairBot:
 
         except Exception as e:
             self.logger.error(f"BUY_FIRST cycle failed: {e}")
+            # CRITICAL: Force close any open positions to prevent accumulation
+            await self._verify_and_force_close_all_positions()
             return False
 
     async def execute_sell_first_cycle(self) -> bool:
@@ -2334,6 +3686,10 @@ class DNPairBot:
         self.entry_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
         self.entry_timestamps = {"ETH": None, "SOL": None}
 
+        # Reset WebSocket position tracking to prevent stale data from previous cycles
+        self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+        self.logger.info("[CYCLE START] Reset WebSocket position tracking to 0")
+
         try:
             # BUILD: Short ETH / Long SOL (opposite of buy_first)
             build_success = await self.execute_build_cycle("sell", "buy")
@@ -2347,6 +3703,18 @@ class DNPairBot:
                 while elapsed < self.sleep_time:
                     await asyncio.sleep(min(sleep_interval, self.sleep_time - elapsed))
                     await self._log_realtime_pnl()
+
+                    # Check for position imbalance using WebSocket data
+                    if hasattr(self, '_ws_positions'):
+                        eth_pos = abs(self._ws_positions.get("ETH", Decimal("0")))
+                        sol_pos = abs(self._ws_positions.get("SOL", Decimal("0")))
+                        if sol_pos > 0:
+                            ratio = float(eth_pos / sol_pos)
+                            if ratio > 1.5 or ratio < 0.67:  # More than 50% imbalance
+                                self.logger.warning(
+                                    f"[POSITION IMBALANCE] ETH={eth_pos}, SOL={sol_pos}, ratio={ratio:.2f}"
+                                )
+
                     elapsed += sleep_interval
 
             # UNWIND: Buy ETH / Sell SOL
@@ -2360,6 +3728,8 @@ class DNPairBot:
 
         except Exception as e:
             self.logger.error(f"SELL_FIRST cycle failed: {e}")
+            # CRITICAL: Force close any open positions to prevent accumulation
+            await self._verify_and_force_close_all_positions()
             return False
 
     async def run_alternating_strategy(self) -> List[bool]:
@@ -2492,6 +3862,38 @@ class DNPairBot:
             f"[INIT] SOL client initialized (contract: {self.sol_contract_id}, tick: {self.sol_tick_size}, ws: {self.sol_client._ws_connected})"
         )
 
+        # Subscribe to position changes for real-time monitoring
+        from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
+
+        if WEBSOCKET_AVAILABLE:
+            # Subscribe to ETH position changes
+            if self.eth_client._ws_client:
+                try:
+                    await self.eth_client._ws_client.subscribe(
+                        stream_type="position_change",
+                        product_id=self.eth_client.config.contract_id,
+                        subaccount=self.eth_client.subaccount_hex,
+                        callback=self._on_position_change
+                    )
+                    self.logger.info("[INIT] Subscribed to ETH position_change stream")
+                except Exception as e:
+                    self.logger.warning(f"[INIT] Failed to subscribe to ETH position_change: {e}")
+
+            # Subscribe to SOL position changes
+            if self.sol_client._ws_client:
+                try:
+                    await self.sol_client._ws_client.subscribe(
+                        stream_type="position_change",
+                        product_id=self.sol_client.config.contract_id,
+                        subaccount=self.sol_client.subaccount_hex,
+                        callback=self._on_position_change
+                    )
+                    self.logger.info("[INIT] Subscribed to SOL position_change stream")
+                except Exception as e:
+                    self.logger.warning(f"[INIT] Failed to subscribe to SOL position_change: {e}")
+        else:
+            self.logger.info("[INIT] WebSocket not available - position_change streaming disabled")
+
 
 
 
@@ -2576,7 +3978,7 @@ Examples:
     parser.add_argument(
         '--enable-partial-fills',
         action='store_true',
-        help='Accept partial fills >= 50% of order size'
+        help='Accept partial fills >= 50%% of order size'
     )
     parser.add_argument(
         '--enable-dynamic-timeout',
@@ -2602,6 +4004,25 @@ Examples:
         type=float,
         default=0.5,
         help='Minimum partial fill ratio to accept (default: 0.5)'
+    )
+
+    # Static TP parameters (Phase 2)
+    parser.add_argument(
+        '--enable-static-tp',
+        action='store_true',
+        help='Enable static individual TP per position (default: disabled)'
+    )
+    parser.add_argument(
+        '--tp-bps',
+        type=float,
+        default=10.0,
+        help='TP threshold in bps per position (default: 10.0)'
+    )
+    parser.add_argument(
+        '--tp-timeout',
+        type=int,
+        default=60,
+        help='Max wait time for TP hit before fallback in seconds (default: 60)'
     )
 
     return parser.parse_args()
@@ -2637,30 +4058,24 @@ async def main():
         queue_threshold_ratio=getattr(args, 'queue_threshold_ratio', 0.5),
         spread_threshold_ticks=getattr(args, 'spread_threshold_ticks', 5),
         min_partial_fill_ratio=getattr(args, 'min_partial_fill_ratio', 0.5),
+        # Static TP parameters (Phase 2)
+        enable_static_tp=getattr(args, 'enable_static_tp', False),
+        tp_bps=getattr(args, 'tp_bps', 10.0),
+        tp_timeout=getattr(args, 'tp_timeout', 60),
     )
 
     # Initialize clients
     await bot.initialize_clients()
 
     # STARTUP CHECK: Verify no residual positions
+    # Use WebSocket positions for real-time detection (REST API has 20+ second lag)
     print("\n[STARTUP] Checking for residual positions...")
-    eth_pos = await bot.eth_client.get_account_positions()
-    sol_pos = await bot.sol_client.get_account_positions()
 
-    print(f"[STARTUP] ETH position: {eth_pos}")
-    print(f"[STARTUP] SOL position: {sol_pos}")
+    # Wait for WebSocket to receive initial position sync
+    await bot._wait_for_ws_position_sync(timeout=5.0)
 
-    POSITION_TOLERANCE = Decimal("0.001")
-    if abs(eth_pos) > POSITION_TOLERANCE or abs(sol_pos) > POSITION_TOLERANCE:
-        print(f"\n[WARNING] Residual positions detected!")
-        print(f"  ETH: {eth_pos}")
-        print(f"  SOL: {sol_pos}")
-        print(f"\n[SAFETY] Please close positions manually before starting the bot.")
-        print(f"  - Use the exchange interface to close positions")
-        print(f"  - Or use a separate close-positions script")
-        sys.exit(1)
-
-    print("[STARTUP] No residual positions. Ready to start.\n")
+    # Check for residual positions using WebSocket priority
+    await bot._check_residual_positions_at_startup()
 
     # Run alternating strategy
     await bot.run_alternating_strategy()
