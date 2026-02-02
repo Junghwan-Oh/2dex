@@ -992,11 +992,21 @@ class DNPairBot:
             entry_timestamp = datetime.now(pytz.UTC).isoformat()
 
             if eth_fill_qty > 0:
+                # CRITICAL: Ensure entry price is valid, fetch from market if missing
+                if not eth_fill_price or eth_fill_price == 0:
+                    eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
+                    eth_fill_price = eth_ask if eth_direction == "buy" else eth_bid
+                    self.logger.warning(f"[BUILD] ETH fill price missing, using market price: ${eth_fill_price}")
                 self.entry_prices["ETH"] = eth_fill_price
                 self.entry_quantities["ETH"] += eth_fill_qty
                 self.entry_timestamps["ETH"] = entry_timestamp
 
             if sol_fill_qty > 0:
+                # CRITICAL: Ensure entry price is valid, fetch from market if missing
+                if not sol_fill_price or sol_fill_price == 0:
+                    sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
+                    sol_fill_price = sol_ask if sol_direction == "buy" else sol_bid
+                    self.logger.warning(f"[BUILD] SOL fill price missing, using market price: ${sol_fill_price}")
                 self.entry_prices["SOL"] = sol_fill_price
                 self.entry_quantities["SOL"] += sol_fill_qty
                 self.entry_timestamps["SOL"] = entry_timestamp
@@ -1217,6 +1227,56 @@ class DNPairBot:
 
         except Exception as e:
             self.logger.error(f"[CLEANUP] Error during position cleanup: {e}")
+
+    async def _verify_positions_before_build(self) -> bool:
+        """Verify positions using REST API before starting BUILD cycle.
+
+        This is a safety check to prevent position accumulation by verifying
+        that positions are actually closed using REST API before starting a new cycle.
+
+        Returns:
+            True if positions are closed (or successfully closed), False otherwise.
+        """
+        from decimal import Decimal
+        POSITION_TOLERANCE = Decimal("0.001")
+
+        try:
+            eth_rest = await self.eth_client.get_account_positions()
+            sol_rest = await self.sol_client.get_account_positions()
+
+            self.logger.info(f"[SAFETY] REST API positions: ETH={eth_rest}, SOL={sol_rest}")
+
+            if abs(eth_rest) > POSITION_TOLERANCE or abs(sol_rest) > POSITION_TOLERANCE:
+                self.logger.error(
+                    f"[SAFETY] Positions not closed before BUILD: "
+                    f"ETH={eth_rest}, SOL={sol_rest}. Attempting to close..."
+                )
+
+                if abs(eth_rest) > POSITION_TOLERANCE:
+                    await self._force_close_position("ETH")
+                if abs(sol_rest) > POSITION_TOLERANCE:
+                    await self._force_close_position("SOL")
+
+                eth_rest = await self.eth_client.get_account_positions()
+                sol_rest = await self.sol_client.get_account_positions()
+
+                if abs(eth_rest) > POSITION_TOLERANCE or abs(sol_rest) > POSITION_TOLERANCE:
+                    self.logger.error(
+                        f"[SAFETY] Failed to close positions before BUILD: "
+                        f"ETH={eth_rest}, SOL={sol_rest}. ABORTING."
+                    )
+                    return False
+
+                self.logger.info("[SAFETY] Positions successfully closed before BUILD")
+
+            self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+            self.logger.info("[CYCLE START] WebSocket positions reset after REST verification")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[SAFETY] Error during position verification: {e}")
+            return False
 
     async def emergency_unwind_eth(self):
         """Emergency unwind ETH position (handles both long and short).
@@ -2326,7 +2386,7 @@ class DNPairBot:
     async def _monitor_static_individual_tp(
         self,
         tp_threshold_bps: float = 10.0,
-        timeout_seconds: int = 60
+        timeout_seconds: int = 600  # Increased to 10 minutes for better TP hit chance
     ) -> tuple[bool, str]:
         """
         Monitor individual positions and exit when TP hit.
@@ -2353,8 +2413,7 @@ class DNPairBot:
         from decimal import Decimal
         import asyncio
 
-        LEVERAGE = 5  # 5x leverage from nado.py
-        tp_threshold = Decimal(str(tp_threshold_bps / 10000)) / LEVERAGE
+        tp_threshold = Decimal(str(tp_threshold_bps / 10000))  # 0.02% for quicker exits
         POSITION_TOLERANCE = Decimal("0.001")
 
         start_time = time.time()
@@ -2379,8 +2438,12 @@ class DNPairBot:
             eth_qty = self.entry_quantities.get("ETH") or Decimal("0")
             sol_qty = self.entry_quantities.get("SOL") or Decimal("0")
 
-            if eth_entry_price == 0 or sol_entry_price == 0:
-                self.logger.warning("[STATIC TP] No entry data available")
+            # Allow individual position monitoring - check each separately
+            eth_available = eth_entry_price > 0 and eth_qty > 0
+            sol_available = sol_entry_price > 0 and sol_qty > 0
+
+            if not eth_available and not sol_available:
+                self.logger.warning("[STATIC TP] No entry data available for either position")
                 return False, "no_entry_data"
 
             # CRITICAL: Use tracked entry_directions, not derive from quantity sign
@@ -2390,22 +2453,27 @@ class DNPairBot:
             eth_direction = "long" if eth_entry_direction == "buy" else "short"
             sol_direction = "long" if sol_entry_direction == "buy" else "short"
 
-            if eth_direction == "long":
-                eth_pnl_pct = (eth_bid - eth_entry_price) / eth_entry_price
-            else:
-                eth_pnl_pct = (eth_entry_price - eth_ask) / eth_entry_price
+            eth_pnl_pct = Decimal("0")
+            sol_pnl_pct = Decimal("0")
 
-            if sol_direction == "long":
-                sol_pnl_pct = (sol_bid - sol_entry_price) / sol_entry_price
-            else:
-                sol_pnl_pct = (sol_entry_price - sol_ask) / sol_entry_price
+            if eth_available:
+                if eth_direction == "long":
+                    eth_pnl_pct = (eth_bid - eth_entry_price) / eth_entry_price
+                else:
+                    eth_pnl_pct = (eth_entry_price - eth_ask) / eth_entry_price
+
+            if sol_available:
+                if sol_direction == "long":
+                    sol_pnl_pct = (sol_bid - sol_entry_price) / sol_entry_price
+                else:
+                    sol_pnl_pct = (sol_entry_price - sol_ask) / sol_entry_price
 
             self.logger.info(
-                f"[STATIC TP] ETH: {eth_pnl_pct*100:.2f}% ({eth_direction}), "
-                f"SOL: {sol_pnl_pct*100:.2f}% ({sol_direction}), target: +{tp_threshold_bps}bps"
+                f"[STATIC TP] ETH: {eth_pnl_pct*100:.2f}% ({eth_direction}, {'active' if eth_available else 'inactive'}), "
+                f"SOL: {sol_pnl_pct*100:.2f}% ({sol_direction}, {'active' if sol_available else 'inactive'}), target: +{tp_threshold_bps}bps"
             )
 
-            if eth_pnl_pct >= tp_threshold:
+            if eth_available and eth_pnl_pct >= tp_threshold:
                 self.logger.info(
                     f"[STATIC TP] ETH TP hit: {eth_pnl_pct*100:.2f}% >= {tp_threshold_bps}bps"
                 )
@@ -2413,7 +2481,7 @@ class DNPairBot:
                 self._tp_hit_pnl_pct = float(eth_pnl_pct) * 100
                 return True, f"static_tp_eth_{eth_pnl_pct*100:.2f}bps"
 
-            if sol_pnl_pct >= tp_threshold:
+            if sol_available and sol_pnl_pct >= tp_threshold:
                 self.logger.info(
                     f"[STATIC TP] SOL TP hit: {sol_pnl_pct*100:.2f}% >= {tp_threshold_bps}bps"
                 )
@@ -2444,9 +2512,8 @@ class DNPairBot:
         from nado_protocol.utils.subaccount import SubaccountParams
         from nado_protocol.engine_client.types.execute import ResponseStatus
 
-        LEVERAGE = 5
-        TP_THRESHOLD_BPS = 10  # 10bps = 0.1%
-        tp_threshold = Decimal(str(TP_THRESHOLD_BPS / 10000)) / LEVERAGE
+        TP_THRESHOLD_BPS = 2  # 2bps = 0.02% for quicker exits
+        tp_threshold = Decimal(str(TP_THRESHOLD_BPS / 10000))  # 0.02%
 
         self._tp_order_ids = {}  # Store for tracking
 
@@ -2624,7 +2691,7 @@ class DNPairBot:
             quantity=close_qty,
             direction=close_side,
             price=close_price,
-            timeout_seconds=30
+            timeout_seconds=60
         )
 
         filled_size = self._get_filled_size(result)
@@ -2689,6 +2756,27 @@ class DNPairBot:
                 f"status={result.status if hasattr(result, 'status') else 'N/A'}, "
                 f"error={result.error_message if hasattr(result, 'error_message') else 'N/A'}"
             )
+            # RETRY: On timeout, try market order immediately
+            if hasattr(result, 'status') and result.status == 'TIMEOUT':
+                self.logger.warning(f"[CLOSE] {ticker} timeout - attempting immediate market order")
+                try:
+                    close_side = "sell" if entry_qty > 0 else "buy"
+                    market_result = await client.place_ioc_order(
+                        contract_id=contract_id,
+                        quantity=abs(entry_qty),
+                        direction=close_side
+                    )
+                    if market_result.success:
+                        filled_size = self._get_filled_size(market_result)
+                        self._exit_prices[ticker] = market_result.price if market_result.price else entry_price
+                        self._exit_quantities[ticker] += filled_size
+                        self.entry_quantities[ticker] = Decimal("0")
+                        self.logger.info(f"[CLOSE] {ticker} closed via MARKET order after timeout: {filled_size}")
+                        return True
+                    else:
+                        self.logger.critical(f"[CLOSE] {ticker} MARKET order also failed after timeout!")
+                except Exception as e:
+                    self.logger.critical(f"[CLOSE] {ticker} MARKET order exception after timeout: {e}")
             return False
 
     async def _check_and_close_remaining_position(self, closed_position: str) -> bool:
@@ -3568,7 +3656,7 @@ class DNPairBot:
     async def execute_dn_pair_cycle(self) -> bool:
         """Execute full DN pair cycle: BUILD + UNWIND."""
         try:
-            build_success = await self.execute_build_cycle()
+            build_success = await self.execute_build_cycle("buy", "sell")
             if not build_success:
                 return False
 
@@ -3614,14 +3702,17 @@ class DNPairBot:
             "exit_time": None
         }
 
+        # Verify positions are closed before starting new cycle
+        positions_verified = await self._verify_positions_before_build()
+        if not positions_verified:
+            self.logger.error("[CYCLE START] Positions not verified. Aborting cycle.")
+            return False
+
         # Clear previous entry state
         self.entry_prices = {"ETH": None, "SOL": None}
         self.entry_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+        self.entry_directions = {"ETH": None, "SOL": None}  # CRITICAL: Reset entry directions to prevent stale data
         self.entry_timestamps = {"ETH": None, "SOL": None}
-
-        # Reset WebSocket position tracking to prevent stale data from previous cycles
-        self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
-        self.logger.info("[CYCLE START] Reset WebSocket position tracking to 0")
 
         try:
             # BUILD: Long ETH / Short SOL
@@ -3681,14 +3772,17 @@ class DNPairBot:
             "exit_time": None
         }
 
+        # Verify positions are closed before starting new cycle
+        positions_verified = await self._verify_positions_before_build()
+        if not positions_verified:
+            self.logger.error("[CYCLE START] Positions not verified. Aborting cycle.")
+            return False
+
         # Clear previous entry state
         self.entry_prices = {"ETH": None, "SOL": None}
         self.entry_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+        self.entry_directions = {"ETH": None, "SOL": None}  # CRITICAL: Reset entry directions to prevent stale data
         self.entry_timestamps = {"ETH": None, "SOL": None}
-
-        # Reset WebSocket position tracking to prevent stale data from previous cycles
-        self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
-        self.logger.info("[CYCLE START] Reset WebSocket position tracking to 0")
 
         try:
             # BUILD: Short ETH / Long SOL (opposite of buy_first)
