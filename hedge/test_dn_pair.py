@@ -136,10 +136,24 @@ class SimpleDNPairBot:
         self.logger.info(f"ETH: Buy {eth_qty:.4f} @ ${eth_price:.2f} (slippage: {eth_slippage:.1f} bps)")
         self.logger.info(f"SOL: Sell {sol_qty:.4f} @ ${sol_price:.2f} (slippage: {sol_slippage:.1f} bps)")
 
-        # Place IOC orders
+        # Place limit orders with timeout
         eth_result, sol_result = await asyncio.gather(
-            self.eth_client.place_ioc_order(4, eth_qty, "buy"),
-            self.sol_client.place_ioc_order(8, sol_qty, "sell"),
+            self.eth_client.place_limit_order_with_timeout(
+                contract_id=4,
+                quantity=eth_qty,
+                direction="buy",
+                price=None,
+                timeout_seconds=30,
+                max_retries=2
+            ),
+            self.sol_client.place_limit_order_with_timeout(
+                contract_id=8,
+                quantity=sol_qty,
+                direction="sell",
+                price=None,
+                timeout_seconds=30,
+                max_retries=2
+            ),
             return_exceptions=True
         )
 
@@ -159,7 +173,7 @@ class SimpleDNPairBot:
             self.logger.error(f"SOL order failed: {sol_result.error_message}")
 
     async def close_positions(self):
-        """Close all positions using IOC orders"""
+        """Close all positions using limit orders with timeout"""
         self.logger.info("Closing positions...")
 
         eth_pos = await self.eth_client.get_account_positions()
@@ -170,7 +184,14 @@ class SimpleDNPairBot:
         if abs(eth_pos) > Decimal("0.001"):
             side = "sell" if eth_pos > 0 else "buy"
             self.logger.info(f"Closing ETH position: {eth_pos} ({side})")
-            result = await self.eth_client.place_ioc_order(4, abs(eth_pos), side)
+            result = await self.eth_client.place_limit_order_with_timeout(
+                contract_id=4,
+                quantity=abs(eth_pos),
+                direction=side,
+                price=None,
+                timeout_seconds=30,
+                max_retries=2
+            )
             if result.success:
                 self.logger.info(f"ETH position closed: {result.filled_size} @ ${result.price}")
             else:
@@ -180,20 +201,41 @@ class SimpleDNPairBot:
         if abs(sol_pos) > Decimal("0.001"):
             side = "buy" if sol_pos < 0 else "sell"  # If short, buy to close; if long, sell to close
             self.logger.info(f"Closing SOL position: {sol_pos} ({side})")
-            result = await self.sol_client.place_ioc_order(8, abs(sol_pos), side)
+            result = await self.sol_client.place_limit_order_with_timeout(
+                contract_id=8,
+                quantity=abs(sol_pos),
+                direction=side,
+                price=None,
+                timeout_seconds=30,
+                max_retries=2
+            )
             if result.success:
                 self.logger.info(f"SOL position closed: {result.filled_size} @ ${result.price}")
             else:
                 self.logger.error(f"SOL close failed: {result.error_message}")
 
     async def close_all_positions(self, eth_pos, sol_pos):
-        """Close any existing positions using IOC orders"""
+        """Close any existing positions using limit orders with timeout"""
         if abs(eth_pos) > Decimal("0.001"):
             side = "sell" if eth_pos > 0 else "buy"
-            await self.eth_client.place_ioc_order(4, abs(eth_pos), side)
+            await self.eth_client.place_limit_order_with_timeout(
+                contract_id=4,
+                quantity=abs(eth_pos),
+                direction=side,
+                price=None,
+                timeout_seconds=30,
+                max_retries=2
+            )
         if abs(sol_pos) > Decimal("0.001"):
             side = "buy" if sol_pos < 0 else "sell"
-            await self.sol_client.place_ioc_order(8, abs(sol_pos), side)
+            await self.sol_client.place_limit_order_with_timeout(
+                contract_id=8,
+                quantity=abs(sol_pos),
+                direction=side,
+                price=None,
+                timeout_seconds=30,
+                max_retries=2
+            )
 
 
 def parse_args():

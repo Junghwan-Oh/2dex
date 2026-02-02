@@ -421,12 +421,12 @@ class DNPairBot:
         from decimal import Decimal
 
         # Debug: Log full message to understand the actual format
-        self.logger.debug(f"[POSITION CHANGE] Raw data: {data}")
-        self.logger.info(f"[POSITION CHANGE] Keys: {list(data.keys())}")
+        product_id = data.get("product_id")
+        amount_raw = data.get("amount", "0")
+        self.logger.info(f"[POSITION CHANGE] product_id={product_id}, amount_raw={amount_raw}, type={type(amount_raw)}")
 
         try:
             # Determine which ticker this update is for
-            product_id = data.get("product_id")
             if product_id == self.eth_client.config.contract_id:
                 ticker = "ETH"
             elif product_id == self.sol_client.config.contract_id:
@@ -436,11 +436,11 @@ class DNPairBot:
                 return
 
             # Extract position data (actual format from Nado WebSocket)
-            # The amount field is in raw contract units (wei/atomic units)
-            # ETH uses 1e18 (18 decimal places), SOL uses 1e9 (9 decimal places)
-            amount_raw = data.get("amount", "0")
-            precision = Decimal("1e18") if ticker == "ETH" else Decimal("1e9")
+            # The amount field is in x18 format for both ETH and SOL
+            # Both use 1e18 (18 decimal places)
+            precision = Decimal("1e18")
             amount = Decimal(str(amount_raw)) / precision if amount_raw else Decimal("0")
+            self.logger.info(f"[POSITION CHANGE] {ticker}: amount_raw={amount_raw}, precision={precision}, amount={amount}")
             v_quote_amount = data.get("v_quote_amount", "0")  # USD value
             reason = data.get("reason", "")
 

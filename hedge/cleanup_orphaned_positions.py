@@ -59,10 +59,10 @@ async def cleanup_orphaned_positions():
                     best_bid = Decimal(str(orderbook.bids[0][0]))
                     best_ask = Decimal(str(orderbook.asks[0][0]))
 
-                    # Taker pricing for IOC
+                    # Taker pricing for limit order
                     close_price = best_bid if side == 'sell' else best_ask
 
-                    # Build IOC order to close
+                    # Build limit order to close (POST-only with timeout)
                     order = OrderParams(
                         sender=SubaccountParams(
                             subaccount_owner=orphaned_owner,
@@ -73,7 +73,7 @@ async def cleanup_orphaned_positions():
                         expiration=get_expiration_timestamp(60),
                         nonce=gen_order_nonce(),
                         appendix=build_appendix(
-                            order_type=OrderType.IOC,
+                            order_type=OrderType.LIMIT,
                             isolated=True,
                         )
                     )

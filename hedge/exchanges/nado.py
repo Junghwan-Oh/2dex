@@ -150,6 +150,11 @@ class NadoClient(BaseExchangeClient):
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {missing_vars}")
 
+    @property
+    def subaccount_hex(self) -> str:
+        """Get subaccount hex string for WebSocket subscriptions."""
+        return subaccount_to_hex(self.owner, self.subaccount_name)
+
     async def connect(self) -> None:
         """Connect to Nado (setup WebSocket for BBO if available)."""
         # Log WebSocket availability at start
@@ -695,6 +700,268 @@ class NadoClient(BaseExchangeClient):
 
         return OrderResult(success=False, error_message='Max retries exceeded')
 
+    async def place_limit_order_with_timeout(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        direction: str,
+        price: Decimal = None,
+        timeout_seconds: int = None,
+        max_retries: int = 3
+    ) -> OrderResult:
+        """Place a limit order with timeout and automatic retry with price improvement.
+
+        This method places a limit order and polls for fill. If not fully filled
+        within timeout, it places new orders with improved pricing (2 bps, 4 bps, 6 bps).
+
+        Args:
+            contract_id: Product ID (e.g., "4" for ETH)
+            quantity: Order quantity
+            direction: "buy" or "sell"
+            price: Limit price (if None, uses at-touch BBO pricing)
+            timeout_seconds: Timeout in seconds (if None, calculated from quantity)
+            max_retries: Maximum retry attempts with price improvement (default: 3)
+
+        Returns:
+            OrderResult with cumulative fill information across all retries
+        """
+        from decimal import ROUND_UP
+
+        # Convert to product_id int
+        product_id_int = int(contract_id)
+
+        # Step 1: Fetch BBO prices if price not provided
+        if price is None:
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+            # Use at-touch pricing
+            price = best_bid if direction == 'buy' else best_ask
+
+        original_price = price
+
+        # Step 2: Round quantity UP to size increment
+        rounded_quantity = self._round_quantity_up_to_size_increment(product_id_int, quantity)
+        if rounded_quantity == 0:
+            return OrderResult(success=False, error_message=f'Quantity {quantity} too small (rounds to 0)')
+
+        # Step 3: Calculate timeout if not provided
+        if timeout_seconds is None:
+            timeout_seconds = self.calculate_timeout(quantity, None)
+
+        # Track cumulative fills across retries
+        cumulative_filled_size = Decimal('0')
+        cumulative_fill_value = Decimal('0')  # For average price calculation
+        remaining_quantity = rounded_quantity
+
+        # Price improvement progression: 2, 4, 6 bps
+        improvement_steps = [2, 4, 6]
+
+        for attempt in range(max_retries):
+            try:
+                # Calculate price improvement for retries
+                if attempt > 0:
+                    improvement_bps = improvement_steps[attempt - 1] if attempt <= len(improvement_steps) else improvement_steps[-1]
+                    if direction == 'buy':
+                        # Buy: improve by lowering price (pay less)
+                        price = original_price * (Decimal('1') - Decimal(str(improvement_bps)) / Decimal('10000'))
+                    else:
+                        # Sell: improve by raising price (get more)
+                        price = original_price * (Decimal('1') + Decimal(str(improvement_bps)) / Decimal('10000'))
+                    price = self._round_price_to_increment(product_id_int, price)
+
+                self.logger.log(
+                    f"Limit order attempt {attempt + 1}/{max_retries}: "
+                    f"{direction} {remaining_quantity} @ ${price} (timeout={timeout_seconds}s)",
+                    "INFO"
+                )
+
+                # Step 4: Place limit order using existing method
+                order_result = await self.place_limit_order(
+                    contract_id=contract_id,
+                    quantity=remaining_quantity,
+                    direction=direction,
+                    price=price
+                )
+
+                if not order_result.success:
+                    self.logger.log(f"Failed to place limit order attempt {attempt + 1}: {order_result.error_message}", "ERROR")
+                    continue
+
+                order_id = order_result.order_id
+
+                # Step 5: Poll for fill using helper
+                poll_result = await self._poll_until_fill_or_timeout(order_id, timeout_seconds)
+
+                # Track fills
+                attempt_filled_size = poll_result['filled_size']
+                cumulative_filled_size += attempt_filled_size
+
+                # Calculate fill value for average price
+                if attempt_filled_size > 0:
+                    cumulative_fill_value += attempt_filled_size * price
+
+                # Step 6: Handle partial fills - retry with remaining quantity
+                if poll_result['status'] == 'FILLED':
+                    # Fully filled
+                    avg_price = cumulative_fill_value / cumulative_filled_size if cumulative_filled_size > 0 else Decimal('0')
+                    return OrderResult(
+                        success=True,
+                        order_id=order_id,
+                        side=direction,
+                        size=rounded_quantity,
+                        filled_size=cumulative_filled_size,
+                        price=avg_price,
+                        status='FILLED'
+                    )
+                elif poll_result['status'] == 'TIMEOUT':
+                    # Check if we got any fill
+                    if attempt_filled_size > 0:
+                        # Partial fill - continue to next attempt with remaining quantity
+                        remaining_quantity -= attempt_filled_size
+                        self.logger.log(
+                            f"Partial fill on attempt {attempt + 1}: {attempt_filled_size}/{rounded_quantity}, "
+                            f"remaining: {remaining_quantity}",
+                            "INFO"
+                        )
+                        # Continue to next retry
+                    else:
+                        # No fill - this attempt timed out with zero fill
+                        if attempt < max_retries - 1:
+                            remaining_quantity = rounded_quantity  # Reset to original quantity
+                            self.logger.log(f"No fill on attempt {attempt + 1}, retrying with improved price", "INFO")
+                        else:
+                            # Last attempt failed completely
+                            avg_price = cumulative_fill_value / cumulative_filled_size if cumulative_filled_size > 0 else Decimal('0')
+                            return OrderResult(
+                                success=cumulative_filled_size > 0,
+                                order_id=order_id,
+                                side=direction,
+                                size=rounded_quantity,
+                                filled_size=cumulative_filled_size,
+                                price=avg_price,
+                                status='TIMEOUT'
+                            )
+                else:
+                    # CANCELED, ERROR - check if we got partial fill
+                    if attempt_filled_size > 0:
+                        remaining_quantity -= attempt_filled_size
+                        avg_price = cumulative_fill_value / cumulative_filled_size if cumulative_filled_size > 0 else Decimal('0')
+                        # Return with partial fill status
+                        return OrderResult(
+                            success=True,
+                            order_id=order_id,
+                            side=direction,
+                            size=rounded_quantity,
+                            filled_size=cumulative_filled_size,
+                            price=avg_price,
+                            status='PARTIALLY_FILLED'
+                        )
+                    else:
+                        # No fill, try next attempt
+                        if attempt < max_retries - 1:
+                            remaining_quantity = rounded_quantity  # Reset to original quantity
+                        else:
+                            # Last attempt failed
+                            return OrderResult(
+                                success=False,
+                                error_message=f'Order failed after {max_retries} attempts',
+                                status='FAILED'
+                            )
+
+            except Exception as e:
+                self.logger.log(f"Error in limit order attempt {attempt + 1}: {e}", "ERROR")
+                if attempt < max_retries - 1:
+                    remaining_quantity = rounded_quantity  # Reset to original quantity for retry
+                    continue
+                else:
+                    return OrderResult(success=False, error_message=str(e))
+
+        # Final return if we exhausted retries
+        avg_price = cumulative_fill_value / cumulative_filled_size if cumulative_filled_size > 0 else Decimal('0')
+        if cumulative_filled_size > 0:
+            return OrderResult(
+                success=True,
+                side=direction,
+                size=rounded_quantity,
+                filled_size=cumulative_filled_size,
+                price=avg_price,
+                status='PARTIALLY_FILLED'
+            )
+        else:
+            return OrderResult(success=False, error_message='Max retries exceeded with no fills')
+
+    async def _poll_until_fill_or_timeout(
+        self,
+        order_id: str,
+        timeout_seconds: int
+    ) -> dict:
+        """Poll order status until filled or timeout.
+
+        Args:
+            order_id: Order ID to poll
+            timeout_seconds: Maximum time to wait for fill
+
+        Returns:
+            dict with:
+                - 'status': 'FILLED', 'TIMEOUT', 'CANCELED', or 'ERROR'
+                - 'filled_size': Decimal filled quantity
+        """
+        start_time = asyncio.get_event_loop().time()
+        polling_retries = 0
+
+        while True:
+            try:
+                order_info = await self.get_order_info(order_id)
+
+                if order_info is None:
+                    # Order not found, might be canceled or too old
+                    self.logger.log(f"Order {order_id} not found (may be canceled)", "WARN")
+                    return {'status': 'CANCELED', 'filled_size': Decimal('0')}
+
+                # Check if fully filled
+                if order_info.remaining_size == 0:
+                    self.logger.log(f"Order {order_id} fully filled", "INFO")
+                    return {'status': 'FILLED', 'filled_size': order_info.filled_size}
+
+                # Check if canceled/expired
+                if order_info.status in ('CANCELLED', 'EXPIRED', 'CANCELED'):
+                    self.logger.log(f"Order {order_id} status: {order_info.status}", "INFO")
+                    return {'status': 'CANCELED', 'filled_size': order_info.filled_size}
+
+            except Exception as e:
+                self.logger.log(f"Polling error for order {order_id}: {e}", "WARN")
+                polling_retries += 1
+                if polling_retries >= 3:
+                    # Too many polling errors, cancel order
+                    self.logger.log(f"Too many polling errors for order {order_id}, canceling", "ERROR")
+                    try:
+                        await self.cancel_order(order_id)
+                    except:
+                        pass
+                    return {'status': 'ERROR', 'filled_size': Decimal('0')}
+                await asyncio.sleep(0.1)
+
+            # Check timeout
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed >= timeout_seconds:
+                # Cancel order on timeout
+                self.logger.log(f"Order {order_id} timeout after {elapsed:.1f}s, canceling", "INFO")
+                try:
+                    await self.cancel_order(order_id)
+                except:
+                    pass  # Already canceled
+                # Get final status
+                try:
+                    final_info = await self.get_order_info(order_id)
+                    filled = final_info.filled_size if final_info else Decimal('0')
+                    self.logger.log(f"Order {order_id} timed out with partial fill: {filled}", "INFO")
+                    return {'status': 'TIMEOUT', 'filled_size': filled}
+                except:
+                    return {'status': 'TIMEOUT', 'filled_size': Decimal('0')}
+
+            await asyncio.sleep(0.1)  # Poll every 0.1s
+
     async def place_ioc_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an IOC (Immediate-Or-Cancel) order for immediate execution.
 
@@ -939,144 +1206,76 @@ class NadoClient(BaseExchangeClient):
             return (price / price_increment).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * price_increment
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a close order with Nado using official SDK.
+        """Place a close order using Limit Orders (not IOC).
 
-        CRITICAL FIXES:
-        - Uses IOC order type for immediate execution (not POST_ONLY)
-        - Includes isolated_margin calculation (required for isolated margin trading)
-        - Rounds quantity to size increment (same as place_ioc_order)
-        - Short expiration (60s) for immediate-or-cancel behavior
+        This method uses Limit Orders with timeout/polling mechanism instead of IOC.
+        The order is placed at a price with slippage tolerance and waits up to 30 seconds
+        for execution with automatic retries on failure.
+
+        Args:
+            contract_id: Contract ID (e.g., "4" for ETH, "8" for SOL)
+            quantity: Quantity to close (positive Decimal)
+            price: Reference price (not currently used, we fetch BBO)
+            side: Order side ('buy' or 'sell')
+
+        Returns:
+            OrderResult with execution status and details
         """
-        max_retries = 3
-        retry_count = 0
+        try:
+            # Fetch current market prices
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
-        while retry_count < max_retries:
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+
+            # Convert to product_id int
+            product_id_int = int(contract_id)
+
+            # Volatility-regime-based slippage tolerance
+            slippage_bps = 1
             try:
-                best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
-
-                if best_bid <= 0 or best_ask <= 0:
-                    return OrderResult(success=False, error_message='Invalid bid/ask prices')
-
-                # Convert to product_id int
-                product_id_int = int(contract_id)
-
-                # CRITICAL FIX #4: Volatility-regime-based slippage tolerance for IOC pricing
-                slippage_bps = 1
-                try:
-                    if hasattr(self, 'get_bbo_handler') and self.get_bbo_handler():
-                        spread_state = self.get_bbo_handler().get_spread_state()
-                        if spread_state == "WIDENING":
-                            slippage_bps = 2
-                        elif spread_state == "NARROWING":
-                            slippage_bps = 0.5
-                except Exception as e:
-                    self.logger.debug(f"[CLOSE IOC] Using default slippage: {e}")
-
-                # Progressive price improvement on retry
-                retry_improvement_bps = retry_count * 2  # 0, 2, 4 bps
-                total_slippage_bps = slippage_bps + retry_improvement_bps
-
-                # Apply combined slippage
-                if side.lower() == 'buy':
-                    order_price_raw = best_ask * (Decimal('1') + Decimal(str(total_slippage_bps)) / Decimal('10000'))
-                else:
-                    order_price_raw = best_bid * (Decimal('1') - Decimal(str(total_slippage_bps)) / Decimal('10000'))
-                order_price = self._round_price_to_increment(product_id_int, order_price_raw)
-
-                # CRITICAL FIX #3: Round quantity to size increment FIRST
-                rounded_quantity = self._round_quantity_to_size_increment(product_id_int, quantity)
-                if rounded_quantity == 0:
-                    return OrderResult(success=False, error_message=f'Quantity {quantity} too small (rounds to 0)')
-
-                # CRITICAL FIX #1: Calculate isolated margin for 5x leverage
-                # SDK requires x6 precision (6 decimal places) for isolated_margin parameter
-                notional_value = float(str(rounded_quantity)) * float(str(order_price))
-                leverage = 5.0
-                isolated_margin = int(notional_value / leverage * 10**6)  # x6 precision
-
-                self.logger.log(
-                    f"Close order: {side} {rounded_quantity} @ ${order_price}, "
-                    f"notional=${notional_value:.2f}, margin=${notional_value/leverage:.2f}",
-                    "INFO"
-                )
-
-                # Build order parameters with isolated_margin
-                order = OrderParams(
-                    sender=SubaccountParams(
-                        subaccount_owner=self.owner,
-                        subaccount_name=self.subaccount_name,
-                    ),
-                    priceX18=to_x18(float(str(order_price))),
-                    amount=to_x18(float(str(rounded_quantity))) if side.lower() == 'buy' else -to_x18(float(str(rounded_quantity))),
-                    expiration=get_expiration_timestamp(60),  # CRITICAL FIX #6: Short expiration for IOC
-                    nonce=gen_order_nonce(),
-                    appendix=build_appendix(
-                        order_type=OrderType.IOC,  # CRITICAL FIX #2: IOC for immediate execution
-                        isolated=True,
-                        isolated_margin=isolated_margin  # CRITICAL FIX #1: Required for isolated margin
-                    )
-                )
-
-                # Place the order
-                result = self.client.market.place_order({"product_id": product_id_int, "order": order})
-
-                if not result or result.status != ResponseStatus.SUCCESS:
-                    error_msg = result.error if result and result.error else 'Failed to place order'
-                    return OrderResult(
-                        success=False,
-                        error_message=error_msg,
-                        status='EXPIRED'
-                    )
-
-                if not result.data:
-                    return OrderResult(success=False, error_message='No data in order response', status='EXPIRED')
-
-                order_id = result.data.digest
-
-                # CRITICAL FIX #5: Immediately check order status to see if it filled
-                await asyncio.sleep(0.1)  # Brief wait for execution
-                order_info = await self.get_order_info(order_id)
-
-                if order_info is None:
-                    return OrderResult(
-                        success=False,
-                        error_message='Could not get order info',
-                        status='UNKNOWN'
-                    )
-
-                # Determine filled status
-                filled_size = order_info.filled_size
-                remaining_size = order_info.remaining_size
-
-                if remaining_size == 0:
-                    status = 'FILLED'
-                elif filled_size > 0:
-                    status = 'PARTIALLY_FILLED'
-                else:
-                    status = 'EXPIRED'
-
-                # Success only if there was actual fill
-                actual_fill = filled_size != 0
-                return OrderResult(
-                    success=actual_fill,
-                    order_id=order_id,
-                    side=side,
-                    size=rounded_quantity,
-                    filled_size=abs(filled_size) if filled_size != 0 else Decimal('0'),
-                    price=order_info.price,
-                    status=status
-                )
-
+                if hasattr(self, 'get_bbo_handler') and self.get_bbo_handler():
+                    spread_state = self.get_bbo_handler().get_spread_state()
+                    if spread_state == "WIDENING":
+                        slippage_bps = 2
+                    elif spread_state == "NARROWING":
+                        slippage_bps = 0.5
             except Exception as e:
-                self.logger.log(f"Error placing close order: {e}", "ERROR")
-                if retry_count < max_retries - 1:
-                    retry_count += 1
-                    await asyncio.sleep(0.05)
-                    continue
-                else:
-                    return OrderResult(success=False, error_message=str(e))
+                self.logger.debug(f"[CLOSE] Using default slippage: {e}")
 
-        return OrderResult(success=False, error_message='Max retries exceeded for close order')
+            # Calculate initial price with slippage
+            if side.lower() == 'buy':
+                order_price_raw = best_ask * (Decimal('1') + Decimal(str(slippage_bps)) / Decimal('10000'))
+            else:
+                order_price_raw = best_bid * (Decimal('1') - Decimal(str(slippage_bps)) / Decimal('10000'))
+            order_price = self._round_price_to_increment(product_id_int, order_price_raw)
+
+            # Round quantity to size increment
+            rounded_quantity = self._round_quantity_to_size_increment(product_id_int, quantity)
+            if rounded_quantity == 0:
+                return OrderResult(success=False, error_message=f'Quantity {quantity} too small (rounds to 0)')
+
+            self.logger.log(
+                f"Close order: {side} {rounded_quantity} @ ${order_price}",
+                "INFO"
+            )
+
+            # Use the timeout-based limit order method
+            # This handles retries, polling, and cancellation automatically
+            result = await self.place_limit_order_with_timeout(
+                contract_id=product_id_int,
+                quantity=rounded_quantity,
+                side=side,
+                price=order_price,
+                timeout_seconds=30,  # Reasonable timeout for closing positions
+                max_retries=3
+            )
+
+            return result
+
+        except Exception as e:
+            self.logger.log(f"Error placing close order: {e}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Nado using official SDK."""

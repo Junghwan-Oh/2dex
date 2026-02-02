@@ -33,7 +33,14 @@ async def close_position():
     if abs(sol_pos) > Decimal('0.001'):
         print(f'Closing SOL position: {sol_pos}')
         side = 'buy' if sol_pos < 0 else 'sell'
-        result = await sol_client.place_ioc_order(8, abs(sol_pos), side)
+        result = await sol_client.place_limit_order_with_timeout(
+            contract_id=8,
+            quantity=abs(sol_pos),
+            direction=side,
+            price=None,
+            timeout_seconds=60,
+            max_retries=3
+        )
         if result.success:
             print(f'Successfully closed: {result.filled_size} @ ${result.price}')
         else:
@@ -55,7 +62,14 @@ async def close_position():
     if abs(eth_pos) > Decimal('0.001'):
         print(f'Closing ETH position: {eth_pos}')
         side = 'sell' if eth_pos > 0 else 'buy'
-        result = await eth_client.place_ioc_order(4, abs(eth_pos), side)
+        result = await eth_client.place_limit_order_with_timeout(
+            contract_id=4,
+            quantity=abs(eth_pos),
+            direction=side,
+            price=None,
+            timeout_seconds=60,
+            max_retries=3
+        )
         if result.success:
             print(f'Successfully closed: {result.filled_size} @ ${result.price}')
         else:
