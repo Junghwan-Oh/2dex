@@ -82,12 +82,12 @@ class TestTPOrders:
 
         # Mock the context and trigger_client for both
         mock_eth_context = Mock()
-        mock_eth_trigger = AsyncMock()
+        mock_eth_trigger = Mock()
         mock_eth_context.trigger_client = mock_eth_trigger
         mock_eth_client.client.context = mock_eth_context
 
         mock_sol_context = Mock()
-        mock_sol_trigger = AsyncMock()
+        mock_sol_trigger = Mock()
         mock_sol_context.trigger_client = mock_sol_trigger
         mock_sol_client.client.context = mock_sol_context
 
@@ -97,8 +97,8 @@ class TestTPOrders:
         mock_result.data = MagicMock()
         mock_result.data.digest = "test_order_id"
 
-        mock_eth_trigger.place_price_trigger_order = AsyncMock(return_value=mock_result)
-        mock_sol_trigger.place_price_trigger_order = AsyncMock(return_value=mock_result)
+        mock_eth_trigger.place_price_trigger_order = Mock(return_value=mock_result)
+        mock_sol_trigger.place_price_trigger_order = Mock(return_value=mock_result)
 
         # Assign clients to bot
         bot.eth_client = mock_eth_client
@@ -143,7 +143,7 @@ class TestTPOrders:
 
         # Mock the context and trigger_client
         mock_context = Mock()
-        mock_trigger = AsyncMock()
+        mock_trigger = Mock()
         mock_context.trigger_client = mock_trigger
         mock_client.client.context = mock_context
 
@@ -152,7 +152,7 @@ class TestTPOrders:
         mock_result.status = ResponseStatus.SUCCESS
         mock_result.data = MagicMock()
         mock_result.data.digest = "test_order_id"
-        mock_trigger.place_price_trigger_order = AsyncMock(return_value=mock_result)
+        mock_trigger.place_price_trigger_order = Mock(return_value=mock_result)
 
         # Assign client to bot
         bot.eth_client = mock_client
@@ -206,7 +206,7 @@ class TestTPOrders:
 
         # Mock the context and trigger_client
         mock_context = Mock()
-        mock_trigger = AsyncMock()
+        mock_trigger = Mock()
         mock_context.trigger_client = mock_trigger
         mock_client.client.context = mock_context
 
@@ -215,7 +215,7 @@ class TestTPOrders:
         mock_result.status = ResponseStatus.SUCCESS
         mock_result.data = MagicMock()
         mock_result.data.digest = "test_order_id"
-        mock_trigger.place_price_trigger_order = AsyncMock(return_value=mock_result)
+        mock_trigger.place_price_trigger_order = Mock(return_value=mock_result)
 
         # Assign client to bot
         bot.eth_client = None  # Only test SOL
@@ -268,7 +268,7 @@ class TestTPOrders:
 
         # Mock the context and trigger_client
         mock_context = Mock()
-        mock_trigger = AsyncMock()
+        mock_trigger = Mock()
         mock_context.trigger_client = mock_trigger
         mock_client.client.context = mock_context
 
@@ -276,7 +276,7 @@ class TestTPOrders:
         mock_result = MagicMock()
         mock_result.status = ResponseStatus.FAILURE
         mock_result.error = "Insufficient margin"
-        mock_trigger.place_price_trigger_order = AsyncMock(return_value=mock_result)
+        mock_trigger.place_price_trigger_order = Mock(return_value=mock_result)
 
         # Assign client to bot
         bot.eth_client = mock_client
@@ -312,7 +312,7 @@ class TestTPOrders:
         mock_eth_client._round_price_to_increment = Mock(return_value=Decimal("2000.02"))
 
         mock_context = Mock()
-        mock_trigger = AsyncMock()
+        mock_trigger = Mock()
         mock_context.trigger_client = mock_trigger
         mock_eth_client.client.context = mock_context
 
@@ -320,7 +320,7 @@ class TestTPOrders:
         mock_result.status = ResponseStatus.SUCCESS
         mock_result.data = MagicMock()
         mock_result.data.digest = "test_order_id"
-        mock_trigger.place_price_trigger_order = AsyncMock(return_value=mock_result)
+        mock_trigger.place_price_trigger_order = Mock(return_value=mock_result)
 
         bot.eth_client = mock_eth_client
         bot.sol_client = None  # No SOL client

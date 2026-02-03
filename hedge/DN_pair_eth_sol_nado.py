@@ -207,6 +207,15 @@ class DNPairBot:
         # WebSocket position tracking for startup residual detection
         self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
         self._ws_initial_sync_complete = False  # Track if WebSocket has received initial position data
+
+        # Position tracking configuration (WebSocket position tracking fix)
+        self.USE_ASYNC_POSITION_WAIT = True  # Feature flag: enable async position waiting
+        self.POSITION_WAIT_TIMEOUT = 30  # Max seconds to wait for WebSocket position zero
+        self.POSITION_DRIFT_THRESHOLD = Decimal("0.1")  # Alert threshold for REST vs WS mismatch
+        self.POSITION_ZERO_CHECK_INTERVAL = 0.5  # Seconds between position checks during wait
+
+        # Position zero events dictionary (for signaling position zero via WebSocket)
+        self._position_zero_events = {}  # ticker -> asyncio.Event
         self._startup_data_source = None  # Track which data source was used for startup check
 
     def _setup_logger(self):
@@ -415,15 +424,37 @@ class DNPairBot:
     def _on_position_change(self, data: dict) -> None:
         """WebSocket callback for position changes.
 
+        PRINCIPLE: WebSocket is the PRIMARY source for real-time position tracking.
+        Nado's position_change stream is authoritative and provides immediate updates.
+
         This callback receives real-time position updates from Nado's WebSocket
-        position_change stream, enabling early detection of position imbalances.
+        position_change stream. The WebSocket stream is the trusted source for
+        position state - REST API is only used for startup verification.
+
+        WebSocket PositionChange events:
+        - Are real-time and authoritative
+        - Contain the absolute position size (not deltas)
+        - Are sent immediately after any position change
+        - Should be trusted as the primary position source
+
+        REST API is only used for:
+        1. Initial startup check (before WebSocket connects)
+        2. Emergency verification if WebSocket appears disconnected
         """
         from decimal import Decimal
+        import time
 
-        # Debug: Log full message to understand the actual format
+        # Track event sequence for debugging
+        if not hasattr(self, '_ws_event_sequence'):
+            self._ws_event_sequence = 0
+        self._ws_event_sequence += 1
+        event_seq = self._ws_event_sequence
+        event_time = time.time()
+
+        # Extract message data
         product_id = data.get("product_id")
         amount_raw = data.get("amount", "0")
-        self.logger.info(f"[POSITION CHANGE] product_id={product_id}, amount_raw={amount_raw}, type={type(amount_raw)}")
+        self.logger.info(f"[WS #{event_seq}] product_id={product_id}, amount_raw={amount_raw}, time={event_time:.3f}")
 
         try:
             # Determine which ticker this update is for
@@ -432,58 +463,267 @@ class DNPairBot:
             elif product_id == self.sol_client.config.contract_id:
                 ticker = "SOL"
             else:
-                self.logger.warning(f"[POSITION CHANGE] Unknown product_id: {product_id}")
+                self.logger.warning(f"[WS #{event_seq}] Unknown product_id: {product_id}")
                 return
 
             # Extract position data (actual format from Nado WebSocket)
             # The amount field is in x18 format for both ETH and SOL
-            # Both use 1e18 (18 decimal places)
             precision = Decimal("1e18")
             amount = Decimal(str(amount_raw)) / precision if amount_raw else Decimal("0")
-            self.logger.info(f"[POSITION CHANGE] {ticker}: amount_raw={amount_raw}, precision={precision}, amount={amount}")
-            v_quote_amount = data.get("v_quote_amount", "0")  # USD value
-            reason = data.get("reason", "")
 
             # Store in memory for real-time monitoring
             if not hasattr(self, '_ws_positions'):
                 self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
 
-            # For position_change events, the amount field contains the absolute position
-            # Calculate change from previous tracked value
+            # Get previous position
             old_pos = self._ws_positions.get(ticker, Decimal("0"))
-            new_pos = amount
 
-            # Update the tracked position
-            self._ws_positions[ticker] = new_pos
+            # CRITICAL: WebSocket is authoritative - update immediately
+            # The position_change stream provides absolute position, not deltas
+            new_pos_ws = amount
+            position_change = new_pos_ws - old_pos
+
+            # Update the position immediately - WebSocket is the primary source
+            self._ws_positions[ticker] = new_pos_ws
+
+            # Track last WebSocket update time for connection health
+            if not hasattr(self, '_ws_last_update_time'):
+                self._ws_last_update_time = {}
+            self._ws_last_update_time[ticker] = event_time
 
             # Mark sync as complete when we receive position data for both tickers
             if not self._ws_initial_sync_complete:
-                # Check if we have received data for both tickers
                 has_eth = "ETH" in self._ws_positions
                 has_sol = "SOL" in self._ws_positions
                 if has_eth and has_sol:
                     self._ws_initial_sync_complete = True
-                    self.logger.info("[POSITION SYNC] Initial WebSocket position sync complete")
+                    self.logger.info("[WS SYNC] Initial WebSocket position sync complete")
 
-            # For position_change events, calculate the delta
-            position_change = float(new_pos - old_pos) if old_pos > 0 else float(new_pos)
+            # Log the authoritative update
+            self.logger.info(
+                f"[WS #{event_seq}] {ticker}: {old_pos} -> {new_pos_ws} "
+                f"(delta={position_change:+.4f}) [AUTHORITATIVE]"
+            )
 
             # Log to CSV
             self.log_position_update(
                 ticker=ticker,
                 old_position=old_pos,
-                new_position=new_pos,
+                new_position=new_pos_ws,
                 cycle_id=str(self.iteration) if hasattr(self, 'iteration') else "",
-                source="websocket_position_change",
-                price=None  # Price not provided in position_change message
+                source="websocket_position_change_authoritative",
+                price=None
             )
 
-            self.logger.debug(
-                f"[POSITION CHANGE] {ticker}: amount={amount}, v_quote=${v_quote_amount}, reason={reason}"
-            )
+            # Signal position zero event if anyone is waiting
+            if new_pos_ws == Decimal("0"):
+                # Check if there's an active wait for this ticker
+                if hasattr(self, '_position_zero_events') and ticker in self._position_zero_events:
+                    event = self._position_zero_events.get(ticker)
+                    if event and not event.is_set():
+                        event.set()
+                        self.logger.debug(
+                            f"[WS #{event_seq}] Signaled position zero for {ticker}"
+                        )
 
         except Exception as e:
-            self.logger.error(f"[POSITION CHANGE] Error processing update: {e}")
+            self.logger.error(f"[WS #{event_seq}] Error processing update: {e}")
+            import traceback
+            self.logger.error(f"[WS #{event_seq}] Traceback: {traceback.format_exc()}")
+
+            # Signal position zero event even if there was an error (if position reached zero)
+            new_pos_ws = self._ws_positions.get(ticker, Decimal("0")) if hasattr(self, '_ws_positions') else Decimal("0")
+            if new_pos_ws == Decimal("0"):
+                if hasattr(self, '_position_zero_events') and ticker in self._position_zero_events:
+                    event = self._position_zero_events.get(ticker)
+                    if event and not event.is_set():
+                        event.set()
+                        self.logger.debug(
+                            f"[WS #{event_seq}] Signaled position zero for {ticker} (error path)"
+                        )
+
+    async def _wait_for_position_zero(
+        self,
+        ticker: str,
+        timeout: float = None
+    ) -> bool:
+        """Wait for WebSocket position to reach zero.
+
+        Creates a fresh asyncio.Event for each wait operation to avoid
+        race conditions and ensure clean state.
+
+        Args:
+            ticker: Trading pair symbol (e.g., "ETH", "SOL")
+            timeout: Max seconds to wait (uses POSITION_WAIT_TIMEOUT if None)
+
+        Returns:
+            True if position reached zero, False if timeout
+        """
+        from decimal import Decimal
+
+        # Feature flag check
+        if not self.USE_ASYNC_POSITION_WAIT:
+            self.logger.warning(
+                f"[WAIT] Feature flag disabled, skipping wait for {ticker}"
+            )
+            return True  # Assume success for backward compatibility
+
+        # Use configured timeout if not specified
+        if timeout is None:
+            timeout = self.POSITION_WAIT_TIMEOUT
+
+        # Check if already at zero
+        current_pos = self._ws_positions.get(ticker, Decimal("0"))
+        if current_pos == Decimal("0"):
+            self.logger.debug(f"[WAIT] {ticker} already at zero")
+            return True
+
+        # Create FRESH event for this wait operation
+        # (Do NOT reuse events - creates race conditions)
+        zero_event = asyncio.Event()
+
+        # Store event so _on_position_change() can signal it
+        if not hasattr(self, '_position_zero_events'):
+            self._position_zero_events = {}
+        self._position_zero_events[ticker] = zero_event
+
+        try:
+            # Wait for event to be set by _on_position_change()
+            await asyncio.wait_for(
+                zero_event.wait(),
+                timeout=timeout
+            )
+            self.logger.info(
+                f"[WAIT] {ticker} position confirmed zero via WebSocket"
+            )
+            return True
+
+        except asyncio.TimeoutError:
+            final_pos = self._ws_positions.get(ticker, Decimal("0"))
+            self.logger.warning(
+                f"[WAIT] Timeout waiting for {ticker} position zero. "
+                f"Current: {final_pos}, Timeout: {timeout}s"
+            )
+            return False
+
+        finally:
+            # Clean up event after use
+            if ticker in self._position_zero_events:
+                del self._position_zero_events[ticker]
+
+    async def _detect_position_drift(
+        self,
+        ticker: str,
+        client
+    ) -> Decimal:
+        """Check for position drift between REST API and WebSocket.
+
+        Args:
+            ticker: Trading pair symbol
+            client: NadoClient instance for REST API access
+
+        Returns:
+            Drift amount (abs(WebSocket - REST)). Positive means WebSocket
+            shows more position than REST.
+        """
+        from decimal import Decimal
+        from datetime import datetime
+        import pytz
+
+        # Get positions from both sources
+        rest_position = await client.get_account_positions()
+        ws_position = self._ws_positions.get(ticker, Decimal("0"))
+
+        # Calculate drift
+        drift = abs(ws_position - rest_position)
+
+        if drift > self.POSITION_DRIFT_THRESHOLD:
+            # Log detailed drift information
+            self.logger.warning(
+                f"[DRIFT] Position drift detected for {ticker}:\n"
+                f"  WebSocket: {ws_position}\n"
+                f"  REST API:  {rest_position}\n"
+                f"  Drift:     {drift}\n"
+                f"  Time:      {datetime.now(pytz.UTC).isoformat()}\n"
+                f"  Action:    Manual investigation required\n"
+                f"  NOTE:      TODO - Add alerting (Telegram/email) here"
+            )
+
+            # TODO: Add alerting integration
+            # - Send Telegram message
+            # - Send email alert
+            # - Emit Prometheus metric
+
+        return drift
+
+    async def _verify_and_sync_positions_from_rest(self, tickers=None, force_rest: bool = False) -> None:
+        """Verify positions - WebSocket is primary, REST is emergency backup.
+
+        PRINCIPLE: WebSocket position_change stream is the PRIMARY source.
+        REST API should ONLY be used for:
+        1. Initial startup before WebSocket connects
+        2. Emergency recovery if WebSocket appears broken
+
+        Args:
+            tickers: List of tickers to verify (e.g., ["ETH", "SOL"]). If None, verify all.
+            force_rest: If True, bypass WebSocket health check and use REST (emergency only)
+        """
+        from decimal import Decimal
+        import time
+
+        if tickers is None:
+            tickers = ["ETH", "SOL"]
+
+        # Check if WebSocket is healthy (received update within 30 seconds)
+        ws_healthy = True
+        if hasattr(self, '_ws_last_update_time'):
+            current_time = time.time()
+            for ticker in tickers:
+                last_update = self._ws_last_update_time.get(ticker, 0)
+                if current_time - last_update > 30:  # No update for 30 seconds
+                    ws_healthy = False
+                    self.logger.warning(
+                        f"[POSITION VERIFY] WebSocket appears unhealthy for {ticker} "
+                        f"(last update {current_time - last_update:.1f}s ago)"
+                    )
+
+        # Only use REST if forced or WebSocket is unhealthy
+        use_rest = force_rest or not ws_healthy
+
+        if use_rest:
+            self.logger.warning(
+                f"[POSITION VERIFY] Using REST API (force={force_rest}, ws_healthy={ws_healthy}) "
+                "- WebSocket should be primary source!"
+            )
+        else:
+            self.logger.info("[POSITION VERIFY] WebSocket healthy - trusting WS positions")
+            return  # Trust WebSocket, skip REST verification
+
+        for ticker in tickers:
+            try:
+                client = self.eth_client if ticker == "ETH" else self.sol_client
+                rest_pos = await client.get_account_positions()
+
+                if not hasattr(self, '_ws_positions'):
+                    self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+
+                ws_pos = self._ws_positions.get(ticker, Decimal("0"))
+                drift = abs(rest_pos - ws_pos)
+                POSITION_TOLERANCE = Decimal("0.001")
+
+                if drift > POSITION_TOLERANCE:
+                    self.logger.warning(
+                        f"[POSITION VERIFY] {ticker} drift: WS={ws_pos}, REST={rest_pos}, "
+                        f"drift={drift}. Syncing to REST (WS may have missed events)..."
+                    )
+                    self._ws_positions[ticker] = rest_pos
+                else:
+                    self.logger.info(
+                        f"[POSITION VERIFY] {ticker} aligned: WS={ws_pos}, REST={rest_pos}"
+                    )
+
+            except Exception as e:
+                self.logger.error(f"[POSITION VERIFY] Error verifying {ticker}: {e}")
 
     async def _wait_for_ws_position_sync(self, timeout: float = 5.0) -> bool:
         """
@@ -1125,6 +1365,7 @@ class DNPairBot:
     async def _force_close_position(self, ticker: str) -> bool:
         """Force close position with retry, handling settlement lag.
 
+        CRITICAL FIX: After closing, sync _ws_positions with REST API to prevent drift.
         This method is used during emergency unwind to ensure positions are
         fully closed even when settlement delays cause position checks to
         be temporarily inaccurate.
@@ -1155,6 +1396,25 @@ class DNPairBot:
 
                 if abs(current_pos) < POSITION_TOLERANCE:
                     self.logger.info(f"[FORCE] {ticker} position confirmed closed (pos={current_pos})")
+
+                    # Trust WebSocket to update via PositionChange event
+                    # Wait for confirmation if feature flag enabled
+                    if self.USE_ASYNC_POSITION_WAIT:
+                        wait_ok = await self._wait_for_position_zero(ticker, timeout=10)
+                        if not wait_ok:
+                            self.logger.warning(
+                                f"[FORCE] WebSocket timeout for {ticker}, checking drift"
+                            )
+                            drift = await self._detect_position_drift(ticker, client)
+                            if drift > self.POSITION_DRIFT_THRESHOLD:
+                                self.logger.warning(f"[FORCE] Drift detected: {drift}")
+                    else:
+                        # Feature flag disabled - use old behavior
+                        if not hasattr(self, '_ws_positions'):
+                            self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+                        self._ws_positions[ticker] = Decimal("0")
+                        self.logger.info(f"[FORCE] Synced WS position to REST: {ticker}=0 (legacy)")
+
                     return True
 
                 # Determine close side and quantity
@@ -1187,11 +1447,46 @@ class DNPairBot:
                         await asyncio.sleep(1)
                         final_pos = await client.get_account_positions()
                         if abs(final_pos) < POSITION_TOLERANCE:
+                            # Trust WebSocket to update via PositionChange event
+                            self.logger.info(f"[FORCE] {ticker} closed successfully")
+
+                            # Verify with drift check
+                            if self.USE_ASYNC_POSITION_WAIT:
+                                await asyncio.sleep(2)  # Give WebSocket time to update
+                                drift = await self._detect_position_drift(ticker, client)
+                                if drift > self.POSITION_DRIFT_THRESHOLD:
+                                    self.logger.warning(f"[FORCE] Drift after close: {drift}")
+                            else:
+                                # Feature flag disabled - use old behavior
+                                if not hasattr(self, '_ws_positions'):
+                                    self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+                                self._ws_positions[ticker] = Decimal("0")
+                                self.logger.info(f"[FORCE] Synced WS position to REST: {ticker}=0 (legacy)")
+
                             return True
                         else:
                             self.logger.warning(f"[FORCE] {ticker} still has position after close: {final_pos}")
+                            # Log but don't manually override - trust WebSocket
+                            self.logger.info(f"[FORCE] WebSocket will update {ticker} to {final_pos} via event")
                     else:
                         self.logger.warning(f"[FORCE] {ticker} partial fill: {filled_size}")
+                        # Calculate expected partial position
+                        partial_pos = current_pos - filled_size if close_side == "sell" else current_pos + filled_size
+
+                        # Log the expected change, but wait for WebSocket confirmation
+                        self.logger.info(
+                            f"[FORCE] Expecting position update for {ticker}: "
+                            f"{current_pos} -> {partial_pos} (partial fill)"
+                        )
+                        # WebSocket PositionChange event will update _ws_positions
+                        # Do NOT manually override - trust WebSocket to be authoritative
+
+                        # Optional: verify after short delay
+                        if self.USE_ASYNC_POSITION_WAIT:
+                            await asyncio.sleep(1)
+                            drift = await self._detect_position_drift(ticker, client)
+                            if drift > self.POSITION_DRIFT_THRESHOLD:
+                                self.logger.warning(f"[FORCE] Drift after partial fill: {drift}")
                 else:
                     self.logger.warning(f"[FORCE] {ticker} close attempt failed: {result.error_message}")
 
@@ -1204,6 +1499,9 @@ class DNPairBot:
     async def _verify_and_force_close_all_positions(self) -> None:
         """Verify and force close all positions to prevent accumulation.
 
+        CRITICAL FIX: Use REST API directly instead of WebSocket positions.
+        WebSocket positions may be stale or incorrect. REST API is ground truth.
+
         This is called in exception handlers to ensure no residual positions
         remain after errors or unexpected failures.
         """
@@ -1211,11 +1509,11 @@ class DNPairBot:
         POSITION_TOLERANCE = Decimal("0.001")
 
         try:
-            # NOTE: WebSocket positions are real-time; REST API has ~20s lag
-            eth_pos = self._ws_positions.get("ETH", Decimal("0"))
-            sol_pos = self._ws_positions.get("SOL", Decimal("0"))
+            # CRITICAL FIX: Use REST API (ground truth) instead of WebSocket
+            eth_pos = await self.eth_client.get_account_positions()
+            sol_pos = await self.sol_client.get_account_positions()
 
-            self.logger.warning(f"[CLEANUP] Checking positions (WS): ETH={eth_pos}, SOL={sol_pos}")
+            self.logger.warning(f"[CLEANUP] Checking positions (REST API): ETH={eth_pos}, SOL={sol_pos}")
 
             if abs(eth_pos) > POSITION_TOLERANCE:
                 self.logger.warning(f"[CLEANUP] Force closing ETH position: {eth_pos}")
@@ -1225,38 +1523,69 @@ class DNPairBot:
                 self.logger.warning(f"[CLEANUP] Force closing SOL position: {sol_pos}")
                 await self._force_close_position("SOL")
 
+            # WebSocket PositionChange events will automatically update positions to 0
+            self.logger.info("[CLEANUP] WebSocket will auto-sync positions to 0 via PositionChange events")
+
         except Exception as e:
             self.logger.error(f"[CLEANUP] Error during position cleanup: {e}")
 
     async def _verify_positions_before_build(self) -> bool:
-        """Verify positions using REST API before starting BUILD cycle.
+        """Verify positions before starting BUILD cycle.
 
-        This is a safety check to prevent position accumulation by verifying
-        that positions are actually closed using REST API before starting a new cycle.
+        PRINCIPLE: WebSocket is the PRIMARY source for position tracking.
+        REST API is only used as a backup if WebSocket is unhealthy.
 
         Returns:
             True if positions are closed (or successfully closed), False otherwise.
         """
         from decimal import Decimal
+        import time
         POSITION_TOLERANCE = Decimal("0.001")
 
         try:
-            eth_rest = await self.eth_client.get_account_positions()
-            sol_rest = await self.sol_client.get_account_positions()
+            # Primary: Use WebSocket positions if available and healthy
+            if hasattr(self, '_ws_positions') and self._ws_positions:
+                # Check if WebSocket is healthy (received update within 30 seconds)
+                ws_healthy = True
+                if hasattr(self, '_ws_last_update_time'):
+                    current_time = time.time()
+                    for ticker in ["ETH", "SOL"]:
+                        last_update = self._ws_last_update_time.get(ticker, 0)
+                        if current_time - last_update > 30:
+                            ws_healthy = False
+                            self.logger.warning(
+                                f"[SAFETY] WebSocket unhealthy for {ticker} "
+                                f"(last update {current_time - last_update:.1f}s ago)"
+                            )
 
-            self.logger.info(f"[SAFETY] REST API positions: ETH={eth_rest}, SOL={sol_rest}")
+                if ws_healthy:
+                    eth_pos = self._ws_positions.get("ETH", Decimal("0"))
+                    sol_pos = self._ws_positions.get("SOL", Decimal("0"))
+                    self.logger.info(f"[SAFETY] WebSocket positions: ETH={eth_pos}, SOL={sol_pos}")
+                else:
+                    # Fallback to REST API if WebSocket is unhealthy
+                    self.logger.warning("[SAFETY] WebSocket unhealthy, using REST API for verification")
+                    eth_pos = await self.eth_client.get_account_positions()
+                    sol_pos = await self.sol_client.get_account_positions()
+                    self.logger.info(f"[SAFETY] REST API positions: ETH={eth_pos}, SOL={sol_pos}")
+            else:
+                # No WebSocket data - use REST API
+                eth_pos = await self.eth_client.get_account_positions()
+                sol_pos = await self.sol_client.get_account_positions()
+                self.logger.info(f"[SAFETY] REST API positions (no WS): ETH={eth_pos}, SOL={sol_pos}")
 
-            if abs(eth_rest) > POSITION_TOLERANCE or abs(sol_rest) > POSITION_TOLERANCE:
+            if abs(eth_pos) > POSITION_TOLERANCE or abs(sol_pos) > POSITION_TOLERANCE:
                 self.logger.error(
                     f"[SAFETY] Positions not closed before BUILD: "
-                    f"ETH={eth_rest}, SOL={sol_rest}. Attempting to close..."
+                    f"ETH={eth_pos}, SOL={sol_pos}. Attempting to close..."
                 )
 
-                if abs(eth_rest) > POSITION_TOLERANCE:
+                if abs(eth_pos) > POSITION_TOLERANCE:
                     await self._force_close_position("ETH")
-                if abs(sol_rest) > POSITION_TOLERANCE:
+                if abs(sol_pos) > POSITION_TOLERANCE:
                     await self._force_close_position("SOL")
 
+                # Verify closure - use REST API as final authority
                 eth_rest = await self.eth_client.get_account_positions()
                 sol_rest = await self.sol_client.get_account_positions()
 
@@ -1269,8 +1598,28 @@ class DNPairBot:
 
                 self.logger.info("[SAFETY] Positions successfully closed before BUILD")
 
-            self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
-            self.logger.info("[CYCLE START] WebSocket positions reset after REST verification")
+                # Trust WebSocket to update via PositionChange events
+                # Wait for WebSocket to confirm zero (feature flag controlled)
+                if self.USE_ASYNC_POSITION_WAIT:
+                    eth_wait_ok = await self._wait_for_position_zero("ETH", timeout=10)
+                    sol_wait_ok = await self._wait_for_position_zero("SOL", timeout=10)
+
+                    if not (eth_wait_ok and sol_wait_ok):
+                        # Timeout - check for drift
+                        eth_drift = await self._detect_position_drift("ETH", self.eth_client)
+                        sol_drift = await self._detect_position_drift("SOL", self.sol_client)
+
+                        if eth_drift > self.POSITION_DRIFT_THRESHOLD or \
+                           sol_drift > self.POSITION_DRIFT_THRESHOLD:
+                            self.logger.error(
+                                "[SAFETY] Position drift detected after closure"
+                            )
+                            return False
+                else:
+                    # Feature flag disabled - use old behavior
+                    if hasattr(self, '_ws_positions'):
+                        self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+                        self.logger.info("[SAFETY] WebSocket positions reset (legacy)")
 
             return True
 
@@ -3155,6 +3504,11 @@ class DNPairBot:
             if self._is_fill_complete(eth_result) and self._is_fill_complete(sol_result):
                 self.logger.info(f"[BUILD] Both orders filled successfully on first attempt")
                 self._is_entry_phase = False
+
+                # WebSocket PositionChange events will automatically update positions
+                # No need for REST sync - WebSocket is the primary source
+                self.logger.info("[BUILD] WebSocket will auto-sync positions via PositionChange events")
+
                 await self._maybe_place_tp_orders()
 
                 # Log spread analysis at entry if orders succeeded
@@ -3276,6 +3630,10 @@ class DNPairBot:
                         self.logger.debug(f"[BUILD] Position check (may lag): ETH={eth_pos_check}, SOL={sol_pos_check}")
 
                         self._is_entry_phase = False
+
+                        # WebSocket PositionChange events will automatically update positions
+                        self.logger.info("[BUILD] WebSocket will auto-sync positions via PositionChange events")
+
                         await self._maybe_place_tp_orders()
 
                         # Log spread analysis at entry if orders succeeded
@@ -3304,6 +3662,10 @@ class DNPairBot:
                         # Positions are balanced, this is OK
                         self.logger.info(f"[BUILD] Both positions established and balanced")
                         self._is_entry_phase = False
+
+                        # WebSocket PositionChange events will automatically update positions
+                        self.logger.info("[BUILD] WebSocket will auto-sync positions via PositionChange events")
+
                         await self._maybe_place_tp_orders()
                         return True
 
@@ -3319,6 +3681,10 @@ class DNPairBot:
 
             self.logger.info(f"[BUILD] Both positions established")
             self._is_entry_phase = False
+
+            # WebSocket PositionChange events will automatically update positions
+            self.logger.info("[BUILD] WebSocket will auto-sync positions via PositionChange events")
+
             await self._maybe_place_tp_orders()
 
             # Log spread analysis at entry if orders succeeded
@@ -3640,6 +4006,9 @@ class DNPairBot:
                 exit_spread_info = getattr(self, '_exit_spread_info', {})
                 self._log_spread_analysis(entry_spread_info, exit_spread_info)
 
+                # WebSocket PositionChange events will automatically update positions to 0
+                self.logger.info("[UNWIND] WebSocket will auto-sync positions to 0 via PositionChange events")
+
                 # Clear entry state for next cycle
                 self.entry_prices = {"ETH": None, "SOL": None}
                 self.entry_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
@@ -3656,6 +4025,12 @@ class DNPairBot:
     async def execute_dn_pair_cycle(self) -> bool:
         """Execute full DN pair cycle: BUILD + UNWIND."""
         try:
+            # Clear previous entry state
+            self.entry_prices = {"ETH": None, "SOL": None}
+            self.entry_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+            self.entry_directions = {"ETH": None, "SOL": None}
+            self.entry_timestamps = {"ETH": None, "SOL": None}
+
             build_success = await self.execute_build_cycle("buy", "sell")
             if not build_success:
                 return False

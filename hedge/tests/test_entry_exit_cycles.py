@@ -718,14 +718,14 @@ class TestEntryExitCycle:
 
         # Mock trigger client for TP orders
         mock_context = Mock()
-        mock_trigger = AsyncMock()
+        mock_trigger = Mock()
 
         mock_tp_result = MagicMock()
         mock_tp_result.status = ResponseStatus.SUCCESS
         mock_tp_result.data = MagicMock()
         mock_tp_result.data.digest = "0x" + "a" * 64
 
-        mock_trigger.place_price_trigger_order = AsyncMock(return_value=mock_tp_result)
+        mock_trigger.place_price_trigger_order = Mock(return_value=mock_tp_result)
         mock_context.trigger_client = mock_trigger
         mock_client.client = Mock()
         mock_client.client.context = mock_context

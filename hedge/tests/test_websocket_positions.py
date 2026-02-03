@@ -161,10 +161,10 @@ class TestWebSocketUpdatesDictCorrectly:
             bot.log_position_update = Mock()
 
             # Simulate WebSocket position_change event for SOL
-            # Raw amount: 5000000000 (5 SOL in atomic units)
+            # Raw amount: 5000000000000000000 (5 SOL in x18 format)
             ws_message = {
                 "product_id": 5,
-                "amount": "5000000000",  # 5 SOL
+                "amount": "5000000000000000000",  # 5 SOL
                 "v_quote_amount": "500000000",  # ~$500 USD value
                 "reason": "trade"
             }
@@ -474,7 +474,7 @@ class TestResetWorksCorrectly:
             events = [
                 {"product_id": 4, "amount": "50000000000000000", "v_quote_amount": "100000000", "reason": "trade"},  # 0.05 ETH
                 {"product_id": 4, "amount": "100000000000000000", "v_quote_amount": "200000000", "reason": "trade"},  # 0.1 ETH
-                {"product_id": 5, "amount": "1000000000", "v_quote_amount": "100000000", "reason": "trade"},  # 1 SOL
+                {"product_id": 5, "amount": "1000000000000000000", "v_quote_amount": "100000000", "reason": "trade"},  # 1 SOL
             ]
 
             for event in events:
@@ -581,9 +581,9 @@ class TestPositionPersistence:
             # Interleaved updates to both tickers
             updates = [
                 (4, "100000000000000000", Decimal("0.1"), Decimal("0")),  # ETH: 0.1, SOL: 0
-                (5, "2000000000", Decimal("0.1"), Decimal("2")),  # ETH: 0.1, SOL: 2
+                (5, "2000000000000000000", Decimal("0.1"), Decimal("2")),  # ETH: 0.1, SOL: 2
                 (4, "200000000000000000", Decimal("0.2"), Decimal("2")),  # ETH: 0.2, SOL: 2
-                (5, "1000000000", Decimal("0.2"), Decimal("1")),  # ETH: 0.2, SOL: 1
+                (5, "1000000000000000000", Decimal("0.2"), Decimal("1")),  # ETH: 0.2, SOL: 1
                 (4, "0", Decimal("0"), Decimal("1")),  # ETH: 0, SOL: 1
                 (5, "0", Decimal("0"), Decimal("0")),  # ETH: 0, SOL: 0
             ]
@@ -636,7 +636,7 @@ class TestPositionPersistence:
             # Simulate short position (negative amount)
             bot._on_position_change({
                 "product_id": 5,
-                "amount": "-3000000000",  # -3 SOL (short)
+                "amount": "-3000000000000000000",  # -3 SOL (short) in x18 format
                 "v_quote_amount": "-300000000",
                 "reason": "trade"
             })
@@ -846,3 +846,313 @@ class TestEdgeCases:
             assert eth_pos in [Decimal("0"), Decimal("0.1")], (
                 f"Expected ETH position to be 0 or remain 0.1, got {eth_pos}"
             )
+
+
+class TestPositionWaitMechanism:
+    """Test the _wait_for_position_zero() method and event signaling."""
+
+    @pytest.fixture
+    async def bot(self):
+        """Create a bot instance for testing."""
+        with patch.dict('os.environ', {
+            'NADO_PRIVATE_KEY': '0x' + '1' * 64,
+            'NADO_MODE': 'MAINNET',
+            'NADO_SUBACCOUNT_NAME': 'test'
+        }):
+            bot = DNPairBot(
+                target_notional=Decimal('100'),
+                csv_path='/tmp/test_wait_positions.csv'
+            )
+
+            # Initialize clients and _ws_positions
+            bot.eth_client = Mock()
+            bot.eth_client.config.contract_id = 4
+            bot.sol_client = Mock()
+            bot.sol_client.config.contract_id = 5
+            bot._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+
+            # Mock log_position_update
+            bot.log_position_update = Mock()
+
+            return bot
+
+    @pytest.mark.asyncio
+    async def test_wait_for_position_zero_success(self, bot):
+        """Test successful wait for position zero via WebSocket event."""
+        # Setup
+        bot._ws_positions['SOL'] = Decimal("-1.0")
+        bot.USE_ASYNC_POSITION_WAIT = True
+
+        # Start wait in background
+        wait_task = asyncio.create_task(
+            bot._wait_for_position_zero('SOL', timeout=5)
+        )
+
+        # Simulate position change to zero after short delay
+        await asyncio.sleep(0.1)
+        bot._on_position_change({
+            'product_id': bot.sol_client.config.contract_id,
+            'amount': str(0)  # Zero position
+        })
+
+        # Wait should complete successfully
+        result = await wait_task
+        assert result is True
+        assert bot._ws_positions['SOL'] == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_wait_for_position_zero_timeout(self, bot):
+        """Test timeout when position never reaches zero."""
+        # Setup
+        bot._ws_positions['SOL'] = Decimal("-1.0")
+        bot.USE_ASYNC_POSITION_WAIT = True
+
+        # Wait for short timeout (no position change event sent)
+        result = await bot._wait_for_position_zero('SOL', timeout=0.5)
+
+        # Should return False due to timeout
+        assert result is False
+        assert bot._ws_positions['SOL'] == Decimal("-1.0")  # Unchanged
+
+    @pytest.mark.asyncio
+    async def test_wait_uses_fresh_events(self, bot):
+        """Test that each wait creates a fresh event (no reuse)."""
+        bot._ws_positions['SOL'] = Decimal("-1.0")
+        bot.USE_ASYNC_POSITION_WAIT = True
+
+        # First wait
+        wait_task1 = asyncio.create_task(
+            bot._wait_for_position_zero('SOL', timeout=5)
+        )
+
+        # Verify event was created for first wait
+        await asyncio.sleep(0.05)  # Give time for event to be created
+        assert 'SOL' in bot._position_zero_events, "First wait should create event"
+
+        # Send position zero event
+        bot._on_position_change({
+            'product_id': bot.sol_client.config.contract_id,
+            'amount': str(0)
+        })
+
+        result1 = await wait_task1
+        assert result1 is True
+
+        # Verify event was cleaned up
+        assert 'SOL' not in bot._position_zero_events
+
+        # Second wait should create FRESH event
+        bot._ws_positions['SOL'] = Decimal("-1.0")
+        wait_task2 = asyncio.create_task(
+            bot._wait_for_position_zero('SOL', timeout=5)
+        )
+
+        # Verify new event exists (give time for event creation)
+        await asyncio.sleep(0.05)
+        assert 'SOL' in bot._position_zero_events, "Second wait should create fresh event"
+
+        # Clean up
+        bot._on_position_change({
+            'product_id': bot.sol_client.config.contract_id,
+            'amount': str(0)
+        })
+
+        result2 = await wait_task2
+        assert result2 is True
+
+    @pytest.mark.asyncio
+    async def test_wait_respects_feature_flag(self, bot):
+        """Test that wait is skipped when feature flag is disabled."""
+        bot._ws_positions['SOL'] = Decimal("-1.0")
+        bot.USE_ASYNC_POSITION_WAIT = False  # Disabled
+
+        # Should return True immediately (skip wait)
+        result = await bot._wait_for_position_zero('SOL', timeout=5)
+
+        assert result is True
+        # Position should NOT have changed (no WebSocket event sent)
+        assert bot._ws_positions['SOL'] == Decimal("-1.0")
+
+
+class TestPositionDriftDetection:
+    """Test the _detect_position_drift() method."""
+
+    @pytest.fixture
+    async def bot(self):
+        """Create a bot instance for testing."""
+        with patch.dict('os.environ', {
+            'NADO_PRIVATE_KEY': '0x' + '1' * 64,
+            'NADO_MODE': 'MAINNET',
+            'NADO_SUBACCOUNT_NAME': 'test'
+        }):
+            bot = DNPairBot(
+                target_notional=Decimal('100'),
+                csv_path='/tmp/test_drift_positions.csv'
+            )
+
+            # Initialize clients and _ws_positions
+            bot.eth_client = Mock()
+            bot.eth_client.config.contract_id = 4
+            bot.sol_client = Mock()
+            bot.sol_client.config.contract_id = 5
+            bot._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+
+            # Mock log_position_update
+            bot.log_position_update = Mock()
+
+            return bot
+
+    @pytest.mark.asyncio
+    async def test_detect_position_drift(self, bot):
+        """Test position drift detection."""
+        # Setup: WebSocket shows -2.5, REST shows -2.0
+        bot._ws_positions['SOL'] = Decimal("-2.5")
+        bot.POSITION_DRIFT_THRESHOLD = Decimal("0.1")
+
+        # Mock REST API to return different value
+        async def mock_get_positions():
+            return Decimal("-2.0")
+
+        bot.sol_client.get_account_positions = mock_get_positions
+
+        # Detect drift
+        drift = await bot._detect_position_drift('SOL', bot.sol_client)
+
+        # Should detect 0.5 drift
+        assert drift == Decimal("0.5")
+
+    @pytest.mark.asyncio
+    async def test_no_drift_when_positions_match(self, bot):
+        """Test that no drift is detected when positions match."""
+        # Setup: Both WebSocket and REST show -1.0
+        bot._ws_positions['ETH'] = Decimal("-1.0")
+        bot.POSITION_DRIFT_THRESHOLD = Decimal("0.1")
+
+        # Mock REST API to return same value
+        async def mock_get_positions():
+            return Decimal("-1.0")
+
+        bot.eth_client.get_account_positions = mock_get_positions
+
+        # Detect drift
+        drift = await bot._detect_position_drift('ETH', bot.eth_client)
+
+        # Should detect 0 drift
+        assert drift == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_drift_below_threshold(self, bot):
+        """Test that small drift below threshold is detected but not alarming."""
+        # Setup: WebSocket shows -1.05, REST shows -1.0 (drift = 0.05)
+        bot._ws_positions['SOL'] = Decimal("-1.05")
+        bot.POSITION_DRIFT_THRESHOLD = Decimal("0.1")
+
+        # Mock REST API
+        async def mock_get_positions():
+            return Decimal("-1.0")
+
+        bot.sol_client.get_account_positions = mock_get_positions
+
+        # Detect drift
+        drift = await bot._detect_position_drift('SOL', bot.sol_client)
+
+        # Should detect 0.05 drift (below threshold)
+        assert drift == Decimal("0.05")
+
+
+class TestPositionTrackingIntegration:
+    """Integration tests for full position tracking flow."""
+
+    @pytest.fixture
+    async def bot(self):
+        """Create a bot instance for testing."""
+        with patch.dict('os.environ', {
+            'NADO_PRIVATE_KEY': '0x' + '1' * 64,
+            'NADO_MODE': 'MAINNET',
+            'NADO_SUBACCOUNT_NAME': 'test'
+        }):
+            bot = DNPairBot(
+                target_notional=Decimal('100'),
+                csv_path='/tmp/test_integration_positions.csv'
+            )
+
+            # Initialize clients and _ws_positions
+            bot.eth_client = Mock()
+            bot.eth_client.config.contract_id = 4
+            bot.sol_client = Mock()
+            bot.sol_client.config.contract_id = 5
+            bot._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+
+            # Mock log_position_update
+            bot.log_position_update = Mock()
+
+            return bot
+
+    @pytest.mark.asyncio
+    async def test_position_tracking_with_wait_mechanism(self, bot):
+        """Test full position tracking flow with WebSocket events and wait mechanism."""
+        # Start with zero position
+        assert bot._ws_positions.get('SOL', Decimal("0")) == Decimal("0")
+
+        # Simulate position going short
+        bot._on_position_change({
+            'product_id': bot.sol_client.config.contract_id,
+            'amount': str(-1 * 10**18)  # -1.0 in x18 format
+        })
+        assert bot._ws_positions['SOL'] == Decimal("-1.0")
+
+        # Test wait mechanism with fresh event
+        bot._ws_positions['SOL'] = Decimal("-1.0")
+        bot.USE_ASYNC_POSITION_WAIT = True
+
+        wait_task = asyncio.create_task(
+            bot._wait_for_position_zero('SOL', timeout=1)
+        )
+
+        await asyncio.sleep(0.1)
+        bot._on_position_change({
+            'product_id': bot.sol_client.config.contract_id,
+            'amount': str(0)
+        })
+
+        result = await wait_task
+        assert result is True
+        assert bot._ws_positions['SOL'] == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_multiple_wait_cycles(self, bot):
+        """Test that multiple wait cycles work correctly with fresh events."""
+        bot.USE_ASYNC_POSITION_WAIT = True
+
+        # First cycle: -1.0 -> 0
+        bot._ws_positions['ETH'] = Decimal("-1.0")
+        wait_task1 = asyncio.create_task(
+            bot._wait_for_position_zero('ETH', timeout=1)
+        )
+
+        await asyncio.sleep(0.1)
+        bot._on_position_change({
+            'product_id': bot.eth_client.config.contract_id,
+            'amount': str(0)
+        })
+
+        result1 = await wait_task1
+        assert result1 is True
+
+        # Second cycle: -2.0 -> 0
+        bot._ws_positions['ETH'] = Decimal("-2.0")
+        wait_task2 = asyncio.create_task(
+            bot._wait_for_position_zero('ETH', timeout=1)
+        )
+
+        await asyncio.sleep(0.1)
+        bot._on_position_change({
+            'product_id': bot.eth_client.config.contract_id,
+            'amount': str(0)
+        })
+
+        result2 = await wait_task2
+        assert result2 is True
+
+        # Verify no leftover events
+        assert 'ETH' not in bot._position_zero_events
