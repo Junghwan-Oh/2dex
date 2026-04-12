@@ -88,7 +88,7 @@ class FillHandler:
                 "order_id": order_id,
                 "filled_quantity": filled_quantity,
                 "price": price,
-                "timestamp": int(time.time())
+                "timestamp": time.time()
             }
 
             # If this order was pending, move to completed
@@ -125,7 +125,7 @@ class FillHandler:
         """
         self._pending_orders[order_id] = {
             "quantity": quantity,
-            "timestamp": int(time.time())
+            "timestamp": time.time()
         }
         self.logger.debug(f"Tracking order {order_id[:10]}... (qty: {quantity})")
 
@@ -144,8 +144,8 @@ class FillHandler:
         if order_id not in self._pending_orders:
             return False
 
-        elapsed = int(time.time()) - self._pending_orders[order_id]["timestamp"]
-        return elapsed > self.timeout_seconds
+        elapsed = time.time() - self._pending_orders[order_id]["timestamp"]
+        return elapsed >= self.timeout_seconds
 
     def get_fill_info(self, order_id: str) -> Optional[Dict]:
         """
@@ -195,7 +195,7 @@ class FillHandler:
         Returns:
             Number of orders cleared
         """
-        cutoff = int(time.time()) - older_than_seconds
+        cutoff = time.time() - older_than_seconds
         cleared = 0
 
         for order_id in list(self._completed_orders.keys()):

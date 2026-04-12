@@ -322,6 +322,20 @@ class NadoClient(BaseExchangeClient):
         """
         return self._bbo_handler if self._ws_connected else None
 
+    def has_ws_market_data(self) -> bool:
+        """Return True when WS is connected and both BBO + BookDepth are warm."""
+        if not self._ws_connected:
+            return False
+
+        bbo_handler = self.get_bbo_handler()
+        bookdepth_handler = self.get_bookdepth_handler()
+        if bbo_handler is None or bookdepth_handler is None:
+            return False
+
+        has_bbo = bbo_handler.get_latest_bbo() is not None
+        has_bookdepth = getattr(bookdepth_handler, "last_timestamp", 0) > 0
+        return has_bbo and has_bookdepth
+
     async def estimate_slippage(
         self,
         side: str,

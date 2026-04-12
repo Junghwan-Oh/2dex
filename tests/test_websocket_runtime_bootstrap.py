@@ -1,0 +1,89 @@
+import pytest
+from decimal import Decimal
+from unittest.mock import AsyncMock, Mock, patch
+
+from hedge.DN_pair_eth_sol_nado import DNPairBot
+
+
+def make_client(*, connected: bool, ws_ready: bool, rest_position: Decimal):
+    client = Mock()
+    client._ws_connected = connected
+    client.has_ws_market_data = Mock(return_value=ws_ready)
+    client.get_account_positions = AsyncMock(return_value=rest_position)
+    return client
+
+
+def make_bot() -> DNPairBot:
+    with patch.dict(
+        "os.environ",
+        {
+            "NADO_PRIVATE_KEY": "0x" + "1" * 64,
+            "NADO_MODE": "MAINNET",
+            "NADO_SUBACCOUNT_NAME": "test",
+        },
+    ):
+        return DNPairBot(
+            target_notional=Decimal("100"),
+            csv_path="/tmp/test_websocket_runtime_bootstrap.csv",
+        )
+
+
+@pytest.mark.asyncio
+async def test_ws_sync_seeds_startup_positions_from_single_rest_snapshot():
+    bot = make_bot()
+    bot.eth_client = make_client(connected=True, ws_ready=True, rest_position=Decimal("0.15"))
+    bot.sol_client = make_client(connected=True, ws_ready=True, rest_position=Decimal("-1.30"))
+
+    synced = await bot._wait_for_ws_position_sync(timeout=0.1)
+
+    assert synced is True
+    assert bot._ws_initial_sync_complete is True
+    assert bot._ws_positions["ETH"] == Decimal("0.15")
+    assert bot._ws_positions["SOL"] == Decimal("-1.30")
+    assert bot._startup_data_source == "websocket_runtime + rest_seed"
+    bot.eth_client.get_account_positions.assert_awaited_once()
+    bot.sol_client.get_account_positions.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ws_sync_timeout_does_not_spam_rest_when_ws_not_warm():
+    bot = make_bot()
+    bot.eth_client = make_client(connected=True, ws_ready=False, rest_position=Decimal("9"))
+    bot.sol_client = make_client(connected=True, ws_ready=False, rest_position=Decimal("9"))
+
+    synced = await bot._wait_for_ws_position_sync(timeout=0.1)
+
+    assert synced is False
+    assert bot._ws_initial_sync_complete is False
+    bot.eth_client.get_account_positions.assert_not_awaited()
+    bot.sol_client.get_account_positions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verify_and_sync_positions_skips_rest_when_ws_runtime_is_ready():
+    bot = make_bot()
+    bot._ws_positions = {"ETH": Decimal("0.05"), "SOL": Decimal("-1.20")}
+    bot.eth_client = make_client(connected=True, ws_ready=True, rest_position=Decimal("99"))
+    bot.sol_client = make_client(connected=True, ws_ready=True, rest_position=Decimal("99"))
+
+    await bot._verify_and_sync_positions_from_rest()
+
+    assert bot._ws_positions["ETH"] == Decimal("0.05")
+    assert bot._ws_positions["SOL"] == Decimal("-1.20")
+    bot.eth_client.get_account_positions.assert_not_awaited()
+    bot.sol_client.get_account_positions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verify_and_sync_positions_uses_rest_only_when_ws_not_ready():
+    bot = make_bot()
+    bot._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+    bot.eth_client = make_client(connected=True, ws_ready=False, rest_position=Decimal("0.07"))
+    bot.sol_client = make_client(connected=True, ws_ready=False, rest_position=Decimal("-0.90"))
+
+    await bot._verify_and_sync_positions_from_rest()
+
+    assert bot._ws_positions["ETH"] == Decimal("0.07")
+    assert bot._ws_positions["SOL"] == Decimal("-0.90")
+    bot.eth_client.get_account_positions.assert_awaited_once()
+    bot.sol_client.get_account_positions.assert_awaited_once()

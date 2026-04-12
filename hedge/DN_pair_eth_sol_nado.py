@@ -206,11 +206,12 @@ class DNPairBot:
 
         # WebSocket position tracking for startup residual detection
         self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
-        self._ws_initial_sync_complete = False  # Track if WebSocket has received initial position data
-        self._ws_initial_sync_received = set()  # Track which tickers actually received a WS position event
+        self._ws_initial_sync_complete = False  # True after startup baseline is seeded and WS market-data path is warm
+        self._ws_initial_sync_received = set()  # Track which tickers actually emitted position_change (diagnostic only)
         self._ws_position_change_raw = {"ETH": Decimal("0"), "SOL": Decimal("0")}  # Raw position_change values for diagnostics only
         self._processed_fill_events = set()  # Dedupe fill-stream events
         self._bridged_fill_order_ids = set()  # Order IDs already reflected into _ws_positions from order results
+        self._last_order_target_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
 
         # Position tracking configuration (WebSocket position tracking fix)
         self.USE_ASYNC_POSITION_WAIT = True  # Feature flag: enable async position waiting
@@ -499,15 +500,15 @@ class DNPairBot:
                 self._ws_last_update_time = {}
             self._ws_last_update_time[ticker] = event_time
 
-            # Mark sync as complete only after we actually receive a position event
-            # for both tickers. Preinitialized _ws_positions keys are not enough.
+            # position_change remains useful as a diagnostic stream. Record whether
+            # both tickers have emitted at least one event, but do not treat this
+            # as the startup quantity baseline.
             if not self._ws_initial_sync_complete:
                 self._ws_initial_sync_received.add(ticker)
                 has_eth = "ETH" in self._ws_initial_sync_received
                 has_sol = "SOL" in self._ws_initial_sync_received
                 if has_eth and has_sol:
-                    self._ws_initial_sync_complete = True
-                    self.logger.info("[WS SYNC] Initial WebSocket position sync complete")
+                    self.logger.info("[WS SYNC] position_change diagnostic stream observed for both tickers")
 
             # Log raw stream signal for diagnostics.
             self.logger.info(
@@ -680,13 +681,13 @@ class DNPairBot:
         # (Do NOT reuse events - creates race conditions)
         zero_event = asyncio.Event()
 
-        # Store event so _on_position_change() can signal it
+        # Store event so _on_fill_message() can signal it when a leg returns to flat
         if not hasattr(self, '_position_zero_events'):
             self._position_zero_events = {}
         self._position_zero_events[ticker] = zero_event
 
         try:
-            # Wait for event to be set by _on_position_change()
+            # Wait for event to be set by _on_fill_message()
             await asyncio.wait_for(
                 zero_event.wait(),
                 timeout=timeout
@@ -754,48 +755,65 @@ class DNPairBot:
 
         return drift
 
-    async def _verify_and_sync_positions_from_rest(self, tickers=None, force_rest: bool = False) -> None:
-        """Verify positions - WebSocket is primary, REST is emergency backup.
+    def _is_ticker_ws_runtime_ready(self, ticker: str) -> bool:
+        """Return True when the ticker has usable WS market data."""
+        client = self.eth_client if ticker == "ETH" else self.sol_client
+        if client is None:
+            return False
+        return client.has_ws_market_data()
 
-        PRINCIPLE: WebSocket position_change stream is the PRIMARY source.
-        REST API should ONLY be used for:
-        1. Initial startup before WebSocket connects
-        2. Emergency recovery if WebSocket appears broken
+    async def _seed_ws_positions_from_rest(self) -> bool:
+        """Seed WS position baseline from one bounded REST snapshot at startup."""
+        from decimal import Decimal
+
+        try:
+            eth_pos = await self.eth_client.get_account_positions()
+            sol_pos = await self.sol_client.get_account_positions()
+        except Exception as e:
+            self.logger.warning(f"[WS SYNC] Failed to seed startup positions from REST: {e}")
+            return False
+
+        if not hasattr(self, '_ws_positions'):
+            self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+
+        self._ws_positions["ETH"] = eth_pos
+        self._ws_positions["SOL"] = sol_pos
+        self._ws_initial_sync_complete = True
+        self._startup_data_source = "websocket_runtime + rest_seed"
+
+        self.logger.info(
+            f"[WS SYNC] Seeded startup baseline from single REST snapshot: "
+            f"ETH={eth_pos}, SOL={sol_pos}"
+        )
+        return True
+
+    async def _verify_and_sync_positions_from_rest(self, tickers=None, force_rest: bool = False) -> None:
+        """Verify positions - fill/BBO/BookDepth WS path is primary, REST is bounded backup.
+
+        PRINCIPLE:
+        - Startup baseline comes from one REST snapshot after WS market data warms up.
+        - After startup, position quantity should move from fill events.
+        - REST is only for bounded verification or emergency recovery.
 
         Args:
             tickers: List of tickers to verify (e.g., ["ETH", "SOL"]). If None, verify all.
-            force_rest: If True, bypass WebSocket health check and use REST (emergency only)
+            force_rest: If True, bypass WS readiness checks and use REST (emergency only)
         """
         from decimal import Decimal
-        import time
 
         if tickers is None:
             tickers = ["ETH", "SOL"]
 
-        # Check if WebSocket is healthy (received update within 30 seconds)
-        ws_healthy = True
-        if hasattr(self, '_ws_last_update_time'):
-            current_time = time.time()
-            for ticker in tickers:
-                last_update = self._ws_last_update_time.get(ticker, 0)
-                if current_time - last_update > 30:  # No update for 30 seconds
-                    ws_healthy = False
-                    self.logger.warning(
-                        f"[POSITION VERIFY] WebSocket appears unhealthy for {ticker} "
-                        f"(last update {current_time - last_update:.1f}s ago)"
-                    )
+        ws_ready = all(self._is_ticker_ws_runtime_ready(ticker) for ticker in tickers)
 
-        # Only use REST if forced or WebSocket is unhealthy
-        use_rest = force_rest or not ws_healthy
+        if not force_rest and ws_ready:
+            self.logger.info("[POSITION VERIFY] WS market data is warm - skipping REST verification")
+            return
 
-        if use_rest:
-            self.logger.warning(
-                f"[POSITION VERIFY] Using REST API (force={force_rest}, ws_healthy={ws_healthy}) "
-                "- WebSocket should be primary source!"
-            )
-        else:
-            self.logger.info("[POSITION VERIFY] WebSocket healthy - trusting WS positions")
-            return  # Trust WebSocket, skip REST verification
+        self.logger.warning(
+            f"[POSITION VERIFY] Using REST API (force={force_rest}, ws_ready={ws_ready}) "
+            "- bounded verification only"
+        )
 
         for ticker in tickers:
             try:
@@ -825,36 +843,49 @@ class DNPairBot:
 
     async def _wait_for_ws_position_sync(self, timeout: float = 5.0) -> bool:
         """
-        Wait for WebSocket to receive initial position_change events.
+        Warm up WS runtime and seed startup position baseline once from REST.
 
         Args:
             timeout: Maximum time to wait in seconds (default 5.0)
 
         Returns:
-            True when sync complete, False on timeout
+            True when runtime is warm and startup baseline was seeded, False on timeout
         """
+        if self._ws_initial_sync_complete:
+            self.logger.info("[WS SYNC] Startup baseline already available")
+            return True
+
         if not self.eth_client._ws_connected or not self.sol_client._ws_connected:
             self.logger.warning("[WS SYNC] WebSocket not connected, skipping sync wait")
             return False
 
         start_time = time.time()
-        self.logger.info(f"[WS SYNC] Waiting for initial position sync (timeout: {timeout}s)...")
+        self.logger.info(f"[WS SYNC] Waiting for WS BBO/BookDepth warmup (timeout: {timeout}s)...")
 
-        while not self._ws_initial_sync_complete:
-            if time.time() - start_time > timeout:
-                self.logger.warning(f"[WS SYNC] Timeout waiting for position sync after {timeout}s")
+        while time.time() - start_time <= timeout:
+            eth_ready = self._is_ticker_ws_runtime_ready("ETH")
+            sol_ready = self._is_ticker_ws_runtime_ready("SOL")
+            if eth_ready and sol_ready:
+                seeded = await self._seed_ws_positions_from_rest()
+                if seeded:
+                    self.logger.info("[WS SYNC] WS warmup complete and startup baseline seeded")
+                    return True
                 return False
+
             await asyncio.sleep(0.1)
 
-        self.logger.info("[WS SYNC] Position sync complete")
-        return True
+        self.logger.warning(
+            "[WS SYNC] Timeout waiting for WS BBO/BookDepth warmup; "
+            "startup will use bounded REST fallback"
+        )
+        return False
 
     async def _get_startup_positions(self) -> Tuple[Decimal, Decimal]:
         """
-        Get positions at startup with WebSocket priority.
+        Get positions at startup with WS-seeded priority.
 
         Priority:
-        1. WebSocket positions (_ws_positions) if available (sync complete or manually set)
+        1. WS position state after startup baseline seeding
         2. REST API fallback
 
         Returns:
@@ -863,12 +894,12 @@ class DNPairBot:
         """
         # Try WebSocket positions first
         # Use WebSocket positions if:
-        # 1. Initial sync is complete (WebSocket is connected and received data), OR
+        # 1. Startup baseline was seeded after WS warmup, OR
         # 2. _ws_positions has been manually set with non-default values (for testing)
         use_websocket = False
         if hasattr(self, '_ws_positions') and self._ws_positions:
             if self._ws_initial_sync_complete:
-                # WebSocket sync completed - use these positions
+                # Startup baseline seeded - use WS-tracked state
                 use_websocket = True
             else:
                 # Check if positions have been manually set (not the default zero initialization)
@@ -882,8 +913,8 @@ class DNPairBot:
         if use_websocket:
             eth_pos = self._ws_positions.get("ETH", Decimal("0"))
             sol_pos = self._ws_positions.get("SOL", Decimal("0"))
-            self._startup_data_source = "websocket"
-            self.logger.info("[STARTUP] Using WebSocket positions for startup check")
+            self._startup_data_source = self._startup_data_source or "websocket_runtime"
+            self.logger.info("[STARTUP] Using WS-tracked positions for startup check")
             self.logger.info(f"[STARTUP] ETH (WS): {eth_pos}, SOL (WS): {sol_pos}")
             return eth_pos, sol_pos
 
@@ -1216,6 +1247,11 @@ class DNPairBot:
             f"ETH {eth_direction} {eth_qty} @ ${eth_price}, "
             f"SOL {sol_direction} {sol_qty} @ ${sol_price}"
         )
+
+        self._last_order_target_quantities = {
+            "ETH": eth_qty,
+            "SOL": sol_qty,
+        }
 
         # Calculate dynamic timeout (FIXED: use get_bbo_handler())
         spread_state = None
@@ -3457,6 +3493,12 @@ class DNPairBot:
             return abs(pos)
         return Decimal("0")
 
+    def _target_fill_reached(self, filled_qty: Decimal, target_qty: Decimal) -> bool:
+        """Return True when a leg is effectively filled to target."""
+        if target_qty <= Decimal("0.001"):
+            return True
+        return filled_qty >= target_qty * Decimal("0.99")
+
     def _resolve_close_check_position(self, ticker: str, ws_pos: Decimal, rest_pos: Decimal) -> Decimal:
         """Resolve close-check position with REST override when WS is stale.
 
@@ -3661,8 +3703,14 @@ class DNPairBot:
                 self._is_entry_phase = False
                 return False
 
-            # Check if both filled
-            if self._is_fill_complete(eth_result) and self._is_fill_complete(sol_result):
+            planned_eth_qty = self._last_order_target_quantities.get("ETH", Decimal("0"))
+            planned_sol_qty = self._last_order_target_quantities.get("SOL", Decimal("0"))
+
+            # Check if both filled against the planned order size.
+            if (
+                self._is_fill_complete(eth_result, planned_eth_qty) and
+                self._is_fill_complete(sol_result, planned_sol_qty)
+            ):
                 self.logger.info(f"[BUILD] Both orders filled successfully on first attempt")
                 self._is_entry_phase = False
 
@@ -3732,6 +3780,22 @@ class DNPairBot:
                     f"[BUILD] Remaining quantities: ETH={eth_remaining_qty}, SOL={sol_remaining_qty}"
                 )
 
+                if (
+                    self._target_fill_reached(effective_eth_filled, target_eth_qty) and
+                    self._target_fill_reached(effective_sol_filled, target_sol_qty)
+                ):
+                    self.logger.info(
+                        f"[BUILD] Targets already satisfied before retry dispatch: "
+                        f"ETH={effective_eth_filled}/{target_eth_qty}, SOL={effective_sol_filled}/{target_sol_qty}"
+                    )
+                    self._is_entry_phase = False
+                    await self._maybe_place_tp_orders()
+                    try:
+                        self._log_spread_analysis(spread_info)
+                    except Exception as e:
+                        self.logger.error(f"[CSV] Error logging spread analysis: {e}")
+                    return True
+
                 # Check positions for logging only (may show 0.0 before settlement)
                 eth_pos = await self.eth_client.get_account_positions()
                 sol_pos = await self.sol_client.get_account_positions()
@@ -3786,19 +3850,30 @@ class DNPairBot:
                                 f"cumulative: {cumulative_eth_filled if ticker == 'ETH' else cumulative_sol_filled}"
                             )
 
-                # Check if all target quantities are now filled based on cumulative fills
-                if effective_eth_filled >= target_eth_qty * Decimal("0.99") and effective_sol_filled >= target_sol_qty * Decimal("0.99"):
-                    if effective_eth_filled > cumulative_eth_filled:
-                        cumulative_eth_filled = effective_eth_filled
-                    if effective_sol_filled > cumulative_sol_filled:
-                        cumulative_sol_filled = effective_sol_filled
+                # Recompute effective fills after retry results. A retry can satisfy
+                # the target on the last allowed attempt, so success must be
+                # recognized immediately instead of waiting for another loop pass.
+                ws_eth_filled = self._aligned_ws_filled_qty("ETH", eth_direction)
+                ws_sol_filled = self._aligned_ws_filled_qty("SOL", sol_direction)
+                effective_eth_filled = max(cumulative_eth_filled, ws_eth_filled)
+                effective_sol_filled = max(cumulative_sol_filled, ws_sol_filled)
+
+                if (
+                    self._target_fill_reached(effective_eth_filled, target_eth_qty) and
+                    self._target_fill_reached(effective_sol_filled, target_sol_qty)
+                ):
+                    cumulative_eth_filled = max(cumulative_eth_filled, effective_eth_filled)
+                    cumulative_sol_filled = max(cumulative_sol_filled, effective_sol_filled)
                     self.logger.info(
                         f"[BUILD] All target quantities filled: ETH={cumulative_eth_filled}/{target_eth_qty}, "
                         f"SOL={cumulative_sol_filled}/{target_sol_qty}. Waiting for positions to settle..."
                     )
                     # CRITICAL: Trust cumulative fills, not position checks which lag
                     # Position checks can show 0.0 for 20+ seconds after fills
-                    if cumulative_eth_filled >= target_eth_qty * Decimal("0.99") and cumulative_sol_filled >= target_sol_qty * Decimal("0.99"):
+                    if (
+                        self._target_fill_reached(cumulative_eth_filled, target_eth_qty) and
+                        self._target_fill_reached(cumulative_sol_filled, target_sol_qty)
+                    ):
                         self.logger.info(
                             f"[BUILD] Both positions filled (cumulative): ETH={cumulative_eth_filled}/{target_eth_qty}, "
                             f"SOL={cumulative_sol_filled}/{target_sol_qty}"
@@ -3824,56 +3899,57 @@ class DNPairBot:
 
                         return True
 
-            # After all retries, verify final state
+            # Final fill-state check before any REST fallback.
+            final_eth_bid, final_eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
+            final_sol_bid, final_sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
+            final_eth_price = final_eth_bid if eth_direction == "buy" else final_eth_ask
+            final_sol_price = final_sol_bid if sol_direction == "buy" else final_sol_ask
+            final_target_eth_qty = self.target_notional / final_eth_price
+            final_target_sol_qty = self.target_notional / final_sol_price
+            final_ws_eth_filled = self._aligned_ws_filled_qty("ETH", eth_direction)
+            final_ws_sol_filled = self._aligned_ws_filled_qty("SOL", sol_direction)
+            final_effective_eth_filled = max(cumulative_eth_filled, final_ws_eth_filled)
+            final_effective_sol_filled = max(cumulative_sol_filled, final_ws_sol_filled)
+
+            if (
+                self._target_fill_reached(final_effective_eth_filled, final_target_eth_qty) and
+                self._target_fill_reached(final_effective_sol_filled, final_target_sol_qty)
+            ):
+                self.logger.info(
+                    f"[BUILD] Final fill state satisfied targets without extra retry: "
+                    f"ETH={final_effective_eth_filled}/{final_target_eth_qty}, "
+                    f"SOL={final_effective_sol_filled}/{final_target_sol_qty}"
+                )
+                self._is_entry_phase = False
+                await self._maybe_place_tp_orders()
+                try:
+                    self._log_spread_analysis(spread_info)
+                except Exception as e:
+                    self.logger.error(f"[CSV] Error logging spread analysis: {e}")
+                return True
+
+            # After all retries, verify final actual positions for emergency handling.
             eth_pos = await self.eth_client.get_account_positions()
             sol_pos = await self.sol_client.get_account_positions()
 
-            # CRITICAL FIX: Check if positions are imbalanced (one significantly larger than other)
-            # This detects both "double entry" bugs and single-leg failures
             eth_significant = abs(eth_pos) > Decimal("0.01")
             sol_significant = abs(sol_pos) > Decimal("0.01")
 
-            # If both have positions (double entry) OR one is significantly larger
-            if (eth_significant and sol_significant) or (eth_significant != sol_significant):
-                # Check for imbalance ratio (more than 10% difference)
-                if eth_significant and sol_significant:
-                    ratio = abs(eth_pos) / max(abs(sol_pos), Decimal("0.0001"))
-                    if Decimal("0.9") <= ratio <= Decimal("1.1"):
-                        # Positions are balanced, this is OK
-                        self.logger.info(f"[BUILD] Both positions established and balanced")
-                        self._is_entry_phase = False
-
-                        # WebSocket PositionChange events will automatically update positions
-                        self.logger.info("[BUILD] WebSocket will auto-sync positions via PositionChange events")
-
-                        await self._maybe_place_tp_orders()
-                        return True
-
-                # Positions are imbalanced or single-leg only - trigger emergency unwind
+            if eth_significant or sol_significant:
                 self.logger.error(
-                    f"[BUILD] FAILED: Positions still imbalanced after {MAX_RETRIES} retries: "
+                    f"[BUILD] FAILED: Targets not reached after {MAX_RETRIES} retries and positions remain open: "
                     f"ETH={eth_pos}, SOL={sol_pos}"
                 )
-                # Trigger emergency unwind with latest results
                 await self.handle_emergency_unwind(latest_eth_result, latest_sol_result)
                 self._is_entry_phase = False
                 return False
 
-            self.logger.info(f"[BUILD] Both positions established")
+            self.logger.warning(
+                f"[BUILD] No stable paired fill established after {MAX_RETRIES} retries; staying flat "
+                f"(ETH={eth_pos}, SOL={sol_pos})"
+            )
             self._is_entry_phase = False
-
-            # WebSocket PositionChange events will automatically update positions
-            self.logger.info("[BUILD] WebSocket will auto-sync positions via PositionChange events")
-
-            await self._maybe_place_tp_orders()
-
-            # Log spread analysis at entry if orders succeeded
-            try:
-                self._log_spread_analysis(spread_info)
-            except Exception as e:
-                self.logger.error(f"[CSV] Error logging spread analysis: {e}")
-
-            return True
+            return False
         except Exception as e:
             self.logger.error(f"[BUILD] Exception during build cycle: {e}")
             import traceback
@@ -4012,12 +4088,14 @@ class DNPairBot:
         # Check if orders filled and add retry logic for partial fills
         MAX_ORDER_RETRIES = 3
         ORDER_RETRY_DELAY = 2.0
+        eth_entry_qty = self.entry_quantities.get("ETH", Decimal("0"))
+        sol_entry_qty = self.entry_quantities.get("SOL", Decimal("0"))
 
-        # Check initial fill status using _is_fill_complete()
+        # Check initial fill status against the close target quantities.
         eth_filled = (isinstance(eth_result, OrderResult) and
-                      self._is_fill_complete(eth_result))
+                      self._is_fill_complete(eth_result, eth_entry_qty))
         sol_filled = (isinstance(sol_result, OrderResult) and
-                      self._is_fill_complete(sol_result))
+                      self._is_fill_complete(sol_result, sol_entry_qty))
 
         if eth_filled and sol_filled:
             self.logger.info("[UNWIND] Both orders filled successfully")
@@ -4029,10 +4107,6 @@ class DNPairBot:
 
             latest_eth_result = eth_result
             latest_sol_result = sol_result
-
-            # Get entry quantities to determine target close amounts
-            eth_entry_qty = self.entry_quantities.get("ETH", Decimal("0"))
-            sol_entry_qty = self.entry_quantities.get("SOL", Decimal("0"))
 
             # Track cumulative filled amounts from OrderResult (not position checks which lag)
             cumulative_eth_filled = self._get_filled_size(eth_result)
@@ -4773,10 +4847,10 @@ async def main():
     await bot.initialize_clients()
 
     # STARTUP CHECK: Verify no residual positions
-    # Use WebSocket positions for real-time detection (REST API has 20+ second lag)
+    # Warm up WS market data, seed one bounded REST baseline, then use WS-tracked state.
     print("\n[STARTUP] Checking for residual positions...")
 
-    # Wait for WebSocket to receive initial position sync
+    # Warm up WS runtime and seed startup baseline
     await bot._wait_for_ws_position_sync(timeout=5.0)
 
     # Check for residual positions using WebSocket priority
