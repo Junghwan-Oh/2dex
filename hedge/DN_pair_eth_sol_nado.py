@@ -207,6 +207,10 @@ class DNPairBot:
         # WebSocket position tracking for startup residual detection
         self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
         self._ws_initial_sync_complete = False  # Track if WebSocket has received initial position data
+        self._ws_initial_sync_received = set()  # Track which tickers actually received a WS position event
+        self._ws_position_change_raw = {"ETH": Decimal("0"), "SOL": Decimal("0")}  # Raw position_change values for diagnostics only
+        self._processed_fill_events = set()  # Dedupe fill-stream events
+        self._bridged_fill_order_ids = set()  # Order IDs already reflected into _ws_positions from order results
 
         # Position tracking configuration (WebSocket position tracking fix)
         self.USE_ASYNC_POSITION_WAIT = True  # Feature flag: enable async position waiting
@@ -424,22 +428,16 @@ class DNPairBot:
     def _on_position_change(self, data: dict) -> None:
         """WebSocket callback for position changes.
 
-        PRINCIPLE: WebSocket is the PRIMARY source for real-time position tracking.
-        Nado's position_change stream is authoritative and provides immediate updates.
+        IMPORTANT:
+        Mainnet observations show that `position_change.amount` does not match
+        the bot's order quantity units for all products. We still consume the
+        stream for liveness and diagnostics, but real-time position quantity for
+        this bot is now tracked from the fill stream, with REST as verification.
 
-        This callback receives real-time position updates from Nado's WebSocket
-        position_change stream. The WebSocket stream is the trusted source for
-        position state - REST API is only used for startup verification.
-
-        WebSocket PositionChange events:
-        - Are real-time and authoritative
-        - Contain the absolute position size (not deltas)
-        - Are sent immediately after any position change
-        - Should be trusted as the primary position source
-
-        REST API is only used for:
-        1. Initial startup check (before WebSocket connects)
-        2. Emergency verification if WebSocket appears disconnected
+        In other words:
+        - `fill` stream = quantity truth for this bot's real-time position
+        - `position_change` stream = raw exchange signal / health / diagnostics
+        - REST API = verification source when values disagree
         """
         from decimal import Decimal
         import time
@@ -453,8 +451,20 @@ class DNPairBot:
 
         # Extract message data
         product_id = data.get("product_id")
-        amount_raw = data.get("amount", "0")
-        self.logger.info(f"[WS #{event_seq}] product_id={product_id}, amount_raw={amount_raw}, time={event_time:.3f}")
+        # IMPORTANT:
+        # Nado position_change payloads may include both trade-like amount fields and
+        # absolute position fields. For real-time position tracking we prefer
+        # `position_size` when present, and only fall back to `amount` for older
+        # message shapes used in tests/legacy code.
+        position_size_raw = data.get("position_size")
+        amount_raw = data.get("amount")
+        chosen_field = "position_size" if position_size_raw is not None else "amount"
+        chosen_raw = position_size_raw if position_size_raw is not None else amount_raw
+        self.logger.info(
+            f"[WS #{event_seq}] product_id={product_id}, "
+            f"position_size_raw={position_size_raw}, amount_raw={amount_raw}, "
+            f"chosen_field={chosen_field}, time={event_time:.3f}"
+        )
 
         try:
             # Determine which ticker this update is for
@@ -466,43 +476,43 @@ class DNPairBot:
                 self.logger.warning(f"[WS #{event_seq}] Unknown product_id: {product_id}")
                 return
 
-            # Extract position data (actual format from Nado WebSocket)
-            # The amount field is in x18 format for both ETH and SOL
+            # Extract raw position-change value for diagnostics.
+            # This is intentionally NOT applied to self._ws_positions because
+            # raw `amount` does not reliably match the bot's token quantity
+            # units on mainnet for all products.
             precision = Decimal("1e18")
-            amount = Decimal(str(amount_raw)) / precision if amount_raw else Decimal("0")
+            raw_value = chosen_raw if chosen_raw is not None else "0"
+            amount = Decimal(str(raw_value)) / precision if raw_value else Decimal("0")
 
             # Store in memory for real-time monitoring
             if not hasattr(self, '_ws_positions'):
                 self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
 
-            # Get previous position
-            old_pos = self._ws_positions.get(ticker, Decimal("0"))
-
-            # CRITICAL: WebSocket is authoritative - update immediately
-            # The position_change stream provides absolute position, not deltas
+            # Store raw stream value separately for diagnostics only.
+            old_pos = self._ws_position_change_raw.get(ticker, Decimal("0"))
             new_pos_ws = amount
             position_change = new_pos_ws - old_pos
-
-            # Update the position immediately - WebSocket is the primary source
-            self._ws_positions[ticker] = new_pos_ws
+            self._ws_position_change_raw[ticker] = new_pos_ws
 
             # Track last WebSocket update time for connection health
             if not hasattr(self, '_ws_last_update_time'):
                 self._ws_last_update_time = {}
             self._ws_last_update_time[ticker] = event_time
 
-            # Mark sync as complete when we receive position data for both tickers
+            # Mark sync as complete only after we actually receive a position event
+            # for both tickers. Preinitialized _ws_positions keys are not enough.
             if not self._ws_initial_sync_complete:
-                has_eth = "ETH" in self._ws_positions
-                has_sol = "SOL" in self._ws_positions
+                self._ws_initial_sync_received.add(ticker)
+                has_eth = "ETH" in self._ws_initial_sync_received
+                has_sol = "SOL" in self._ws_initial_sync_received
                 if has_eth and has_sol:
                     self._ws_initial_sync_complete = True
                     self.logger.info("[WS SYNC] Initial WebSocket position sync complete")
 
-            # Log the authoritative update
+            # Log raw stream signal for diagnostics.
             self.logger.info(
-                f"[WS #{event_seq}] {ticker}: {old_pos} -> {new_pos_ws} "
-                f"(delta={position_change:+.4f}) [AUTHORITATIVE]"
+                f"[WS #{event_seq}] {ticker} raw_signal: {old_pos} -> {new_pos_ws} "
+                f"(delta={position_change:+.4f}) [POSITION_CHANGE_DIAGNOSTIC]"
             )
 
             # Log to CSV
@@ -511,36 +521,124 @@ class DNPairBot:
                 old_position=old_pos,
                 new_position=new_pos_ws,
                 cycle_id=str(self.iteration) if hasattr(self, 'iteration') else "",
-                source="websocket_position_change_authoritative",
+                source="websocket_position_change_raw_signal",
                 price=None
             )
-
-            # Signal position zero event if anyone is waiting
-            if new_pos_ws == Decimal("0"):
-                # Check if there's an active wait for this ticker
-                if hasattr(self, '_position_zero_events') and ticker in self._position_zero_events:
-                    event = self._position_zero_events.get(ticker)
-                    if event and not event.is_set():
-                        event.set()
-                        self.logger.debug(
-                            f"[WS #{event_seq}] Signaled position zero for {ticker}"
-                        )
 
         except Exception as e:
             self.logger.error(f"[WS #{event_seq}] Error processing update: {e}")
             import traceback
             self.logger.error(f"[WS #{event_seq}] Traceback: {traceback.format_exc()}")
 
-            # Signal position zero event even if there was an error (if position reached zero)
-            new_pos_ws = self._ws_positions.get(ticker, Decimal("0")) if hasattr(self, '_ws_positions') else Decimal("0")
-            if new_pos_ws == Decimal("0"):
+            # position_change is diagnostic only; zero signaling is handled from fill-driven positions.
+
+    def _on_fill_message(self, data: dict) -> None:
+        """WebSocket callback for fills.
+
+        This bot uses fill events as the primary real-time source for position
+        quantity because mainnet `position_change.amount` values do not map
+        cleanly to the bot's token quantity units for all products.
+        """
+        try:
+            order_digest = data.get("order_digest")
+            if order_digest in self._bridged_fill_order_ids:
+                # The order result already updated _ws_positions for immediate
+                # phase handoff. Ignore the first matching fill event to avoid
+                # double-counting, then forget the bridge marker.
+                self._bridged_fill_order_ids.discard(order_digest)
+                self.logger.debug(f"[FILL WS] Ignoring bridged fill event for {order_digest}")
+                return
+
+            event_key = (
+                order_digest,
+                data.get("filled_qty"),
+                data.get("remaining_qty"),
+                data.get("timestamp"),
+            )
+            if event_key in self._processed_fill_events:
+                return
+            self._processed_fill_events.add(event_key)
+
+            product_id = data.get("product_id")
+            if product_id == self.eth_client.config.contract_id:
+                ticker = "ETH"
+            elif product_id == self.sol_client.config.contract_id:
+                ticker = "SOL"
+            else:
+                self.logger.warning(f"[FILL WS] Unknown product_id: {product_id}")
+                return
+
+            filled_qty_raw = data.get("filled_qty", "0")
+            filled_qty = Decimal(str(filled_qty_raw)) / Decimal("1e18") if filled_qty_raw else Decimal("0")
+            is_bid = bool(data.get("is_bid"))
+            signed_delta = filled_qty if is_bid else -filled_qty
+
+            old_pos = self._ws_positions.get(ticker, Decimal("0"))
+            new_pos = old_pos + signed_delta
+            self._ws_positions[ticker] = new_pos
+
+            self.logger.info(
+                f"[FILL WS] {ticker}: {old_pos} -> {new_pos} "
+                f"(delta={signed_delta:+.4f}, is_bid={is_bid}, filled_qty={filled_qty}) [AUTHORITATIVE]"
+            )
+
+            self.log_position_update(
+                ticker=ticker,
+                old_position=old_pos,
+                new_position=new_pos,
+                cycle_id=str(self.iteration) if hasattr(self, 'iteration') else "",
+                source="websocket_fill_authoritative",
+                price=None
+            )
+
+            if new_pos == Decimal("0"):
                 if hasattr(self, '_position_zero_events') and ticker in self._position_zero_events:
                     event = self._position_zero_events.get(ticker)
                     if event and not event.is_set():
                         event.set()
-                        self.logger.debug(
-                            f"[WS #{event_seq}] Signaled position zero for {ticker} (error path)"
-                        )
+                        self.logger.debug(f"[FILL WS] Signaled position zero for {ticker}")
+
+        except Exception as e:
+            self.logger.error(f"[FILL WS] Error processing fill update: {e}")
+            import traceback
+            self.logger.error(f"[FILL WS] Traceback: {traceback.format_exc()}")
+
+    def _apply_order_result_to_ws_positions(self, ticker: str, direction: str, result, phase: str) -> None:
+        """Bridge successful order results into _ws_positions immediately.
+
+        Why:
+        - WS fill messages are authoritative for quantity, but can arrive slightly
+          later than the order result path.
+        - BUILD/UNWIND phase handoff should not assume zero just because the fill
+          callback has not fired yet.
+        """
+        filled = self._get_filled_size(result)
+        if filled <= Decimal("0.001"):
+            return
+
+        # If WS/fill state already reflects this quantity in the expected
+        # direction, do not bridge it again.
+        current_aligned = self._aligned_ws_filled_qty(ticker, direction)
+        if current_aligned >= filled * Decimal("0.99"):
+            self.logger.debug(
+                f"[WS BRIDGE] Skip for {phase} {ticker}: WS already reflects "
+                f"{current_aligned} >= {filled}"
+            )
+            return
+
+        signed_delta = filled if direction == "buy" else -filled
+        old_pos = self._ws_positions.get(ticker, Decimal("0"))
+        new_pos = old_pos + signed_delta
+        self._ws_positions[ticker] = new_pos
+
+        order_id = getattr(result, 'order_id', None)
+        if order_id:
+            self._bridged_fill_order_ids.add(order_id)
+
+        self.logger.info(
+            f"[WS BRIDGE] {phase} {ticker}: {old_pos} -> {new_pos} "
+            f"(delta={signed_delta:+.4f}, direction={direction}, filled={filled})"
+        )
 
     async def _wait_for_position_zero(
         self,
@@ -1408,6 +1506,13 @@ class DNPairBot:
                             drift = await self._detect_position_drift(ticker, client)
                             if drift > self.POSITION_DRIFT_THRESHOLD:
                                 self.logger.warning(f"[FORCE] Drift detected: {drift}")
+                                # REST is ground truth after we already confirmed the
+                                # actual position is closed. If WS still shows a stale
+                                # non-zero value here, sync it down to zero.
+                                if not hasattr(self, '_ws_positions'):
+                                    self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+                                self._ws_positions[ticker] = Decimal("0")
+                                self.logger.info(f"[FORCE] Synced stale WS position to REST zero: {ticker}=0")
                     else:
                         # Feature flag disabled - use old behavior
                         if not hasattr(self, '_ws_positions'):
@@ -1456,6 +1561,10 @@ class DNPairBot:
                                 drift = await self._detect_position_drift(ticker, client)
                                 if drift > self.POSITION_DRIFT_THRESHOLD:
                                     self.logger.warning(f"[FORCE] Drift after close: {drift}")
+                                    if not hasattr(self, '_ws_positions'):
+                                        self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+                                    self._ws_positions[ticker] = Decimal("0")
+                                    self.logger.info(f"[FORCE] Synced stale WS position to REST zero after close: {ticker}=0")
                             else:
                                 # Feature flag disabled - use old behavior
                                 if not hasattr(self, '_ws_positions'):
@@ -2958,23 +3067,31 @@ class DNPairBot:
         self.logger.info(f"[VERIFY] Starting position verification for {ticker}")
 
         while time.time() - start_time < max_wait_seconds:
-            # Check REST API
             client = self.eth_client if ticker == "ETH" else self.sol_client
-            rest_pos = await client.get_account_positions()
+            ws_pos = self._ws_positions.get(ticker, Decimal("0")) if hasattr(self, '_ws_positions') else Decimal("0")
 
-            # Check WebSocket (if available)
-            ws_pos = self._ws_positions.get(ticker, Decimal("0")) if hasattr(self, '_ws_positions') else rest_pos
-
-            self.logger.info(f"[VERIFY] {ticker} - REST={rest_pos}, WS={ws_pos}")
-
-            if abs(rest_pos) < POSITION_TOLERANCE and abs(ws_pos) < POSITION_TOLERANCE:
-                self.logger.info(f"[VERIFY] {ticker} confirmed closed")
+            # Fast path: trust WS when it already shows flat.
+            if abs(ws_pos) < POSITION_TOLERANCE:
+                self.logger.info(f"[VERIFY] {ticker} confirmed closed via WS={ws_pos}")
                 return True
+
+            # Slow path: only use REST as bounded verification, not as the main loop source.
+            elapsed = time.time() - start_time
+            should_verify_rest = elapsed >= max_wait_seconds or elapsed >= 3
+            if should_verify_rest:
+                rest_pos = await client.get_account_positions()
+                self.logger.info(f"[VERIFY] {ticker} - WS={ws_pos}, REST={rest_pos}")
+                if abs(rest_pos) < POSITION_TOLERANCE:
+                    if hasattr(self, '_ws_positions'):
+                        self._ws_positions[ticker] = Decimal("0")
+                    self.logger.info(f"[VERIFY] {ticker} confirmed closed via REST fallback; syncing WS to 0")
+                    return True
 
             await asyncio.sleep(1)
 
         # CRITICAL: Position not closed after timeout
-        self.logger.critical(f"[VERIFY] CRITICAL: {ticker} NOT CLOSED after {max_wait_seconds}s - REST={rest_pos}, WS={ws_pos}")
+        rest_pos = await client.get_account_positions()
+        self.logger.critical(f"[VERIFY] CRITICAL: {ticker} NOT CLOSED after {max_wait_seconds}s - WS={ws_pos}, REST={rest_pos}")
         return False
 
     async def _close_individual_position(self, ticker: str) -> bool:
@@ -3331,6 +3448,34 @@ class DNPairBot:
 
         return filled > Decimal("0.001")  # Legacy behavior when no expected quantity
 
+    def _aligned_ws_filled_qty(self, ticker: str, direction: str) -> Decimal:
+        """Return WS-tracked filled quantity only if sign matches expected direction."""
+        pos = self._ws_positions.get(ticker, Decimal("0"))
+        if direction == "buy" and pos > 0:
+            return abs(pos)
+        if direction == "sell" and pos < 0:
+            return abs(pos)
+        return Decimal("0")
+
+    def _resolve_close_check_position(self, ticker: str, ws_pos: Decimal, rest_pos: Decimal) -> Decimal:
+        """Resolve close-check position with REST override when WS is stale.
+
+        Purpose:
+        - Keep WebSocket as the normal fast path.
+        - But when REST already shows flat and WS alone remains non-zero, treat
+          that as stale WS for close verification and sync WS down to zero.
+        """
+        if abs(rest_pos) < self.POSITION_DRIFT_THRESHOLD and abs(ws_pos - rest_pos) > self.POSITION_DRIFT_THRESHOLD:
+            self.logger.warning(
+                f"[VERIFY] {ticker} REST is flat but WS still shows {ws_pos}. "
+                f"Treating WS as stale for close verification."
+            )
+            if not hasattr(self, '_ws_positions'):
+                self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+            self._ws_positions[ticker] = Decimal("0")
+            return Decimal("0")
+        return ws_pos
+
     def _calculate_remaining_quantities(
         self,
         target_notional: Decimal,
@@ -3437,6 +3582,22 @@ class DNPairBot:
             f"reason={entry_timing['reason']}"
         )
 
+        # Hard stop for timeout-based weak entries.
+        # If we only got here because time ran out, and the observed spread never
+        # reached the dynamic threshold, do not open the cycle.
+        timeout_below_threshold = (
+            entry_timing.get('reason') == 'timeout' and
+            entry_timing.get('entry_spread_bps', Decimal("0")) < entry_timing.get('threshold_bps', Decimal("0"))
+        )
+        if timeout_below_threshold:
+            reason = (
+                f"ENTRY_TIMEOUT_BELOW_THRESHOLD: spread={entry_timing['entry_spread_bps']:.1f}bps "
+                f"< threshold={entry_timing.get('threshold_bps', 25)}bps"
+            )
+            self.logger.warning(f"[BUILD] {reason}")
+            self._log_skipped_cycle(reason)
+            return False
+
         # SPREAD FILTER: Check if spread is profitable
         eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
         sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
@@ -3505,9 +3666,10 @@ class DNPairBot:
                 self.logger.info(f"[BUILD] Both orders filled successfully on first attempt")
                 self._is_entry_phase = False
 
-                # WebSocket PositionChange events will automatically update positions
-                # No need for REST sync - WebSocket is the primary source
-                self.logger.info("[BUILD] WebSocket will auto-sync positions via PositionChange events")
+                # Bridge successful order results immediately so the next phase
+                # doesn't start from stale zero while waiting for fill WS timing.
+                self._apply_order_result_to_ws_positions("ETH", eth_direction, eth_result, "BUILD")
+                self._apply_order_result_to_ws_positions("SOL", sol_direction, sol_result, "BUILD")
 
                 await self._maybe_place_tp_orders()
 
@@ -3547,13 +3709,24 @@ class DNPairBot:
                 target_eth_qty = self.target_notional / eth_price
                 target_sol_qty = self.target_notional / sol_price
 
-                # Calculate remaining based on cumulative fills (not positions)
-                eth_remaining_qty = max(target_eth_qty - cumulative_eth_filled, Decimal("0"))
-                sol_remaining_qty = max(target_sol_qty - cumulative_sol_filled, Decimal("0"))
+                # Calculate remaining using both order results and WS fill-based positions.
+                # This prevents re-ordering a leg that already filled but whose
+                # OrderResult path timed out before the fill callback arrived.
+                ws_eth_filled = self._aligned_ws_filled_qty("ETH", eth_direction)
+                ws_sol_filled = self._aligned_ws_filled_qty("SOL", sol_direction)
+                effective_eth_filled = max(cumulative_eth_filled, ws_eth_filled)
+                effective_sol_filled = max(cumulative_sol_filled, ws_sol_filled)
+
+                eth_remaining_qty = max(target_eth_qty - effective_eth_filled, Decimal("0"))
+                sol_remaining_qty = max(target_sol_qty - effective_sol_filled, Decimal("0"))
 
                 self.logger.info(
                     f"[BUILD] Cumulative fills: ETH={cumulative_eth_filled}/{target_eth_qty}, "
                     f"SOL={cumulative_sol_filled}/{target_sol_qty}"
+                )
+                self.logger.info(
+                    f"[BUILD] WS fills: ETH={ws_eth_filled}/{target_eth_qty}, "
+                    f"SOL={ws_sol_filled}/{target_sol_qty}"
                 )
                 self.logger.info(
                     f"[BUILD] Remaining quantities: ETH={eth_remaining_qty}, SOL={sol_remaining_qty}"
@@ -3598,6 +3771,9 @@ class DNPairBot:
                         elif ticker == "SOL":
                             cumulative_sol_filled += filled_size
 
+                        direction = eth_direction if ticker == "ETH" else sol_direction
+                        self._apply_order_result_to_ws_positions(ticker, direction, result, "BUILD-RETRY")
+
                         # Update entry quantities and prices
                         if hasattr(result, 'price') and result.price:
                             self.entry_quantities[ticker] += filled_size
@@ -3611,7 +3787,11 @@ class DNPairBot:
                             )
 
                 # Check if all target quantities are now filled based on cumulative fills
-                if cumulative_eth_filled >= target_eth_qty * Decimal("0.99") and cumulative_sol_filled >= target_sol_qty * Decimal("0.99"):
+                if effective_eth_filled >= target_eth_qty * Decimal("0.99") and effective_sol_filled >= target_sol_qty * Decimal("0.99"):
+                    if effective_eth_filled > cumulative_eth_filled:
+                        cumulative_eth_filled = effective_eth_filled
+                    if effective_sol_filled > cumulative_sol_filled:
+                        cumulative_sol_filled = effective_sol_filled
                     self.logger.info(
                         f"[BUILD] All target quantities filled: ETH={cumulative_eth_filled}/{target_eth_qty}, "
                         f"SOL={cumulative_sol_filled}/{target_sol_qty}. Waiting for positions to settle..."
@@ -3841,6 +4021,8 @@ class DNPairBot:
 
         if eth_filled and sol_filled:
             self.logger.info("[UNWIND] Both orders filled successfully")
+            self._apply_order_result_to_ws_positions("ETH", eth_side, eth_result, "UNWIND")
+            self._apply_order_result_to_ws_positions("SOL", sol_side, sol_result, "UNWIND")
         else:
             # One or both legs didn't fill - retry individual legs
             self.logger.warning(f"[UNWIND] Initial fill incomplete: ETH={eth_filled}, SOL={sol_filled}")
@@ -3868,18 +4050,29 @@ class DNPairBot:
                 eth_bid, eth_ask = await self.eth_client.fetch_bbo_prices(self.eth_client.config.contract_id)
                 sol_bid, sol_ask = await self.sol_client.fetch_bbo_prices(self.sol_client.config.contract_id)
 
-                # Calculate remaining based on cumulative fills (not positions which lag)
+                # Calculate remaining using both order results and WS fill-based positions.
+                # WS fill callbacks can arrive after an OrderResult timeout, so use the
+                # larger of the two to avoid over-closing an already-closed leg.
+                ws_eth_closed = self._aligned_ws_filled_qty("ETH", eth_side)
+                ws_sol_closed = self._aligned_ws_filled_qty("SOL", sol_side)
+                effective_eth_closed = max(cumulative_eth_filled, ws_eth_closed)
+                effective_sol_closed = max(cumulative_sol_filled, ws_sol_closed)
+
                 # We need to close the full entry quantity
-                eth_remaining_qty = max(eth_entry_qty - cumulative_eth_filled, Decimal("0"))
-                sol_remaining_qty = max(sol_entry_qty - cumulative_sol_filled, Decimal("0"))
+                eth_remaining_qty = max(eth_entry_qty - effective_eth_closed, Decimal("0"))
+                sol_remaining_qty = max(sol_entry_qty - effective_sol_closed, Decimal("0"))
 
                 # Determine which side needs retry based on cumulative fills
-                retry_eth = cumulative_eth_filled < eth_entry_qty * Decimal("0.99")
-                retry_sol = cumulative_sol_filled < sol_entry_qty * Decimal("0.99")
+                retry_eth = effective_eth_closed < eth_entry_qty * Decimal("0.99")
+                retry_sol = effective_sol_closed < sol_entry_qty * Decimal("0.99")
 
                 self.logger.info(
                     f"[UNWIND] Cumulative fills: ETH={cumulative_eth_filled}/{eth_entry_qty}, "
                     f"SOL={cumulative_sol_filled}/{sol_entry_qty}"
+                )
+                self.logger.info(
+                    f"[UNWIND] WS fills: ETH={ws_eth_closed}/{eth_entry_qty}, "
+                    f"SOL={ws_sol_closed}/{sol_entry_qty}"
                 )
                 self.logger.info(
                     f"[UNWIND] Remaining: ETH={eth_remaining_qty}, SOL={sol_remaining_qty}, "
@@ -3912,6 +4105,7 @@ class DNPairBot:
                     if filled_size > POSITION_TOLERANCE:
                         cumulative_eth_filled += filled_size
                         self._exit_quantities["ETH"] += filled_size
+                        self._apply_order_result_to_ws_positions("ETH", eth_side, eth_result, "UNWIND-RETRY")
                         # Always update exit_prices on successful fills (use latest price)
                         if eth_result.price and eth_result.price > 0:
                             self._exit_prices["ETH"] = eth_result.price
@@ -3934,6 +4128,7 @@ class DNPairBot:
                     if filled_size > POSITION_TOLERANCE:
                         cumulative_sol_filled += filled_size
                         self._exit_quantities["SOL"] += filled_size
+                        self._apply_order_result_to_ws_positions("SOL", sol_side, sol_result, "UNWIND-RETRY")
                         # Always update exit_prices on successful fills (use latest price)
                         if sol_result.price and sol_result.price > 0:
                             self._exit_prices["SOL"] = sol_result.price
@@ -3968,16 +4163,31 @@ class DNPairBot:
                 self.logger.error("[UNWIND] Both legs failed after retries")
                 return False
 
-        # Verify positions closed with retries
-        for attempt in range(MAX_RETRIES):
-            await asyncio.sleep(RETRY_DELAY)
+            # Verify positions closed with retries
+            for attempt in range(MAX_RETRIES):
+                await asyncio.sleep(RETRY_DELAY)
 
-            # NOTE: WebSocket positions are real-time; REST API has ~20s lag
-            # Use WS for initial check, REST as backup/verification
+            # WS-first close check. REST is only used as bounded verification on
+            # later attempts if WS still shows non-zero.
             eth_pos_ws = self._ws_positions.get("ETH", Decimal("0"))
             sol_pos_ws = self._ws_positions.get("SOL", Decimal("0"))
-            eth_pos_rest = await self.eth_client.get_account_positions()
-            sol_pos_rest = await self.sol_client.get_account_positions()
+            eth_pos_rest = None
+            sol_pos_rest = None
+
+            if abs(eth_pos_ws) >= POSITION_TOLERANCE or abs(sol_pos_ws) >= POSITION_TOLERANCE:
+                if attempt >= 1 or attempt == MAX_RETRIES - 1:
+                    eth_pos_rest = await self.eth_client.get_account_positions()
+                    sol_pos_rest = await self.sol_client.get_account_positions()
+
+                    if abs(eth_pos_rest) < POSITION_TOLERANCE and abs(eth_pos_ws) >= POSITION_TOLERANCE:
+                        self.logger.warning(f"[UNWIND] ETH WS stale while REST is flat; syncing ETH WS to 0")
+                        self._ws_positions["ETH"] = Decimal("0")
+                        eth_pos_ws = Decimal("0")
+
+                    if abs(sol_pos_rest) < POSITION_TOLERANCE and abs(sol_pos_ws) >= POSITION_TOLERANCE:
+                        self.logger.warning(f"[UNWIND] SOL WS stale while REST is flat; syncing SOL WS to 0")
+                        self._ws_positions["SOL"] = Decimal("0")
+                        sol_pos_ws = Decimal("0")
 
             self.logger.info(
                 f"[UNWIND] POSITIONS CHECK (attempt {attempt + 1}/{MAX_RETRIES}): "
@@ -4335,6 +4545,32 @@ class DNPairBot:
         from hedge.exchanges.nado import WEBSOCKET_AVAILABLE
 
         if WEBSOCKET_AVAILABLE:
+            # Subscribe to ETH fills
+            if self.eth_client._ws_client:
+                try:
+                    await self.eth_client._ws_client.subscribe(
+                        stream_type="fill",
+                        product_id=self.eth_client.config.contract_id,
+                        subaccount=self.eth_client.subaccount_hex,
+                        callback=self._on_fill_message
+                    )
+                    self.logger.info("[INIT] Subscribed to ETH fill stream")
+                except Exception as e:
+                    self.logger.warning(f"[INIT] Failed to subscribe to ETH fill: {e}")
+
+            # Subscribe to SOL fills
+            if self.sol_client._ws_client:
+                try:
+                    await self.sol_client._ws_client.subscribe(
+                        stream_type="fill",
+                        product_id=self.sol_client.config.contract_id,
+                        subaccount=self.sol_client.subaccount_hex,
+                        callback=self._on_fill_message
+                    )
+                    self.logger.info("[INIT] Subscribed to SOL fill stream")
+                except Exception as e:
+                    self.logger.warning(f"[INIT] Failed to subscribe to SOL fill: {e}")
+
             # Subscribe to ETH position changes
             if self.eth_client._ws_client:
                 try:

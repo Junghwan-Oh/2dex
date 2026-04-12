@@ -27,6 +27,7 @@ try:
     from .nado_websocket_client import NadoWebSocketClient
     from .nado_bbo_handler import BBOHandler
     from .nado_bookdepth_handler import BookDepthHandler
+    from .nado_fill_handler import FillHandler
     WEBSOCKET_AVAILABLE = True
     import sys
     print("[NADO WEBSOCKET] Import successful - WEBSOCKET_AVAILABLE = True", file=sys.stderr)
@@ -35,6 +36,7 @@ except ImportError as e:
     NadoWebSocketClient = None
     BBOHandler = None
     BookDepthHandler = None
+    FillHandler = None
     # Log import error for debugging (only once at module load)
     import sys
     print(f"[NADO WEBSOCKET] Import failed: {e}", file=sys.stderr)
@@ -75,6 +77,7 @@ class NadoClient(BaseExchangeClient):
         self._ws_client: Optional[NadoWebSocketClient] = None
         self._bbo_handler: Optional[BBOHandler] = None
         self._bookdepth_handler: Optional['BookDepthHandler'] = None
+        self._fill_handler: Optional['FillHandler'] = None
         self._ws_connected = False
         self._use_websocket = WEBSOCKET_AVAILABLE
 
@@ -212,6 +215,14 @@ class NadoClient(BaseExchangeClient):
             logger=self.logger.logger  # Use internal logger
         )
 
+        # Create Fill handler for real-time fill detection
+        self._fill_handler = FillHandler(
+            product_id=product_id,
+            subaccount=self.subaccount_hex,
+            ws_client=self._ws_client,
+            logger=self.logger.logger
+        )
+
         # Connect and subscribe
         self.logger.log(f"WebSocket: Connecting to server for {self.config.ticker}...", "INFO")
         await self._ws_client.connect()
@@ -221,6 +232,9 @@ class NadoClient(BaseExchangeClient):
 
         self.logger.log(f"WebSocket: Starting BookDepth handler for {self.config.ticker}...", "INFO")
         await self._bookdepth_handler.start()
+
+        self.logger.log(f"WebSocket: Starting Fill handler for {self.config.ticker}...", "INFO")
+        await self._fill_handler.start()
 
         self._ws_connected = True
         self.logger.log(f"WebSocket connected for {self.config.ticker} (product_id={product_id})", "INFO")
@@ -763,11 +777,13 @@ class NadoClient(BaseExchangeClient):
                 if attempt > 0:
                     improvement_bps = improvement_steps[attempt - 1] if attempt <= len(improvement_steps) else improvement_steps[-1]
                     if direction == 'buy':
-                        # Buy: improve by lowering price (pay less)
-                        price = original_price * (Decimal('1') - Decimal(str(improvement_bps)) / Decimal('10000'))
-                    else:
-                        # Sell: improve by raising price (get more)
+                        # Buy retry should become MORE aggressive to increase fill probability.
+                        # Paying less makes a resting bid less likely to fill.
                         price = original_price * (Decimal('1') + Decimal(str(improvement_bps)) / Decimal('10000'))
+                    else:
+                        # Sell retry should become MORE aggressive to increase fill probability.
+                        # Asking more makes a resting ask less likely to fill.
+                        price = original_price * (Decimal('1') - Decimal(str(improvement_bps)) / Decimal('10000'))
                     price = self._round_price_to_increment(product_id_int, price)
 
                 self.logger.log(
@@ -789,6 +805,14 @@ class NadoClient(BaseExchangeClient):
                     continue
 
                 order_id = order_result.order_id
+
+                # Track order so WS fill messages can resolve fills without
+                # waiting for REST polling lag.
+                if self._ws_connected and self._fill_handler and order_id:
+                    try:
+                        self._fill_handler.track_order(order_id, remaining_quantity)
+                    except Exception as e:
+                        self.logger.log(f"Fill handler track_order failed: {e}", "WARNING")
 
                 # Step 5: Poll for fill using helper
                 poll_result = await self._poll_until_fill_or_timeout(order_id, timeout_seconds)
@@ -911,6 +935,18 @@ class NadoClient(BaseExchangeClient):
         polling_retries = 0
 
         while True:
+            # Prefer real-time fill stream when available.
+            if self._ws_connected and self._fill_handler:
+                try:
+                    fill_info = self._fill_handler.get_fill_info(order_id)
+                    if fill_info is not None:
+                        filled = fill_info.get('filled_quantity', Decimal('0'))
+                        if filled > 0:
+                            self.logger.log(f"Order {order_id} filled via WebSocket fill stream", "INFO")
+                            return {'status': 'FILLED', 'filled_size': filled}
+                except Exception as e:
+                    self.logger.log(f"Fill stream lookup error for order {order_id}: {e}", "WARN")
+
             try:
                 order_info = await self.get_order_info(order_id)
 
@@ -1515,4 +1551,3 @@ class NadoClient(BaseExchangeClient):
             self.logger.log(f"Error getting contract attributes: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             raise
-
