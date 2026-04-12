@@ -198,3 +198,185 @@ async def test_build_does_not_use_rest_raw_qty_ratio_as_success_signal():
 
     assert result is False
     bot.handle_emergency_unwind.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_timeout_entry_uses_min_spread_floor_not_dynamic_threshold():
+    bot = make_bot()
+    bot.min_spread_bps = 0
+    bot._wait_for_optimal_entry = AsyncMock(
+        return_value={
+            "waited_seconds": 30.0,
+            "entry_spread_bps": Decimal("1.2"),
+            "threshold_bps": Decimal("25"),
+            "reason": "timeout",
+        }
+    )
+
+    bot.place_simultaneous_orders = AsyncMock(
+        return_value=(
+            make_result(
+                success=False,
+                filled_size="0",
+                price=None,
+                status="TIMEOUT",
+                order_id="eth-open",
+                error_message="timeout",
+            ),
+            make_result(
+                success=False,
+                filled_size="0",
+                price=None,
+                status="TIMEOUT",
+                order_id="sol-open",
+                error_message="timeout",
+            ),
+        )
+    )
+
+    with patch("hedge.DN_pair_eth_sol_nado.asyncio.sleep", new=AsyncMock()):
+        await bot.execute_build_cycle(eth_direction="buy", sol_direction="sell")
+
+    bot._log_skipped_cycle.assert_not_called()
+    bot.place_simultaneous_orders.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_build_no_fill_and_flat_positions_returns_false_without_retry_loop():
+    bot = make_bot()
+    bot.eth_client.get_account_positions = AsyncMock(return_value=Decimal("0"))
+    bot.sol_client.get_account_positions = AsyncMock(return_value=Decimal("0"))
+
+    bot.place_simultaneous_orders = AsyncMock(
+        return_value=(
+            make_result(
+                success=False,
+                filled_size="0",
+                price=None,
+                status="TIMEOUT",
+                order_id="eth-open",
+                error_message="timeout",
+            ),
+            make_result(
+                success=False,
+                filled_size="0",
+                price=None,
+                status="TIMEOUT",
+                order_id="sol-open",
+                error_message="timeout",
+            ),
+        )
+    )
+    bot._retry_side_order = AsyncMock()
+
+    with patch("hedge.DN_pair_eth_sol_nado.asyncio.sleep", new=AsyncMock()):
+        result = await bot.execute_build_cycle(eth_direction="buy", sol_direction="sell")
+
+    assert result is False
+    bot._retry_side_order.assert_not_awaited()
+    assert bot._last_cycle_outcome == "flat_skip"
+
+
+@pytest.mark.asyncio
+async def test_build_does_not_retry_after_emergency_unwind_recovers_flat():
+    bot = make_bot()
+
+    async def place_orders(eth_direction, sol_direction):
+        bot._last_order_target_quantities = {
+            "ETH": Decimal("0.05"),
+            "SOL": Decimal("1.0"),
+        }
+        bot.entry_quantities["ETH"] += Decimal("0.05")
+        bot.entry_prices["ETH"] = Decimal("2000")
+        bot._last_cycle_outcome = "unwind_recovered_flat"
+        return (
+            make_result(
+                success=True,
+                filled_size="0.05",
+                price="2000",
+                status="FILLED",
+                order_id="eth-open",
+            ),
+            make_result(
+                success=False,
+                filled_size="0",
+                price=None,
+                status="TIMEOUT",
+                order_id="sol-open",
+                error_message="timeout",
+            ),
+        )
+
+    bot.place_simultaneous_orders = AsyncMock(side_effect=place_orders)
+    bot._retry_side_order = AsyncMock()
+
+    result = await bot.execute_build_cycle(eth_direction="buy", sol_direction="sell")
+
+    assert result is False
+    assert bot._last_cycle_outcome == "unwind_recovered_flat"
+    bot._retry_side_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_alternating_strategy_continues_after_flat_skip():
+    bot = make_bot()
+    bot.iterations = 3
+
+    buy_calls = {"count": 0}
+
+    async def buy_first_side_effect():
+        buy_calls["count"] += 1
+        bot._last_cycle_flat_skip = True
+        return False
+
+    async def sell_first_side_effect():
+        bot._last_cycle_flat_skip = False
+        return True
+
+    bot.execute_buy_first_cycle = AsyncMock(side_effect=buy_first_side_effect)
+    bot.execute_sell_first_cycle = AsyncMock(side_effect=sell_first_side_effect)
+    bot.rollback_monitor.should_rollback = Mock(return_value=(False, "ok"))
+
+    results = await bot.run_alternating_strategy()
+
+    assert results == [False, True, False]
+    assert buy_calls["count"] == 2
+    assert bot.execute_sell_first_cycle.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_alternating_strategy_continues_after_unwind_recovered_flat():
+    bot = make_bot()
+    bot.iterations = 2
+
+    async def buy_first_side_effect():
+        bot._last_cycle_flat_skip = False
+        bot._last_cycle_outcome = "unwind_recovered_flat"
+        return False
+
+    async def sell_first_side_effect():
+        bot._last_cycle_outcome = None
+        return True
+
+    bot.execute_buy_first_cycle = AsyncMock(side_effect=buy_first_side_effect)
+    bot.execute_sell_first_cycle = AsyncMock(side_effect=sell_first_side_effect)
+    bot.rollback_monitor.should_rollback = Mock(return_value=(False, "ok"))
+
+    results = await bot.run_alternating_strategy()
+
+    assert results == [False, True]
+    assert bot.execute_buy_first_cycle.await_count == 1
+    assert bot.execute_sell_first_cycle.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_positions_before_build_syncs_stale_ws_from_rest_when_unhealthy():
+    bot = make_bot()
+    bot._ws_positions = {"ETH": Decimal("0.046"), "SOL": Decimal("0")}
+    bot._ws_last_update_time = {"ETH": 0, "SOL": 0}
+    bot.eth_client.get_account_positions = AsyncMock(return_value=Decimal("0"))
+    bot.sol_client.get_account_positions = AsyncMock(return_value=Decimal("0"))
+
+    assert await bot._verify_positions_before_build() is True
+    assert bot._ws_positions["ETH"] == Decimal("0")
+    assert bot._ws_positions["SOL"] == Decimal("0")

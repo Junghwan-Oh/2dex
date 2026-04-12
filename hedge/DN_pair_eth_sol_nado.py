@@ -212,6 +212,8 @@ class DNPairBot:
         self._processed_fill_events = set()  # Dedupe fill-stream events
         self._bridged_fill_order_ids = set()  # Order IDs already reflected into _ws_positions from order results
         self._last_order_target_quantities = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+        self._last_cycle_flat_skip = False
+        self._last_cycle_outcome = None
 
         # Position tracking configuration (WebSocket position tracking fix)
         self.USE_ASYNC_POSITION_WAIT = True  # Feature flag: enable async position waiting
@@ -1493,8 +1495,25 @@ class DNPairBot:
             self.logger.info(f"[UNWIND] Both failed - checking for residual positions")
 
         # ALWAYS close both positions
-        await self._force_close_position("ETH")
-        await self._force_close_position("SOL")
+        eth_closed = await self._force_close_position("ETH")
+        sol_closed = await self._force_close_position("SOL")
+
+        eth_pos = await self.eth_client.get_account_positions() if self.eth_client else Decimal("0")
+        sol_pos = await self.sol_client.get_account_positions() if self.sol_client else Decimal("0")
+        positions_flat = abs(eth_pos) < Decimal("0.001") and abs(sol_pos) < Decimal("0.001")
+
+        if positions_flat and eth_closed and sol_closed:
+            if eth_filled or sol_filled:
+                self._last_cycle_outcome = "unwind_recovered_flat"
+                self.logger.warning(
+                    "[UNWIND] Emergency unwind recovered to flat; this cycle must end without BUILD retry"
+                )
+            else:
+                self._last_cycle_outcome = "flat_skip"
+            return True
+
+        self._last_cycle_outcome = "hard_fail"
+        return False
 
     async def _force_close_position(self, ticker: str) -> bool:
         """Force close position with retry, handling settlement lag.
@@ -1688,6 +1707,8 @@ class DNPairBot:
         POSITION_TOLERANCE = Decimal("0.001")
 
         try:
+            ws_healthy = False
+
             # Primary: Use WebSocket positions if available and healthy
             if hasattr(self, '_ws_positions') and self._ws_positions:
                 # Check if WebSocket is healthy (received update within 30 seconds)
@@ -1718,6 +1739,18 @@ class DNPairBot:
                 eth_pos = await self.eth_client.get_account_positions()
                 sol_pos = await self.sol_client.get_account_positions()
                 self.logger.info(f"[SAFETY] REST API positions (no WS): ETH={eth_pos}, SOL={sol_pos}")
+
+            # When WS is stale or unavailable, REST becomes the bounded authority for
+            # pre-BUILD flatness. Sync the stale WS cache so the next cycle does not
+            # fail on an old non-zero value after actual positions are already flat.
+            if not ws_healthy:
+                if not hasattr(self, '_ws_positions'):
+                    self._ws_positions = {"ETH": Decimal("0"), "SOL": Decimal("0")}
+                self._ws_positions["ETH"] = eth_pos
+                self._ws_positions["SOL"] = sol_pos
+                self.logger.info(
+                    f"[SAFETY] Synced stale WS cache from REST: ETH={eth_pos}, SOL={sol_pos}"
+                )
 
             if abs(eth_pos) > POSITION_TOLERANCE or abs(sol_pos) > POSITION_TOLERANCE:
                 self.logger.error(
@@ -3624,17 +3657,19 @@ class DNPairBot:
             f"reason={entry_timing['reason']}"
         )
 
-        # Hard stop for timeout-based weak entries.
-        # If we only got here because time ran out, and the observed spread never
-        # reached the dynamic threshold, do not open the cycle.
-        timeout_below_threshold = (
+        # Hard stop for timeout-based entries uses the explicit floor, not the
+        # dynamic "optimal entry" threshold. The dynamic threshold decides when
+        # to enter early; the explicit min_spread_bps decides the minimum sanity
+        # floor when we have timed out and still want to proceed.
+        timeout_entry_floor_bps = Decimal(str(self.min_spread_bps))
+        timeout_below_floor = (
             entry_timing.get('reason') == 'timeout' and
-            entry_timing.get('entry_spread_bps', Decimal("0")) < entry_timing.get('threshold_bps', Decimal("0"))
+            entry_timing.get('entry_spread_bps', Decimal("0")) < timeout_entry_floor_bps
         )
-        if timeout_below_threshold:
+        if timeout_below_floor:
             reason = (
-                f"ENTRY_TIMEOUT_BELOW_THRESHOLD: spread={entry_timing['entry_spread_bps']:.1f}bps "
-                f"< threshold={entry_timing.get('threshold_bps', 25)}bps"
+                f"ENTRY_TIMEOUT_BELOW_FLOOR: spread={entry_timing['entry_spread_bps']:.1f}bps "
+                f"< min_spread_bps={timeout_entry_floor_bps}"
             )
             self.logger.warning(f"[BUILD] {reason}")
             self._log_skipped_cycle(reason)
@@ -3682,6 +3717,10 @@ class DNPairBot:
             self.entry_directions = {"ETH": eth_direction, "SOL": sol_direction}
 
             eth_result, sol_result = await self.place_simultaneous_orders(eth_direction, sol_direction)
+
+            if self._last_cycle_outcome in ("flat_skip", "unwind_recovered_flat"):
+                self._is_entry_phase = False
+                return False
 
             # Extract initial fills
             eth_filled_size = self._get_filled_size(eth_result)
@@ -3739,6 +3778,25 @@ class DNPairBot:
             self.logger.info(
                 f"[BUILD] Initial cumulative fills: ETH={cumulative_eth_filled}, SOL={cumulative_sol_filled}"
             )
+
+            if (
+                cumulative_eth_filled <= POSITION_TOLERANCE and
+                cumulative_sol_filled <= POSITION_TOLERANCE
+            ):
+                eth_pos_after_initial = await self.eth_client.get_account_positions()
+                sol_pos_after_initial = await self.sol_client.get_account_positions()
+                if (
+                    abs(eth_pos_after_initial) <= POSITION_TOLERANCE and
+                    abs(sol_pos_after_initial) <= POSITION_TOLERANCE
+                ):
+                    self.logger.warning(
+                        "[BUILD] Initial attempt produced no fills and no residual positions; "
+                        "treating as clean skip without retry loop"
+                    )
+                    self._last_cycle_flat_skip = True
+                    self._last_cycle_outcome = "flat_skip"
+                    self._is_entry_phase = False
+                    return False
 
             for attempt in range(MAX_RETRIES):
                 self.logger.warning(
@@ -4349,6 +4407,8 @@ class DNPairBot:
         """Execute BUY_FIRST cycle: BUILD (Long ETH / Short SOL) -> UNWIND."""
         # Increment cycle_id for PNL tracking
         self.cycle_id += 1
+        self._last_cycle_flat_skip = False
+        self._last_cycle_outcome = None
         self.logger.info(f"[CYCLE {self.cycle_id}] Starting BUY_FIRST cycle")
 
         # Initialize cycle PNL state
@@ -4419,6 +4479,8 @@ class DNPairBot:
         """Execute SELL_FIRST cycle: BUILD (Short ETH / Long SOL) -> UNWIND."""
         # Increment cycle_id for PNL tracking
         self.cycle_id += 1
+        self._last_cycle_flat_skip = False
+        self._last_cycle_outcome = None
         self.logger.info(f"[CYCLE {self.cycle_id}] Starting SELL_FIRST cycle")
 
         # Initialize cycle PNL state
@@ -4501,6 +4563,20 @@ class DNPairBot:
                 result = await self.execute_sell_first_cycle()
 
             results.append(result)
+
+            if not result and self._last_cycle_flat_skip:
+                self.logger.warning(
+                    f"[SKIP] Cycle {iteration_num} produced no fills and stayed flat. "
+                    f"Continuing to next iteration."
+                )
+                continue
+
+            if not result and self._last_cycle_outcome == "unwind_recovered_flat":
+                self.logger.warning(
+                    f"[RECOVERED] Cycle {iteration_num} recovered to flat via emergency unwind. "
+                    f"Continuing to next iteration."
+                )
+                continue
 
             # CRITICAL: Stop if UNWIND failed
             if not result:
