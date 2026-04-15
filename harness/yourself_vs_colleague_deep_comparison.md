@@ -72,6 +72,22 @@ Source:
 반면 `yourself-skill`은 업무 흔적도 먹일 수는 있지만, 기본 framing이 work twin이 아니라 self twin입니다.
 그래서 업무 노하우, 리뷰 습관, 운영 체크리스트, 코딩 결정 패턴만 뽑아내는 능력은 구조상 `colleague-skill`보다 약합니다.
 
+여기서 중요한 건 단순히 입력 소스가 많다는 게 아닙니다.
+`colleague-skill`은 아예 **업무 노하우 추출을 위한 분업 구조**가 더 선명합니다.
+
+- intake에서 동료의 회사/레벨/직무/성향을 먼저 잡습니다.
+- source import 단계에서 enterprise trace를 우선 수집합니다.
+- 그다음 분석이 `Work Skill`과 `Persona`로 갈라집니다.
+- 최종적으로는 `Receive task -> Persona decides attitude -> Work Skill executes -> Output in their voice` 구조를 취합니다.
+
+이 설계가 중요한 이유는, 많은 “사람 복제” 프로젝트가 결국 말투 imitation에 멈추는데,
+`colleague-skill`은 처음부터 **태도와 업무 능력을 분리했다가 다시 합성**합니다.
+
+즉 “그 사람처럼 말하는가?”가 아니라
+**“그 사람이 어떤 근거와 습관으로 일을 처리하는가?”**를 중심에 놓습니다.
+
+이게 업무 암묵지 추출기라는 평가의 핵심 근거입니다.
+
 ## 3. 자기 자신의 깊은 패턴 복원은 `yourself-skill`이 더 자연스럽다
 
 여기서는 반대로 `yourself-skill`이 더 좋습니다.
@@ -96,6 +112,26 @@ Source:
 즉 “미래의 나가 다시 돌아왔을 때 내가 어떤 사람인지 복구”하는 목적에는 `yourself-skill`이 더 맞습니다.
 이건 네가 말한 `future-me recovery`, `self-senpai`, `personal tacit knowledge OS`와 더 가깝습니다.
 
+여기서도 핵심은 입력 종류 자체보다 **해석의 중심축**입니다.
+
+`yourself-skill`은 원자료를 다음 질문으로 읽습니다.
+
+- 나는 무엇을 반복해서 말하는가
+- 나는 어떤 기억을 중심으로 자신을 설명하는가
+- 나는 압박을 받으면 어떤 정서 패턴을 보이는가
+- 나는 나 자신을 어떤 narrative로 이해하는가
+
+즉 이 프로젝트는 “직장인 twin”보다는
+**자기 narrative와 자기 반응 구조를 보존하는 자기 복원 장치**에 더 가깝습니다.
+
+이 차이 때문에 `yourself-skill`은 단순 자동화보다 아래 용도에 특히 강합니다.
+
+- 미래의 나 onboarding
+- 자기 회고
+- 자기 말투 유지형 writing assistant
+- personal memory prompt layer
+- 자기판단 보정 장치
+
 ## 4. 자동 수집과 실전 파이프라인은 `colleague-skill`이 더 성숙해 보인다
 
 공식 repo 기준으로 `colleague-skill`은 더 operational합니다.
@@ -119,6 +155,55 @@ Source:
 
 이라고 보는 게 맞습니다.
 
+이 차이는 실제 파일 구조와 실행 경로에도 드러납니다.
+
+`colleague-skill` 쪽:
+
+- 생성 위치: `./colleagues/{slug}/`
+- 핵심 파일:
+  - `work.md`
+  - `persona.md`
+  - `meta.json`
+  - `SKILL.md`
+- 호출 surface:
+  - `/{slug}`
+  - `/{slug}-work`
+  - `/{slug}-persona`
+- 운영 기능:
+  - append files
+  - conversation correction
+  - version archive
+  - rollback
+
+`yourself-skill` 쪽:
+
+- 생성 위치: `./.claude/skills/{slug}/`
+- 핵심 파일:
+  - `self.md`
+  - `persona.md`
+  - `meta.json`
+  - `SKILL.md`
+- 호출 surface:
+  - `/{slug}`
+  - `/{slug}-self`
+  - `/{slug}-persona`
+- 운영 기능:
+  - append memory
+  - self-correction
+  - version archive
+  - rollback
+
+즉 `yourself-skill`도 가벼운 장난 repo는 아닙니다.
+하지만 operational 관점에서는 `colleague-skill`이 더 먼저 “현업 trace ingestion -> skillization”을 뚜렷하게 만들었고,
+`yourself-skill`은 그 골격을 자기 자신 쪽으로 inward turn시킨 것입니다.
+
+다시 말해:
+
+- `colleague-skill`은 **조직 지식 복원용 파이프라인**
+- `yourself-skill`은 **개인 지식 복원용 파이프라인**
+
+입니다.
+
 ## 5. 실용성 전범위로 보면 둘의 쓰임새가 다릅니다
 
 `colleague-skill`이 더 잘하는 일:
@@ -141,6 +226,30 @@ Source:
 
 - **업무 실행성** 중심이면 `colleague-skill`
 - **자기 복원성** 중심이면 `yourself-skill`
+
+이걸 더 세게 말하면 아래처럼 나뉩니다.
+
+`colleague-skill`의 실용성은
+**“지금 당장 팀의 손실을 막는 것”**에 있습니다.
+
+- 사람 빠진 뒤 빈자리 메우기
+- 리뷰/운영/의사결정 스타일 복원
+- 인수인계 문서가 짧을 때 gap 메우기
+- 신규 담당자에게 “이 사람이라면 어떻게 했을까”를 주는 것
+
+`yourself-skill`의 실용성은
+**“지금 당장 미래의 나를 덜 불편하게 만드는 것”**에 있습니다.
+
+- 며칠 후 다시 돌아온 나 복구
+- 프로젝트 톤과 판단 일관성 유지
+- 개인 runbook 자동화
+- self-onboarding
+- 기억을 prompt layer로 끌어올리기
+
+그래서 전범위 실용성이라는 관점에서는:
+
+- 팀 협업, 오프보딩, 조직 지식: `colleague-skill`
+- 개인 생산성, 자기복원, personal automation: `yourself-skill`
 
 ## 6. 네 목적에 딱 맞춰 말하면
 
@@ -170,9 +279,34 @@ Source:
   - Persona layer
   - Update / correction
   - Version rollback
-  - Multi-source ingestion
+- Multi-source ingestion
 
 으로 가져가는 게 맞습니다.
+
+여기서 특히 중요한 건,
+네 목적은 “나처럼 말하는 에이전트” 하나가 아니라
+**“미래의 나도 바로 복구되고, 내 판단 기준도 다시 불러오고, 내 작업방식도 재가동되는 시스템”**이라는 점입니다.
+
+그 기준이면 `yourself-skill`만 쓰면 자기 narrative 쪽은 좋지만 업무 spine이 약하고,
+`colleague-skill`만 쓰면 업무 spine은 강하지만 자기복원감이 떨어집니다.
+
+그래서 네 목적을 제대로 만족시키는 설계는 단순 선택이 아니라 조합입니다.
+
+- `yourself-skill`이 주는 것:
+  - self-targeting
+  - 자기 기억 복원
+  - 자기 서사/감정 패턴 복원
+- `colleague-skill`이 주는 것:
+  - operational pipeline
+  - 업무 암묵지 추출 구조
+  - work/persona 분업 설계
+  - update/correction/versioning spine
+
+이 둘을 합쳐야 비로소 네가 말한
+`future-me recovery harness`
+`self-senpai`
+`personal tacit knowledge OS`
+에 가까워집니다.
 
 ## 최종 판단
 
@@ -211,6 +345,24 @@ Source:
 - `colleague-skill`의 operational spine
 - `yourself-skill`의 self-targeting
 - 여기에 네 환경의 `future-me recovery harness`를 얹는 방식
+
+추가로, `yourself-skill`은 단순히 “나를 흉내내는 챗봇”으로 끝내지 않고,
+생성 결과를 Claude Code skill 디렉터리인 `./.claude/skills/{slug}/`에 직접 심는다는 점도 중요합니다.
+
+이 말은 곧:
+
+- 결과물이 그냥 분석 리포트가 아니라
+- **바로 호출 가능한 agent surface**라는 뜻입니다.
+
+반면 `colleague-skill`은 generated skill을 `./colleagues/{slug}/`에 두고,
+이후 `/{slug}`, `/{slug}-work`, `/{slug}-persona`로 나누어 호출하는 흐름을 전제로 합니다.
+
+즉 둘 다 “문서 생성기”가 아니라
+**실행 가능한 skill artifact 생성기**라는 공통점이 있습니다.
+
+이 공통점 때문에, 네가 이걸 참고해 만들 때도
+최종 산출물은 메모나 리포트가 아니라
+바로 호출 가능한 `self-senpai skill`이 되어야 합니다.
 
 ## 최종 요약
 
